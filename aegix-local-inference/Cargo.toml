@@ -1,0 +1,33 @@
+[package]
+name = "aegix-local-inference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Admission and progress deadlines for LOCAL (Ollama) inference, shared by the
+# worker's `llm::complete*` host functions and the controller's
+# `aegix_llm::OllamaClient` (RFC 0014 P3a), and the fleet-wide queue both
+# take in Redis (P3b). A leaf: nothing Aegix-specific above the HTTP body cap,
+# the DLP redactor and the shared env vocabulary.
+[dependencies]
+futures-util.workspace = true
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "script", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+aegix-redis = { path = "../aegix-redis" }
+reqwest = { workspace = true, features = ["json", "stream", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+aegix-config = { path = "../aegix-config" }
+aegix-dlp-provider = { path = "../aegix-dlp-provider" }
+aegix-http-body = { path = "../aegix-http-body" }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "test-util"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[lints]
+workspace = true

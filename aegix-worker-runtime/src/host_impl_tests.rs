@@ -1,0 +1,990 @@
+use crate::bindings::aegix::core::crypto::{self as wit_crypto};
+use crate::bindings::aegix::core::http::{self as wit_http, Host};
+use crate::context::{AegixContext, DevEgressOptIns};
+use crate::wit_inspector::CapabilityWorld;
+use aegix_workflow_job_protocol::LlmTier;
+use std::collections::HashMap;
+
+#[tokio::test]
+async fn test_http_fetch_forbidden_world() {
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Minimal,
+        vec!["*".to_string()],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    let req = wit_http::Request {
+        method: wit_http::Method::Get,
+        url: "https://example.com".to_string(),
+        headers: vec![],
+        body: vec![],
+        timeout_ms: None,
+    };
+
+    let result = ctx.fetch(req).await;
+    assert!(matches!(result, Err(wit_http::Error::Forbiddenhost)));
+}
+
+#[tokio::test]
+async fn test_http_fetch_allowlist_enforcement() {
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Http,
+        vec!["example.com".to_string()],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    // Allowed host
+    let req_ok = wit_http::Request {
+        method: wit_http::Method::Get,
+        url: "https://example.com/foo".to_string(),
+        headers: vec![],
+        body: vec![],
+        timeout_ms: None,
+    };
+
+    // We don't actually want to make a real network call in unit tests if possible,
+    // but the current implementation of `fetch` calls `reqwest::Client::send().await`.
+    // For this unit test, we can at least verify it GETS PAST the allowlist check
+    // by checking if it returns Forbiddenhost or something else (like Networkerror if DNS fails).
+    let result_ok = ctx.fetch(req_ok).await;
+    // If it's not Forbiddenhost, it passed the allowlist check.
+    assert!(!matches!(result_ok, Err(wit_http::Error::Forbiddenhost)));
+
+    // Forbidden host
+    let req_bad = wit_http::Request {
+        method: wit_http::Method::Get,
+        url: "https://google.com".to_string(),
+        headers: vec![],
+        body: vec![],
+        timeout_ms: None,
+    };
+    let result_bad = ctx.fetch(req_bad).await;
+    assert!(matches!(result_bad, Err(wit_http::Error::Forbiddenhost)));
+}
+
+#[tokio::test]
+async fn test_http_ssrf_protection() {
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Http,
+        vec!["*".to_string()], // Wildcard host allowlist
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    // Use https:// so each request passes the HTTPS-only scheme gate and is
+    // rejected specifically by the SSRF private-IP-literal gate (Forbiddenhost).
+    // With http:// the scheme gate would short-circuit to Invalidurl first,
+    // which would not exercise the SSRF protection this test is asserting.
+    let private_ips = [
+        "https://127.0.0.1",
+        "https://192.168.1.1",
+        "https://10.0.0.1",
+        "https://169.254.169.254",
+        "https://[::1]",
+        "https://[fe80::1]",
+    ];
+
+    for url in private_ips {
+        let req = wit_http::Request {
+            method: wit_http::Method::Get,
+            url: url.to_string(),
+            headers: vec![],
+            body: vec![],
+            timeout_ms: None,
+        };
+        let result = ctx.fetch(req).await;
+        assert!(
+            matches!(result, Err(wit_http::Error::Forbiddenhost)),
+            "URL {} should be blocked by SSRF protection",
+            url
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_crypto_hash_limits() {
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    // 101 MB (limit is 100 MB)
+    let huge_data = vec![0u8; 101 * 1024 * 1024];
+    let result = <AegixContext as wit_crypto::Host>::hash(
+        &mut ctx,
+        wit_crypto::HashAlgorithm::Sha256,
+        huge_data,
+    )
+    .await;
+    assert!(
+        result.is_empty(),
+        "Hash of oversized data should return empty vector"
+    );
+}
+
+/// The three digests a module can ask for, against published test vectors
+/// (RFC 1321 A.5 for MD5; FIPS 180 "abc" for SHA-256 and SHA-512). The MD5
+/// arm had no test at all: a new release of the `md5` crate could have
+/// changed what a module is given and nothing would have noticed.
+#[tokio::test]
+async fn test_crypto_hash_known_answers() {
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    for (algorithm, input, expected) in [
+        (
+            wit_crypto::HashAlgorithm::Md5,
+            &b"abc"[..],
+            "900150983cd24fb0d6963f7d28e17f72",
+        ),
+        (
+            wit_crypto::HashAlgorithm::Md5,
+            &b"message digest"[..],
+            "f96b697d7cb7938d525a2f31aaf161d0",
+        ),
+        (
+            wit_crypto::HashAlgorithm::Sha256,
+            &b"abc"[..],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            wit_crypto::HashAlgorithm::Sha512,
+            &b"abc"[..],
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        ),
+    ] {
+        let digest =
+            <AegixContext as wit_crypto::Host>::hash(&mut ctx, algorithm, input.to_vec()).await;
+        assert_eq!(hex::encode(digest), expected);
+    }
+}
+
+/// What `crypto::encode` and `crypto::decode` give a module for the two
+/// base64 encodings, against the test vectors of RFC 4648 section 10, and
+/// what `decode` refuses. A module may have stored or sent what `encode`
+/// returned, so the text is a contract; and `decode` is strict on purpose —
+/// the padded form requires its padding, the URL-safe form forbids it, and
+/// neither accepts another alphabet, whitespace, or trailing bits that are
+/// not zero (two spellings of one value).
+#[tokio::test]
+async fn test_crypto_base64_known_answers_and_refusals() {
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    use wit_crypto::Encoding::{Base64, Base64url};
+    for (plain, padded, url_safe) in [
+        (&b""[..], "", ""),
+        (&b"f"[..], "Zg==", "Zg"),
+        (&b"fo"[..], "Zm8=", "Zm8"),
+        (&b"foo"[..], "Zm9v", "Zm9v"),
+        (&b"foob"[..], "Zm9vYg==", "Zm9vYg"),
+        (&b"fooba"[..], "Zm9vYmE=", "Zm9vYmE"),
+        (&b"foobar"[..], "Zm9vYmFy", "Zm9vYmFy"),
+        // The two characters the alphabets disagree on.
+        (&[0xfb, 0xff, 0xfe][..], "+//+", "-__-"),
+        (&[0xff, 0xef][..], "/+8=", "_-8"),
+    ] {
+        for (encoding, text) in [(Base64, padded), (Base64url, url_safe)] {
+            assert_eq!(
+                <AegixContext as wit_crypto::Host>::encode(&mut ctx, encoding, plain.to_vec())
+                    .await,
+                text,
+                "encode {plain:?}"
+            );
+            assert_eq!(
+                <AegixContext as wit_crypto::Host>::decode(&mut ctx, encoding, text.to_string())
+                    .await
+                    .ok(),
+                Some(plain.to_vec()),
+                "decode {text:?}"
+            );
+        }
+    }
+
+    for (encoding, text, why) in [
+        (Base64, "Zg", "padding left off"),
+        (Base64, "Zg=", "one padding character of two"),
+        (Base64, "Zg===", "one padding character too many"),
+        (Base64, "Zh==", "trailing bits that are not zero"),
+        (Base64, "Zm9v\n", "a newline"),
+        (Base64, "Zm 9v", "a space"),
+        (Base64, "-__-", "the URL-safe alphabet"),
+        (Base64, "Zm9vY", "a length no encoding produces"),
+        (Base64url, "Zg==", "padding"),
+        (Base64url, "Zh", "trailing bits that are not zero"),
+        (Base64url, "+//+", "the standard alphabet"),
+        (Base64url, "Zm9v ", "a space"),
+        (Base64url, "Zm9vY", "a length no encoding produces"),
+    ] {
+        assert!(
+            matches!(
+                <AegixContext as wit_crypto::Host>::decode(&mut ctx, encoding, text.to_string())
+                    .await,
+                Err(wit_crypto::Error::Invalidinput)
+            ),
+            "{text:?} must be refused: {why}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_crypto_random_bytes_limits() {
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    // 1.1 MB (limit is 1 MB)
+    let result = <AegixContext as wit_crypto::Host>::random_bytes(&mut ctx, 1_100_000).await;
+    assert!(
+        result.is_empty(),
+        "Random bytes request > 1MB should return empty vector"
+    );
+
+    let ok_result = <AegixContext as wit_crypto::Host>::random_bytes(&mut ctx, 100).await;
+    assert_eq!(ok_result.len(), 100);
+}
+
+#[tokio::test]
+async fn test_json_path_query() {
+    use crate::bindings::aegix::core::json::{self as wit_json};
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    let json = r#"{"user": {"email": "test@example.com", "tags": ["a", "b"]}, "items": [1, 2, 3]}"#;
+
+    // Simple path
+    let res = <AegixContext as wit_json::Host>::query(
+        &mut ctx,
+        json.to_string(),
+        "user.email".to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(res, "\"test@example.com\"");
+
+    // Array index
+    let res =
+        <AegixContext as wit_json::Host>::query(&mut ctx, json.to_string(), "items[1]".to_string())
+            .await
+            .unwrap();
+    assert_eq!(res, "2");
+
+    // Nested array
+    let res = <AegixContext as wit_json::Host>::query(
+        &mut ctx,
+        json.to_string(),
+        "user.tags[0]".to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(res, "\"a\"");
+
+    // Invalid path
+    let res = <AegixContext as wit_json::Host>::query(
+        &mut ctx,
+        json.to_string(),
+        "nonexistent".to_string(),
+    )
+    .await;
+    assert!(matches!(res, Err(wit_json::Error::Invalidpath)));
+}
+
+#[tokio::test]
+async fn test_logging_redaction() {
+    use crate::bindings::aegix::core::logging::{self as wit_logging};
+    let mut secrets = HashMap::new();
+    secrets.insert(
+        "API_KEY".to_string(),
+        zeroize::Zeroizing::new("secret-token-123".to_string()),
+    );
+
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        secrets,
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    // We can't easily capture tracing output in a unit test without complex setup,
+    // but we can verify the redaction logic doesn't crash and the NATS publish
+    // (if it were configured) would use the redacted message.
+    // For now, just ensure it runs.
+    <AegixContext as wit_logging::Host>::log(
+        &mut ctx,
+        wit_logging::Level::Info,
+        "Key is secret-token-123".to_string(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_datetime_operations() {
+    use crate::bindings::aegix::core::datetime::{self as wit_datetime};
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Minimal,
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+
+    let now = <AegixContext as wit_datetime::Host>::now_unix(&mut ctx).await;
+    assert!(now > 1700000000); // Sometime in the recent past
+
+    let iso = "2024-01-01T00:00:00Z";
+    let ts = <AegixContext as wit_datetime::Host>::parse(&mut ctx, iso.to_string(), None)
+        .await
+        .unwrap();
+    assert_eq!(ts, 1704067200);
+
+    let formatted =
+        <AegixContext as wit_datetime::Host>::format(&mut ctx, ts, "%Y-%m-%d".to_string())
+            .await
+            .unwrap();
+    assert_eq!(formatted, "2024-01-01");
+}
+
+/// Tiny single-shot loopback HTTP server (no external dep). Binds
+/// `127.0.0.1:0`, accepts ONE connection, reads the raw request bytes,
+/// then replies `200 OK` with a `{}` body. Returns `(bound_port,
+/// JoinHandle<captured request String>)` so a test can connect then await
+/// the captured bytes.
+async fn spawn_loopback_capture_server() -> (u16, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        // Read whatever the client sends in the first chunk — enough to
+        // capture the request line + headers for assertion.
+        let mut buf = vec![0u8; 8192];
+        let n = socket.read(&mut buf).await.expect("read request");
+        let captured = String::from_utf8_lossy(&buf[..n]).to_string();
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        socket.write_all(resp).await.expect("write response");
+        socket.flush().await.ok();
+        captured
+    });
+    (port, handle)
+}
+
+/// A real fetch by a run that asked to keep what it received: the response
+/// is kept in the shape a fixture has, and nothing of the REQUEST is — its
+/// header value and body stand in for resolved secrets here.
+#[tokio::test]
+async fn a_real_response_is_captured_and_the_request_is_not() {
+    // Same dev-only loopback setup as the test below, stated on this context
+    // alone (`with_dev_egress`) rather than set in the process environment.
+    let (port, server) = spawn_loopback_capture_server().await;
+
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Http,
+        vec!["localhost".to_string()],
+        vec!["POST".to_string()],
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap()
+    .with_dev_egress(DevEgressOptIns::LOOPBACK);
+    let capture = std::sync::Arc::new(crate::http_replay::HttpCapture::new());
+    ctx.http_capture = Some(capture.clone());
+
+    let resp = wit_http::Host::fetch(
+        &mut ctx,
+        wit_http::Request {
+            method: wit_http::Method::Post,
+            url: format!("http://localhost:{port}/v1/items?cursor=request-only-query"),
+            headers: vec![(
+                "Authorization".to_string(),
+                "Bearer request-only-credential".to_string(),
+            )],
+            body: br#"{"secret":"request-only-body"}"#.to_vec(),
+            timeout_ms: None,
+        },
+    )
+    .await
+    .expect("the loopback server answers");
+    assert_eq!(resp.status, 200);
+    let sent = server.await.expect("server task");
+    assert!(
+        sent.contains("request-only-credential"),
+        "premise: the request really carried the header"
+    );
+
+    let (kept, dropped) = capture.taken();
+    assert_eq!(dropped, 0);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        (kept[0].method, kept[0].host.as_str(), kept[0].path.as_str()),
+        ("POST", "localhost", "/v1/items")
+    );
+    assert_eq!(
+        (kept[0].status, kept[0].body.as_slice()),
+        (200, b"{}".as_slice())
+    );
+    let everything = format!("{kept:?}");
+    assert!(
+        !everything.contains("request-only"),
+        "nothing of the request is kept: {everything}"
+    );
+
+    // Control: a run that did not ask keeps nothing (and pays one branch).
+    assert!(AegixContext::new(
+        CapabilityWorld::Http,
+        vec![],
+        vec![],
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap()
+    .http_capture
+    .is_none());
+}
+
+/// Regression for the `fetch_with_bearer` double-"Bearer" 401 bug.
+///
+/// `SecretProvider::into_auth_header(slot, "Authorization")` ALREADY
+/// prepends `"Bearer "`. The bug prepended a SECOND `"Bearer "`, sending
+/// `Authorization: Bearer Bearer <token>` → every upstream rejected it
+/// with 401 (first seen against api.github.com via github-pr-reviewer).
+/// This test drives a real `fetch_with_bearer` against a loopback server
+/// and asserts the wire header is exactly `Bearer <token>` (single prefix).
+#[tokio::test]
+async fn fetch_with_bearer_sends_single_bearer_prefix() {
+    // The loopback target is a private IP, which the per-execution SSRF
+    // resolver blocks without the dev-only private-target opt-in, and the
+    // loopback server speaks plaintext HTTP, which the scheme gate rejects
+    // without the insecure-HTTP opt-in. Both are stated on THIS context
+    // (`with_dev_egress` below). They used to be set in the process
+    // environment, where under plain `cargo test` every other test saw them.
+
+    let (port, server) = spawn_loopback_capture_server().await;
+
+    let mut secrets = HashMap::new();
+    secrets.insert(
+        "test/token".to_string(),
+        zeroize::Zeroizing::new("ghs_testtoken12345".to_string()),
+    );
+
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Secrets,
+        // Use the `localhost` HOSTNAME (not a 127.0.0.1 IP *literal*): the
+        // host-entry `denied_ip_literal` gate unconditionally blocks private
+        // IP literals, but a hostname is checked at connect time by the
+        // per-execution SSRF resolver — which DOES honour the
+        // private-target opt-in when the host is in this
+        // explicit allowlist (no `*`). So `localhost` reaches the loopback
+        // server while still exercising the real fetch_with_bearer path.
+        vec!["localhost".to_string()],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        secrets,
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap()
+    .with_dev_egress(DevEgressOptIns::LOOPBACK);
+
+    // Grant the secret path — an empty allowlist is deny-all, so without
+    // this grant get_secret returns Unauthorized. `test/token` is NOT a
+    // reserved host path (not an LLM-provider / OAuth-refresh key), so the
+    // grant is honoured.
+    ctx.set_allowed_secrets(vec!["test/token".to_string()]);
+
+    // Resolve the secret path to a host-internal u64 slot exactly the way a
+    // guest module would (via the guest-facing get-secret host fn).
+    let slot = <AegixContext as crate::bindings::aegix::core::secrets::Host>::get_secret(
+        &mut ctx,
+        "test/token".to_string(),
+    )
+    .await
+    .expect("get_secret should resolve the in-memory secret to a slot");
+
+    let req = wit_http::Request {
+        method: wit_http::Method::Get,
+        url: format!("http://localhost:{}/", port),
+        headers: vec![],
+        body: vec![],
+        timeout_ms: None,
+    };
+
+    let resp = ctx.fetch_with_bearer(slot, req).await;
+    assert!(
+        resp.is_ok(),
+        "fetch_with_bearer should reach the loopback server: {:?}",
+        resp.err()
+    );
+
+    let captured = server.await.expect("server task");
+
+    // Find the Authorization header line and assert the single-prefix value.
+    let auth_line = captured
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+        .expect("request must carry an Authorization header");
+    let value = auth_line
+        .split_once(':')
+        .map(|(_, v)| v.trim())
+        .unwrap_or("");
+    assert_eq!(
+        value, "Bearer ghs_testtoken12345",
+        "Authorization header must carry exactly one Bearer prefix"
+    );
+    // Core regression guard: the double-prefix substring must NOT appear.
+    assert!(
+        !captured.contains("Bearer Bearer"),
+        "request must NOT contain a doubled `Bearer Bearer` prefix (the 401 bug)"
+    );
+}
+
+/// Regression for the local-LLM SSRF-bypass fix: the dedicated
+/// `local_llm_http_client()` (used for local Ollama in `wit_llm::complete`
+/// when `is_local`) must NOT carry the per-execution SSRF-filtering DNS
+/// resolver — local Ollama lives on a private IP (loopback / LAN), which
+/// the guest SSRF-filtered client correctly blocks. This proves the local
+/// client can reach a private loopback target.
+#[tokio::test]
+async fn local_llm_client_reaches_private_loopback() {
+    let (port, server) = spawn_loopback_capture_server().await;
+
+    let resp = crate::host_impl::local_llm_http_client()
+        .get(format!("http://127.0.0.1:{}/", port))
+        .send()
+        .await;
+
+    assert!(
+        resp.is_ok(),
+        "local_llm_http_client must reach a private loopback IP (Ollama egress): {:?}",
+        resp.as_ref().err()
+    );
+    assert_eq!(
+        resp.unwrap().status(),
+        200,
+        "loopback server should return 200"
+    );
+
+    // Drain the server task so it doesn't leak.
+    let _ = server.await;
+}
+
+/// A denied fetch must leave a `[host:*]` line in the caller's sink.
+///
+/// This is the probe that produced NOTHING before: `run_sandbox` with a
+/// deliberately-failing fetch returned only the module's opaque error,
+/// because the diagnostic route required an execution id the handler
+/// doesn't have. Exercises the REAL deny path (`wit_http::fetch` →
+/// `record_capability_denied` → `emit_host_diagnostic`), not a stub.
+#[tokio::test]
+async fn denied_fetch_lands_in_the_in_process_diagnostic_sink() {
+    let sink: crate::context::HostDiagSink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Http,
+        // Empty allowlist ⇒ deny-all, the "no host allowlist configured" arm.
+        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        128,
+        HashMap::new(),
+        None, // redis
+        None, // NATS — exactly the run_sandbox / test_module shape
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+    ctx.host_diag_sink = Some(sink.clone());
+
+    let req = wit_http::Request {
+        method: wit_http::Method::Get,
+        url: "https://blocked.example.com/thing".to_string(),
+        headers: vec![],
+        body: vec![],
+        timeout_ms: None,
+    };
+    let result = ctx.fetch(req).await;
+    assert!(matches!(result, Err(wit_http::Error::Forbiddenhost)));
+
+    let lines = sink.lock().unwrap().clone();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the deny must be explained exactly once, got: {lines:?}"
+    );
+    assert!(
+        lines[0].starts_with("[host:"),
+        "diagnostic lines carry the [host:<reason>] tag: {}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("no-allowlist-configured"),
+        "the line must name the policy that fired, not just say 'denied': {}",
+        lines[0]
+    );
+    // Sanitization contract: fixed policy tokens plus caller-supplied values
+    // only. The host is the caller's own; nothing else leaks.
+    assert!(lines[0].contains("blocked.example.com"));
+}
+
+/// The `http://127.0.0.1:9` probe from the #617 write-up returns
+/// `Invalidurl` via the HTTPS-only SCHEME gate — it never reaches the
+/// private-IP SSRF guard (which returns `Forbiddenhost`). Pinned because
+/// the two were conflated in a prior diagnosis: the SSRF guard sits BELOW
+/// the scheme gate in `wit_http::fetch`, so a plaintext loopback URL is
+/// refused for its scheme and its IP is never classified at all. Asserted
+/// at the classifier rather than through `fetch`: when this was written
+/// `WASM_ALLOW_INSECURE_HTTP` was read from the process environment per call
+/// and a sibling test in this binary set it, so a fetch-level assertion was
+/// order-dependent under plain `cargo test`. No test sets it any more (the
+/// opt-in is stated per context, `with_dev_egress`); the classifier-level
+/// assertion stays because it is the narrower statement of the same fact.
+#[test]
+fn loopback_http_probe_is_refused_by_the_scheme_gate_not_the_ssrf_guard() {
+    use crate::host::egress::{classify_url_scheme, UrlSchemeVerdict};
+
+    let url: url::Url = "http://127.0.0.1:9".parse().expect("valid url");
+    // Without the operator opt-in — the production default — the scheme
+    // alone decides, and the verdict maps to `Invalidurl`, NOT
+    // `Forbiddenhost`.
+    assert!(matches!(
+        classify_url_scheme(url.scheme(), false),
+        UrlSchemeVerdict::InsecureRefused { .. }
+    ));
+    // The private-IP guard WOULD have fired on this host — which is exactly
+    // why the distinction matters: identical URL, two different reasons, and
+    // only the diagnostic line says which one ran.
+    assert!(
+        crate::host::egress::denied_ip_literal(&url).is_some(),
+        "127.0.0.1 is a denied IP literal — but the scheme gate refuses it first"
+    );
+}
+
+/// Unit semantics of the per-call `fetch_all` byte budget.
+#[test]
+fn a_batch_reservation_is_released_unless_kept() {
+    use crate::host::BatchByteBudget;
+    let budget = std::sync::Arc::new(BatchByteBudget::new(100));
+    let mut a = budget.reservation();
+    assert!(a.grow(60));
+    let mut b = budget.reservation();
+    assert!(!b.grow(50), "60 + 50 exceeds the cap");
+    assert!(b.grow(40), "a refused grow reserved nothing");
+    assert_eq!(budget.used(), 100);
+    drop(b); // an entry that failed
+    assert_eq!(
+        budget.used(),
+        60,
+        "a dropped reservation gives its bytes back"
+    );
+    a.keep(); // an entry that succeeded
+    assert_eq!(budget.used(), 60, "a kept reservation holds its bytes");
+}
+
+/// Loopback server answering every connection with a `body_len`-byte body.
+async fn spawn_loopback_bulk_server(body_len: usize, conns: usize) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    tokio::spawn(async move {
+        for _ in 0..conns {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                );
+                if socket.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let block = vec![b'z'; 64 * 1024];
+                let mut left = body_len;
+                while left > 0 {
+                    let n = left.min(block.len());
+                    if socket.write_all(&block[..n]).await.is_err() {
+                        return; // the client gave up on this entry
+                    }
+                    left -= n;
+                }
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    port
+}
+
+/// Production path: a batch whose bodies are each under the per-entry cap but
+/// together far over the per-CALL budget. Pre-fix every entry succeeded and
+/// the call held all of it (here 64 MiB; up to 10 GB at the call-count cap).
+/// Now the successful bodies together stay within the budget, the rest fail,
+/// and at least one full-size entry still gets through.
+#[tokio::test]
+async fn fetch_all_holds_at_most_one_call_budget_of_response_bytes() {
+    // Same dev-only loopback opt-ins as `fetch_with_bearer_sends_single_bearer_prefix`,
+    // stated on this context.
+    const BODY: usize = 8 * 1024 * 1024;
+    const ENTRIES: usize = 8;
+    let port = spawn_loopback_bulk_server(BODY, ENTRIES).await;
+
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Http,
+        vec!["localhost".to_string()],
+        vec!["GET".to_string()],
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap()
+    .with_dev_egress(DevEgressOptIns::LOOPBACK);
+    let reqs = (0..ENTRIES)
+        .map(|i| wit_http::Request {
+            method: wit_http::Method::Get,
+            url: format!("http://localhost:{port}/{i}"),
+            headers: vec![],
+            body: vec![],
+            timeout_ms: Some(30_000),
+        })
+        .collect();
+    let out = ctx.fetch_all(reqs).await;
+    let ok_bytes: usize = out
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|r| r.body.len())
+        .sum();
+    let ok = out.iter().filter(|r| r.is_ok()).count();
+    assert!(
+        ok >= 1,
+        "at least one full-size entry must fit: {out:?}",
+        out = out
+            .iter()
+            .map(|r| r.as_ref().map(|r| r.body.len()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ok < ENTRIES,
+        "the batch must not hold every body ({ok} of {ENTRIES} succeeded)"
+    );
+    assert!(
+        ok_bytes <= crate::host::FETCH_ALL_MAX_RESPONSE_BYTES_PER_CALL,
+        "the call held {ok_bytes} response bytes"
+    );
+}
+
+/// The dispatch binding a context stamps on its data-plane RPCs (2026-10-29)
+/// is exactly the two ids its execution context holds — the job's run and the
+/// job's own row — and nothing when it has none (a rehearsal), which the
+/// controller admits only on its own identity.
+#[test]
+fn a_context_binds_its_rpcs_to_its_run_and_job_and_a_rehearsal_to_nothing() {
+    let mut ctx = AegixContext::new(
+        CapabilityWorld::Agent,
+        vec![],
+        vec![],
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.dispatch_binding(),
+        None,
+        "no execution context: unbound"
+    );
+
+    let run = uuid::Uuid::new_v4();
+    let job = uuid::Uuid::new_v4();
+    ctx.set_workflow_context(run.to_string(), job.to_string(), "talos://m".into());
+    let bound = ctx.dispatch_binding().expect("a dispatched job is bound");
+    assert_eq!((bound.execution_id, bound.job_id), (run, job));
+
+    // An id that is not a UUID (a legacy pipeline log id) binds nothing rather
+    // than something false.
+    ctx.set_workflow_context(
+        run.to_string(),
+        format!("{run}-pipeline"),
+        "talos://m".into(),
+    );
+    assert_eq!(ctx.dispatch_binding(), None);
+}

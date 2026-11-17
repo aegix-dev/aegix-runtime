@@ -1,0 +1,191 @@
+//! Host function implementations for all WIT interfaces.
+//!
+//! Each `impl <interface>::Host for AegixContext` block provides the host side
+//! of one WIT interface imported by the `automation-node` world.
+//!
+//! Split out of the former single-file `host_impl.rs` into per-interface
+//! modules (May-2026 workspace hygiene). Every submodule is glob
+//! re-exported here so `crate::host::<item>` — and, via the
+//! `crate::host_impl` re-export shim — `crate::host_impl::<item>` keep
+//! resolving exactly as before the split. Shared plumbing (the `wit_*`
+//! binding aliases, `AegixContext`, cross-interface constants and
+//! helpers) flows into each submodule through its `use super::*;`.
+
+pub(crate) use crate::circuit_breaker::get_global_circuit_breaker;
+pub(crate) use crate::context::AegixContext;
+
+// Bring the generated WIT bindings into scope.
+pub(crate) use crate::bindings::aegix::core::{
+    agent_memory as wit_agent_memory, agent_orchestration as wit_agent_orchestration,
+    cache as wit_cache, context_window as wit_context_window, crypto as wit_crypto,
+    data_transform as wit_data_transform, database as wit_database, datetime as wit_datetime,
+    email as wit_email, embedding as wit_embedding, env as wit_env, events as wit_events,
+    files as wit_files, graph_memory as wit_graph_memory, graphql as wit_graphql, http as wit_http,
+    http_stream as wit_http_stream, integration_state as wit_integration_state, json as wit_json,
+    llm as wit_llm, llm_streaming as wit_llm_streaming, llm_tools as wit_llm_tools,
+    logging as wit_logging, messaging as wit_messaging, model as wit_model,
+    object_storage as wit_object_storage, resource_quotas as wit_resource_quotas,
+    secrets as wit_secrets, state as wit_state, templates as wit_templates, webhook as wit_webhook,
+};
+pub(crate) use futures_util::StreamExt;
+pub(crate) use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+mod ceiling_axis_pins;
+// Every host function names itself for the fuel profile (derived population).
+#[cfg(test)]
+mod host_call_label_pins;
+#[cfg(test)]
+#[path = "../host_impl_tests.rs"]
+mod host_impl_tests;
+
+#[cfg(test)]
+mod cancellation_tests;
+
+#[cfg(test)]
+mod method_allowlist_tests;
+
+#[cfg(test)]
+mod reason_class_denial_tests;
+
+#[cfg(test)]
+mod sibling_egress_reason_tests;
+
+/// A tier-2 + `egress_scope = local` actor is refused a public IP literal on
+/// every guest HTTP surface (2026-09-25).
+#[cfg(test)]
+mod local_egress_literal_tests;
+
+#[cfg(test)]
+mod sse_connect_failure_tests;
+
+/// The dev-only private-target opt-in at each host-function pre-check, stated
+/// on the context instead of set in the process environment (2026-10-06).
+#[cfg(test)]
+mod dev_egress_gate_tests;
+/// `fetch` / `fetch_all` admission, pinned per refusal across the extraction
+/// into `egress_admission`.
+#[cfg(test)]
+mod http_admission_characterization_tests;
+/// `vault://` body substitution must reach every guest-composed egress
+/// surface, not only `http::fetch` (2026-09-24).
+#[cfg(test)]
+mod vault_body_parity_tests;
+/// A credential travels only to a host named in `allowed_hosts`, on every
+/// surface that substitutes one (E-3, 2026-10-14).
+#[cfg(test)]
+mod vault_destination_tests;
+
+/// A granted `vault://` reference the run was not given is explained in the
+/// run's host diagnostics, not left as a bare `forbiddenhost` (2026-10-29).
+#[cfg(test)]
+mod vault_unresolved_tests;
+
+mod cache;
+mod crypto;
+mod data;
+mod database;
+mod egress;
+/// The operator-grant host matcher the egress gates use, exported so the
+/// controller can reason about an `allowed_hosts` list by the same rule the
+/// worker enforces (no second implementation to drift).
+pub use egress::host_allowlist_match;
+mod egress_admission;
+mod email;
+mod files;
+mod governance;
+mod graphql;
+mod http;
+mod http_stream;
+mod integration_state;
+pub(crate) mod limits;
+/// Byte-level SSE line reader shared by the two streaming readers.
+mod line_reader;
+mod llm;
+pub(crate) mod llm_gate;
+
+/// The local LLM backend this worker calls (`OLLAMA_URL`), for the fleet
+/// queue's key (RFC 0014 P3b).
+pub fn local_llm_backend_url() -> &'static str {
+    llm::ollama_base_url()
+}
+/// RFC 0014 P1: progress-based deadlines for a local (Ollama) exchange.
+mod llm_local_stream;
+pub(crate) mod llm_providers;
+mod llm_streaming;
+mod llm_tools;
+mod logging;
+mod memory;
+mod messaging;
+mod model;
+mod object_storage;
+mod orchestration;
+mod secrets;
+mod state;
+mod vault;
+mod webhook;
+
+// Glob re-exports keep every item reachable at `crate::host::<item>`
+// (and, via the `host_impl` shim, `crate::host_impl::<item>`) exactly
+// as before the split. Some submodules currently export nothing that
+// other modules reference — the narrow allow keeps the re-export
+// surface uniform instead of curating per-module (same pattern as the
+// `trace_nats` / `audit` re-export shims).
+#[allow(unused_imports)]
+pub(crate) use cache::*;
+#[allow(unused_imports)]
+pub(crate) use crypto::*;
+#[allow(unused_imports)]
+pub(crate) use data::*;
+#[allow(unused_imports)]
+pub(crate) use database::*;
+#[allow(unused_imports)]
+pub(crate) use egress::*;
+
+/// The gated `wasi:http/outgoing-handler` (trusted world only) and its
+/// hardened send path (2026-09-25).
+pub(crate) mod wasi_http;
+#[allow(unused_imports)]
+pub(crate) use email::*;
+#[allow(unused_imports)]
+pub(crate) use files::*;
+#[allow(unused_imports)]
+pub(crate) use governance::*;
+#[allow(unused_imports)]
+pub(crate) use graphql::*;
+#[allow(unused_imports)]
+pub(crate) use http::*;
+#[allow(unused_imports)]
+pub(crate) use http_stream::*;
+#[allow(unused_imports)]
+pub(crate) use integration_state::*;
+#[allow(unused_imports)]
+pub(crate) use limits::*;
+#[allow(unused_imports)]
+pub(crate) use llm::*;
+#[allow(unused_imports)]
+pub(crate) use llm_streaming::*;
+#[allow(unused_imports)]
+pub(crate) use llm_tools::*;
+#[allow(unused_imports)]
+pub(crate) use logging::*;
+#[allow(unused_imports)]
+pub(crate) use memory::*;
+#[allow(unused_imports)]
+pub(crate) use messaging::*;
+#[allow(unused_imports)]
+pub(crate) use object_storage::*;
+#[allow(unused_imports)]
+pub(crate) use orchestration::*;
+#[allow(unused_imports)]
+pub(crate) use secrets::*;
+#[allow(unused_imports)]
+pub(crate) use state::*;
+#[allow(unused_imports)]
+pub(crate) use vault::*;
+#[allow(unused_imports)]
+pub(crate) use webhook::*;
+
+// `verify_signed_agent_envelope` was `pub` (crate-external) in the
+// pre-split host_impl.rs — keep it exported at the same visibility.
+pub use orchestration::verify_signed_agent_envelope;

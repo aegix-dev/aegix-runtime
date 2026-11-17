@@ -1,0 +1,21 @@
+[package]
+name = "aegix-replay-guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+aegix-redis = { path = "../aegix-redis" }
+aegix-config = { path = "../aegix-config" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

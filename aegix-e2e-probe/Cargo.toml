@@ -1,0 +1,31 @@
+[package]
+name = "aegix-e2e-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# The hardened leg of `make test-e2e` (scripts/test-e2e.sh): a process that
+# connects to the live broker as one pinned worker identity and asks for what
+# that identity must be refused — another worker's RPC replies, and an RPC
+# served for another worker's claimed job. Never shipped in an image; it links
+# the worker library only for the worker's own connect options, so the
+# connection it makes is byte-for-byte the one a worker makes.
+
+[[bin]]
+name = "aegix-e2e-probe"
+path = "src/main.rs"
+
+[dependencies]
+worker = { path = "../worker" }
+aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
+aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
+async-nats.workspace = true
+tokio = { workspace = true, features = ["full"] }
+anyhow.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["serde", "v4"] }
+
+[lints]
+workspace = true

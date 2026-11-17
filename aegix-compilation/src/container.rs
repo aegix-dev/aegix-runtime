@@ -1,0 +1,1459 @@
+//! Compilation container isolation for Aegix WASM module builds.
+//!
+//! Wraps `cargo component build` (and `cargo audit`) in a rootless Podman (or
+//! Docker) container to prevent proc-macro escape from the WASM sandbox.
+//!
+//! The container runs with `--network=none`, `--read-only`, memory/cpu limits,
+//! and a non-root user. User-supplied Rust code never executes on the host.
+//!
+//! # Configuration
+//!
+//! - `AEGIX_COMPILATION_CONTAINER` — on by default in a deployment that faces
+//!   users ([`compile_sandbox_required`]), off in development. In development
+//!   `"false"` compiles with a direct `cargo` on the host; in a deployment that
+//!   faces users a compile that cannot run in the container is REFUSED — there
+//!   is no acknowledgement that runs it on the host (operator decision G-9,
+//!   2026-10-15; `AEGIX_COMPILATION_ALLOW_HOST_FALLBACK` is retired and refused
+//!   at boot when set there).
+//! - `AEGIX_BUILDER_IMAGE` — Container image name. Default: `talos-builder:latest`.
+//! - `AEGIX_BUILDER_MEMORY` — Memory limit. Default: `2g`.
+//! - `AEGIX_BUILDER_CPUS` — CPU limit. Default: `2`.
+
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use tokio::process::Command;
+
+use crate::sandbox_run::SandboxCommand;
+
+/// The default container image built by `scripts/build-compiler-image.sh`.
+const DEFAULT_IMAGE: &str = "talos-builder:latest";
+
+/// Stable, image-baked path of the RustSec advisory database. Both
+/// `controller/Dockerfile` (the runtime/fallback) and `Dockerfile.builder`
+/// (the network-isolated sandbox) stage the DB here at image build time.
+/// The compilation service passes this via `cargo audit --db <PATH>` so
+/// the path is explicit, not derived from $CARGO_HOME (which the runtime
+/// points at a tmpfs that gets wiped per pod).
+pub const ADVISORY_DB_PATH: &str = "/opt/talos-advisory-db";
+
+/// Default memory limit for the compilation container.
+const DEFAULT_MEMORY: &str = "2g";
+
+/// Default CPU limit for the compilation container.
+const DEFAULT_CPUS: &str = "2";
+
+/// Process-count ceiling inside every sandbox container (2026-09-10). The
+/// memory and CPU limits bound how MUCH a fork bomb can consume, not how
+/// many processes it can spawn before the OOM killer notices; `--pids-limit`
+/// is the control that does. 512 is generous for `cargo` (rustc + a proc-
+/// macro server per crate, sccache, linker) and for jco / componentize-py.
+const CONTAINER_PIDS_LIMIT: &str = "512";
+
+/// Environment variables a HOST-side fallback spawn (`cargo`, `jco`,
+/// `componentize-py` running directly on the controller host) may inherit.
+///
+/// Everything else is dropped by `env_clear()` in [`host_command`]
+/// (2026-09-10). Before this, every host fallback inherited the controller's
+/// WHOLE environment — `WORKER_SHARED_KEY`, `AEGIX_MASTER_KEY`,
+/// `DATABASE_URL`, `ANTHROPIC_API_KEY`, the vault token, … — and a
+/// user-supplied `build.rs`, proc-macro, or `env!("AEGIX_MASTER_KEY")` runs
+/// in that process. The container path never had this problem (`podman run`
+/// starts from an empty environment).
+///
+/// This narrows the fallback; it does NOT make it equivalent to the
+/// container. The build still runs as the controller's user, in its PID and
+/// mount namespaces, with its network: a `build.rs` can read the parent's
+/// environment from `/proc/<ppid>/environ` (blocked only while the controller
+/// is non-dumpable) and any file the controller user can read. That is why
+/// production refuses the host fallback without an explicit
+/// single-tenant-RCE acknowledgement (`sandbox_decision`).
+///
+/// The list is what the toolchains demonstrably need: process basics (PATH,
+/// HOME, user, locale, temp dir, XDG cache roots — jco's wizer step writes a
+/// wasmtime cache there), cargo/rustup discovery + caches, the sccache wrapper
+/// this workspace's dev boxes use, TLS roots, the Aegix WIT/SDK fixture
+/// overrides the scaffold reads, and the host-language toolchain roots. No
+/// `*_KEY`, `*_URL`, `*_TOKEN`, `*SECRET*` or `*PASSWORD*` name is on it, and
+/// a test pins that shape.
+const HOST_SPAWN_ENV_ALLOWLIST: &[&str] = &[
+    // Process basics.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    // Rust toolchain discovery + caches. `CARGO_TARGET_DIR` is re-set by
+    // the caller when a per-user cache is in play (see `build_command`).
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_JOBS",
+    "CARGO_NET_OFFLINE",
+    "CARGO_HTTP_CAINFO",
+    "RUSTC_WRAPPER",
+    "SCCACHE_DIR",
+    "SCCACHE_CACHE_SIZE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    // Aegix scaffold fixture overrides (paths, not secrets).
+    "AEGIX_WIT_PATH",
+    "AEGIX_SDK_MACROS_PATH",
+    "AEGIX_DEFAULT_WIT_WORLD",
+    // Host-language toolchains (jco / componentize-py).
+    "NODE_PATH",
+    "NPM_CONFIG_CACHE",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "VIRTUAL_ENV",
+];
+
+/// Build a HOST-side command whose environment is `env_clear()`ed and then
+/// re-populated ONLY from [`HOST_SPAWN_ENV_ALLOWLIST`]. Every host-fallback
+/// spawn in this crate goes through here — `build_command`, `audit_command`,
+/// `tool_command` — so a fourth spawn site cannot quietly inherit the
+/// controller's credentials again. Callers may still `.env(...)` on top
+/// (e.g. `CARGO_TARGET_DIR`). It is a [`SandboxCommand`], so it too can only
+/// be started through the bounded `run` (2026-09-25).
+pub(crate) fn host_command(program: &str) -> SandboxCommand {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    for key in HOST_SPAWN_ENV_ALLOWLIST {
+        if let Some(v) = std::env::var_os(key) {
+            cmd.env(key, v);
+        }
+    }
+    SandboxCommand::host(cmd)
+}
+
+/// MCP-753 (2026-05-13): read an env var and treat empty strings as
+/// unset. Helm placeholder pattern (`AEGIX_BUILDER_MEMORY: ""` in
+/// values.yaml when the operator hasn't overridden the override)
+/// makes `std::env::var(...)` return `Ok("")`, which the natural
+/// `unwrap_or_else(|_| default)` path then PASSES THROUGH because
+/// the closure only fires on `Err`. Without this helper, an empty
+/// env value flowed verbatim into the container runtime as
+/// `podman run ... --memory "" --cpus "" ...` and the container
+/// failed to start with an opaque exit code 125 / "invalid memory
+/// format" — operators saw "compilation failed" with no clean
+/// attribution to the misconfigured env var. Same empty-env class
+/// as MCP-590/591/653/710/752.
+fn nonempty_env_or(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Returns `true` when compilation should run inside a container.
+///
+/// Checks `AEGIX_COMPILATION_CONTAINER` env var first; falls back to
+/// production = true, development = false.
+///
+/// 2026-08-28: the `.filter(|v| !v.is_empty())` is load-bearing, and this is
+/// the one site in the empty-env sweep where an empty value changed BEHAVIOUR
+/// rather than a report. Pre-fix the `Ok` arm bound `Ok("")`, and
+/// `!matches!("", "false"|"0"|"no")` is TRUE — so
+/// `AEGIX_COMPILATION_CONTAINER=""` forced containerised compilation ON in
+/// development, the opposite of the unset default (`is_production()` = false).
+/// A dev box with no container runtime then fail-closes through
+/// the sandbox rule and refuses to compile any module at all. Empty
+/// now means unset, matching this file's own `nonempty_env_or` (whose doc
+/// comment cites the same class) and `aegix_config::bool_env_or_default`,
+/// which likewise returns its default on empty.
+fn container_enabled() -> bool {
+    aegix_config::bool_env("AEGIX_COMPILATION_CONTAINER").unwrap_or_else(compile_sandbox_required)
+}
+
+/// Whether every compile must run in the sandbox container: the security
+/// profile enforces (`aegix_config::security_profile::profile().enforces()`,
+/// 2026-10-29 — `hardened` and `transitional`, which is every deployment that
+/// faces users: `RUST_ENV=production` AND `staging`, as
+/// `docker-compose.prod.yml` runs; until then this read
+/// `browser_hardening_required()` directly, the same population).
+/// Operator decision G-9 (2026-10-15): container mode is the only compile
+/// mode there. A host compile runs a user's `build.rs` and proc-macros on the
+/// controller, and the source scan in front of it is a per-line regex
+/// (security review G-9), so it is not offered at all — where until then the
+/// acknowledgement token `acknowledge-single-tenant-rce-risk` ran it, and
+/// `RUST_ENV=staging` ran it with no token.
+#[must_use]
+pub fn compile_sandbox_required() -> bool {
+    aegix_config::security_profile::profile().enforces()
+}
+
+/// The retired escape (G-9): it no longer runs a compile on the host.
+pub const RETIRED_HOST_FALLBACK: &str = "AEGIX_COMPILATION_ALLOW_HOST_FALLBACK";
+
+/// Refuse to boot a deployment that faces users while it still sets
+/// [`RETIRED_HOST_FALLBACK`]: an operator who relied on it learns at boot,
+/// not from the first refused compile. Development ignores it (a host compile
+/// needs no acknowledgement there).
+pub fn refuse_retired_host_fallback(sandbox_required: bool, setting: Option<&str>) -> Result<()> {
+    let set = setting.is_some_and(|v| !v.trim().is_empty());
+    if sandbox_required && set {
+        bail!(
+            "{RETIRED_HOST_FALLBACK} is set, and it is retired: a deployment that faces users \
+             compiles only in the sandbox container (operator decision G-9, 2026-10-15). Unset \
+             it, and give the controller a container runtime with the builder image, or set \
+             AEGIX_MODULE_COMPILATION=false with AEGIX_REGISTRY_URL to run registry-only."
+        );
+    }
+    Ok(())
+}
+
+/// [`refuse_retired_host_fallback`] for this process's environment.
+pub fn refuse_retired_host_fallback_from_env() -> Result<()> {
+    refuse_retired_host_fallback(
+        compile_sandbox_required(),
+        std::env::var(RETIRED_HOST_FALLBACK).ok().as_deref(),
+    )
+}
+
+/// Whether a compile invoked right now would actually run inside the
+/// sandbox container (container mode on AND a runtime binary present).
+///
+/// Callers use this to decide whether the M-13 host-toolchain gate applies:
+/// a sandboxed JS/Python compile needs no gate (that is the point of the
+/// sandbox); only the host-fallback path is production-gated.
+pub fn will_sandbox() -> bool {
+    container_enabled() && detect_runtime().is_some()
+}
+
+/// Why a Rust compile or audit would run on the host instead of the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostReason {
+    /// `AEGIX_COMPILATION_CONTAINER` turned container mode off.
+    ContainerDisabled,
+    /// Container mode is on but neither podman nor docker was found.
+    NoRuntime,
+}
+
+impl HostReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            HostReason::ContainerDisabled => "container_disabled",
+            HostReason::NoRuntime => "no_runtime",
+        }
+    }
+}
+
+/// Where a Rust compile or `cargo audit` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum SandboxDecision {
+    /// Inside the container, with this runtime.
+    Container(&'static str),
+    /// On the host: development only.
+    Host(HostReason),
+    /// Refused: a deployment that faces users ([`compile_sandbox_required`]).
+    Refuse(HostReason),
+}
+
+/// The one rule for running cargo unsandboxed (package CA, 2026-09-17; G-9,
+/// 2026-10-15). Both ways a compile can land on the host — container mode
+/// turned off, or no runtime found — are refused where the sandbox is
+/// required, and nothing waives that. `runtime` is only consulted when
+/// container mode is on (detecting it spawns processes).
+pub(crate) fn sandbox_decision(
+    container_enabled: bool,
+    runtime: Option<&'static str>,
+    sandbox_required: bool,
+) -> SandboxDecision {
+    let reason = match (container_enabled, runtime) {
+        (true, Some(rt)) => return SandboxDecision::Container(rt),
+        (true, None) => HostReason::NoRuntime,
+        (false, _) => HostReason::ContainerDisabled,
+    };
+    if sandbox_required {
+        SandboxDecision::Refuse(reason)
+    } else {
+        SandboxDecision::Host(reason)
+    }
+}
+
+/// [`sandbox_decision`] resolved from this process's environment: the ONE
+/// reading that `build_command`, `audit_command` and
+/// [`sandbox_availability`] share (2026-11-03), so what a status report
+/// says about compiling here and what a compile does cannot disagree.
+/// `detect_runtime` is consulted only when container mode is on (detecting
+/// it spawns `podman --version` / `docker --version`).
+fn resolve_sandbox_decision() -> SandboxDecision {
+    let enabled = container_enabled();
+    let runtime = if enabled { detect_runtime() } else { None };
+    sandbox_decision(enabled, runtime, compile_sandbox_required())
+}
+
+/// The sentence a refused sandbox decision is reported with, for `step`
+/// (`build` / `audit`). One spelling: `build_command` refuses with it and
+/// [`sandbox_availability`] reports it.
+fn sandbox_refusal(step: &str, reason: HostReason) -> String {
+    format!(
+        "Container compilation is required in a deployment that faces users ({}): {}. \
+         Give the controller podman or docker with the builder image and leave \
+         AEGIX_COMPILATION_CONTAINER unset or true, or set AEGIX_MODULE_COMPILATION=false \
+         with AEGIX_REGISTRY_URL to run registry-only. There is no host fallback \
+         (operator decision G-9, 2026-10-15).",
+        step,
+        match reason {
+            HostReason::ContainerDisabled => "AEGIX_COMPILATION_CONTAINER disables it",
+            HostReason::NoRuntime => "neither podman nor docker was found in PATH",
+        }
+    )
+}
+
+/// Resolves [`sandbox_decision`] from the environment for `step` (`build` /
+/// `audit`), logs it, and returns the container runtime or `None` for a host
+/// run. A refusal is an `Err`.
+fn resolve_sandbox_runtime(step: &str) -> Result<Option<&'static str>> {
+    match resolve_sandbox_decision() {
+        SandboxDecision::Container(rt) => Ok(Some(rt)),
+        SandboxDecision::Refuse(reason) => bail!("{}", sandbox_refusal(step, reason)),
+        SandboxDecision::Host(HostReason::ContainerDisabled) => {
+            tracing::debug!(step, "Container compilation disabled — using direct cargo");
+            Ok(None)
+        }
+        SandboxDecision::Host(HostReason::NoRuntime) => {
+            tracing::warn!(
+                step,
+                "Container compilation enabled but no runtime found — \
+                 falling back to direct cargo in non-production mode"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Where a compile asked for right now would run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileMode {
+    /// Directly on the controller host (development only).
+    Host,
+    /// Inside the sandbox container, with this runtime (`podman` / `docker`).
+    Container {
+        /// The runtime binary `build_command` would spawn.
+        runtime: &'static str,
+    },
+}
+
+impl CompileMode {
+    /// The word a status report uses for this mode.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompileMode::Host => "host",
+            CompileMode::Container { .. } => "container",
+        }
+    }
+}
+
+/// Whether a module can compile HERE — the answer to the question a status
+/// report asks, which is not "is the switch on" (2026-11-03,
+/// `docs/engineering-log/packages/2026-11-03-compile-availability-is-asked-not-assumed.md`).
+///
+/// Measured on the production VPS (compose stack, published controller
+/// image, no podman or docker): `get_catalog_status` said
+/// `module_compilation: {enabled: true}` and the install dry run showed no
+/// warning, while the real install failed with `build_command`'s refusal.
+/// The switch was on; nothing could compile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileAvailability {
+    /// A compile would run, in this mode.
+    Available {
+        /// Where it would run.
+        mode: CompileMode,
+    },
+    /// The deployment turned module compilation off
+    /// (`AEGIX_MODULE_COMPILATION=false`): registry-only, by the operator's
+    /// decision.
+    SwitchedOff,
+    /// The switch is on, but the sandbox this deployment requires cannot be
+    /// built — `reason` is the very sentence `build_command` refuses with.
+    SandboxUnavailable {
+        /// `build_command`'s refusal, verbatim.
+        reason: String,
+    },
+}
+
+impl CompileAvailability {
+    /// Whether the compile switch is on (a sandbox refusal is still "on").
+    #[must_use]
+    pub fn switch_on(&self) -> bool {
+        !matches!(self, CompileAvailability::SwitchedOff)
+    }
+
+    /// Whether a compile asked for now would run.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        matches!(self, CompileAvailability::Available { .. })
+    }
+
+    /// The mode a compile would run in, or `None` when none would.
+    #[must_use]
+    pub fn mode(&self) -> Option<CompileMode> {
+        match self {
+            CompileAvailability::Available { mode } => Some(*mode),
+            _ => None,
+        }
+    }
+
+    /// Why a compile would be refused, in the service's own words, or `None`
+    /// when one would run.
+    #[must_use]
+    pub fn refusal_reason(&self) -> Option<&str> {
+        match self {
+            CompileAvailability::Available { .. } => None,
+            CompileAvailability::SwitchedOff => Some(crate::COMPILATION_DISABLED_MESSAGE),
+            CompileAvailability::SandboxUnavailable { reason } => Some(reason),
+        }
+    }
+}
+
+/// [`CompileAvailability`] of one [`SandboxDecision`]: the pure half of
+/// [`sandbox_availability`]. A refusal carries the `build` step's sentence,
+/// since a build is the first thing every compile path asks for.
+pub(crate) fn availability_of(decision: SandboxDecision) -> CompileAvailability {
+    match decision {
+        SandboxDecision::Container(runtime) => CompileAvailability::Available {
+            mode: CompileMode::Container { runtime },
+        },
+        SandboxDecision::Host(_) => CompileAvailability::Available {
+            mode: CompileMode::Host,
+        },
+        SandboxDecision::Refuse(reason) => CompileAvailability::SandboxUnavailable {
+            reason: sandbox_refusal("build", reason),
+        },
+    }
+}
+
+/// Whether a compile asked for NOW would run, and where, without running any
+/// toolchain. Reads the SAME decision `build_command` reads
+/// ([`resolve_sandbox_decision`] — container mode, the runtime probe, the
+/// hardening predicate), so the two cannot disagree; do not re-derive the
+/// PATH lookup anywhere else. The switch (`AEGIX_MODULE_COMPILATION`) is a
+/// property of the service, so this answers only the sandbox half:
+/// `CompilationService::compile_availability` puts the two together.
+#[must_use]
+pub fn sandbox_availability() -> CompileAvailability {
+    availability_of(resolve_sandbox_decision())
+}
+
+/// Detect which container runtime is available on the host.
+///
+/// Prefers `podman` (rootless by default); falls back to `docker`.
+/// Returns `None` if neither is found.
+fn detect_runtime() -> Option<&'static str> {
+    // Quick check: try `podman --version` then `docker --version`.
+    // Using sync Command because this runs once at startup and the result is
+    // used to configure the async build command.
+    for candidate in &["podman", "docker"] {
+        let result = std::process::Command::new(candidate)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Ok(status) = result {
+            if status.success() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Build a [`SandboxCommand`] that runs `cargo` inside an isolated container.
+///
+/// The returned command is pre-configured with security flags but has no
+/// arguments yet — the caller appends `cargo component build ...` or
+/// `cargo audit ...` arguments.
+///
+/// # Arguments
+///
+/// * `workspace` — The temporary compilation workspace directory (mounted read-write).
+/// * `cargo_registry_cache` — Host-side Cargo registry cache (mounted read-only for speed).
+/// * `wit_dir` — Directory containing the WIT files (mounted read-only).
+/// * `target_cache` — Optional persistent `CARGO_TARGET_DIR` (per-USER — see
+///   `target_cache` module for why it must never be fleet-shared). Mounted
+///   read-write at `/cache/target` with `CARGO_TARGET_DIR` pointed there, so
+///   dependency artifacts survive across compiles instead of rebuilding from
+///   scratch in the throwaway `{workspace}/target`. `None` = legacy behavior.
+///   Steps that don't build (lockfile gen, audit) pass `None`.
+///
+/// # Fallback
+///
+/// Decided by [`sandbox_decision`]: a host run (container mode off, or no
+/// runtime) outside production, or in production with the ack token, returns a scrubbed `host_command("cargo")`
+/// that runs directly on the host (with `CARGO_TARGET_DIR` set to the same
+/// per-user cache when provided, so the host path gets identical reuse).
+pub fn build_command(
+    workspace: &Path,
+    cargo_registry_cache: &Path,
+    wit_dir: &Path,
+    target_cache: Option<&Path>,
+) -> Result<SandboxCommand> {
+    let Some(runtime) = resolve_sandbox_runtime("build")? else {
+        let mut cmd = host_command("cargo");
+        if let Some(cache) = target_cache {
+            cmd.env("CARGO_TARGET_DIR", cache);
+        }
+        return Ok(cmd);
+    };
+    tracing::info!(runtime, "Container compilation enabled");
+
+    let image = nonempty_env_or("AEGIX_BUILDER_IMAGE", DEFAULT_IMAGE);
+
+    // SECURITY: Validate container image name format to prevent injection via env var.
+    // While Command::arg() uses execvp (no shell), an invalid image name could still
+    // cause confusing errors or be exploited if the name is logged/templated elsewhere.
+    if !image
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b".:/_-".contains(&b))
+        || image.is_empty()
+    {
+        bail!(
+            "AEGIX_BUILDER_IMAGE contains invalid characters: '{}'. \
+             Only alphanumeric, '.', ':', '/', '_', '-' are allowed.",
+            image
+        );
+    }
+
+    let memory = nonempty_env_or("AEGIX_BUILDER_MEMORY", DEFAULT_MEMORY);
+    let cpus = nonempty_env_or("AEGIX_BUILDER_CPUS", DEFAULT_CPUS);
+
+    // Resolve paths to absolute for container volume mounts.
+    let workspace_abs = workspace
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve workspace path: {}", workspace.display()))?;
+    let registry_abs = cargo_registry_cache
+        .canonicalize()
+        .unwrap_or_else(|_| cargo_registry_cache.to_path_buf());
+    let wit_abs = wit_dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve WIT directory path: {}",
+            wit_dir.display()
+        )
+    })?;
+
+    // The container mounts the workspace at /build, the registry cache at
+    // /home/builder/.cargo/registry (read-only), and the WIT directory at /wit (read-only).
+    // Inside the container, the Cargo.toml references wit/aegix.wit relative to the
+    // workspace, so we also bind the WIT dir into /build/wit as a read-only overlay.
+    let workspace_mount = format!("{}:/build:rw", workspace_abs.display());
+    let registry_mount = format!(
+        "{}:/home/builder/.cargo/registry:ro",
+        registry_abs.display()
+    );
+    let wit_workspace_mount = format!("{}:/build/wit:ro", wit_abs.display());
+    // Persistent per-user target cache (see `target_cache` module). Mounted
+    // read-write because cargo writes build artifacts into it — the
+    // cross-tenant poisoning risk that rw implies is bounded by the
+    // per-user keying, NOT by anything in this function; callers must only
+    // ever pass a user-scoped path here.
+    let target_cache_mount = target_cache.map(|cache| {
+        let cache_abs = cache.canonicalize().unwrap_or_else(|_| cache.to_path_buf());
+        format!("{}:/cache/target:rw", cache_abs.display())
+    });
+
+    // `run --name talos-sandbox-<uuid> --label talos.sandbox=1` — the name
+    // is what lets a timed-out or cancelled build be removed (see
+    // `sandbox_run`).
+    let mut cmd = SandboxCommand::container_run(runtime);
+    cmd.args([
+        "--rm",
+        // SECURITY: No network access — proc macros cannot phone home
+        "--network=none",
+        // SECURITY: Read-only root filesystem — no persistent writes outside mounts
+        "--read-only",
+        // Writable /tmp for cargo intermediate artifacts
+        "--tmpfs",
+        "/tmp:rw,size=1g",
+        // SECURITY: Memory limit to prevent fork bombs / OOM
+        "--memory",
+        &memory,
+        // SECURITY: CPU limit to prevent resource starvation
+        "--cpus",
+        &cpus,
+        // SECURITY: process-count ceiling — memory/cpu bound consumption,
+        // this bounds fork-bomb fan-out (see CONTAINER_PIDS_LIMIT).
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
+        // SECURITY: Run as non-root user (matches builder user in Dockerfile)
+        "--user",
+        "1000:1000",
+        // SECURITY: Drop all capabilities
+        "--cap-drop=ALL",
+        // SECURITY: No new privileges via setuid/setgid
+        "--security-opt",
+        "no-new-privileges:true",
+        // Volume mounts
+        "-v",
+        &workspace_mount,
+        "-v",
+        &registry_mount,
+        "-v",
+        &wit_workspace_mount,
+    ]);
+    if let Some(mount) = &target_cache_mount {
+        // Point cargo at the persistent cache instead of /build/target.
+        cmd.args(["-v", mount, "-e", "CARGO_TARGET_DIR=/cache/target"]);
+    }
+    cmd.args([
+        // Working directory inside the container
+        "-w", "/build", // Image
+        &image,
+        // The caller will append cargo subcommand args (e.g. "cargo component build ...")
+        // but we need "cargo" as the entrypoint command inside the container.
+        "cargo",
+    ]);
+
+    Ok(cmd)
+}
+
+/// Build a [`SandboxCommand`] for running `cargo audit` inside the container.
+///
+/// Identical security flags as [`build_command`] including `--network=none`.
+/// The RustSec advisory database is pre-fetched into the talos-builder
+/// image at [`ADVISORY_DB_PATH`] (`/opt/talos-advisory-db`, see
+/// `Dockerfile.builder` stage 1). The compilation service passes
+/// `--db /opt/talos-advisory-db` to every `cargo audit` invocation so
+/// the path is explicit, matching the controller image's identical
+/// stable bake-in. If you set `AEGIX_BUILDER_IMAGE` to a custom image,
+/// bake the DB at the same path or every audit fails closed.
+pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<SandboxCommand> {
+    audit_command_with_db_probe(workspace, cargo_registry_cache).map(|(audit, _)| audit)
+}
+
+/// The command that dates the advisory database `cargo audit` will read, in
+/// the place it will read it (G-21, 2026-10-14). In container mode the audit
+/// reads the BUILDER image's copy, which the controller cannot `stat`; the
+/// probe runs in the same image under the same envelope (no network,
+/// read-only root, no mounts at all) and prints the mtimes
+/// [`crate::advisory_db::advisory_db_age_days`] reads on the host.
+#[derive(Debug)]
+pub struct AdvisoryDbProbe {
+    /// The builder image the probe (and the audit) runs; the cache key of
+    /// [`crate::advisory_db::builder_advisory_db_age_days`].
+    pub image: String,
+    pub command: SandboxCommand,
+}
+
+/// The shell the probe runs: one line of epoch seconds per signal — the
+/// directory, `.git/refs/heads/{main,master}`, and each `crates/*` entry. A
+/// missing signal prints nothing; `exit 0` because a missing ref is normal.
+#[must_use]
+pub fn advisory_db_probe_script() -> String {
+    format!(
+        "stat -c %Y {db} {db}/.git/refs/heads/main {db}/.git/refs/heads/master {db}/crates/* \
+         2>/dev/null; exit 0",
+        db = ADVISORY_DB_PATH
+    )
+}
+
+/// [`audit_command`] and, in container mode, the [`AdvisoryDbProbe`] for the
+/// copy it reads — from ONE sandbox decision, so the gate dates the copy the
+/// audit uses. `None` in host mode: the host audit reads the host's copy,
+/// which the gate `stat`s directly.
+pub fn audit_command_with_db_probe(
+    workspace: &Path,
+    cargo_registry_cache: &Path,
+) -> Result<(SandboxCommand, Option<AdvisoryDbProbe>)> {
+    let Some(runtime) = resolve_sandbox_runtime("audit")? else {
+        return Ok((host_command("cargo"), None));
+    };
+
+    let image = nonempty_env_or("AEGIX_BUILDER_IMAGE", DEFAULT_IMAGE);
+    if !image
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b".:/_-".contains(&b))
+        || image.is_empty()
+    {
+        bail!(
+            "AEGIX_BUILDER_IMAGE contains invalid characters: '{}'",
+            image
+        );
+    }
+    let memory = nonempty_env_or("AEGIX_BUILDER_MEMORY", DEFAULT_MEMORY);
+    let cpus = nonempty_env_or("AEGIX_BUILDER_CPUS", DEFAULT_CPUS);
+
+    let workspace_abs = workspace
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve workspace path: {}", workspace.display()))?;
+    let registry_abs = cargo_registry_cache
+        .canonicalize()
+        .unwrap_or_else(|_| cargo_registry_cache.to_path_buf());
+
+    let workspace_mount = format!("{}:/build:ro", workspace_abs.display());
+    let registry_mount = format!(
+        "{}:/home/builder/.cargo/registry:ro",
+        registry_abs.display()
+    );
+
+    let mut cmd = SandboxCommand::container_run(runtime);
+    cmd.args([
+        "--rm",
+        "--network=none",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,size=256m",
+        "--memory",
+        &memory,
+        "--cpus",
+        &cpus,
+        // SECURITY: process-count ceiling — memory/cpu bound consumption,
+        // this bounds fork-bomb fan-out (see CONTAINER_PIDS_LIMIT).
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
+        "--user",
+        "1000:1000",
+        "--cap-drop=ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "-v",
+        &workspace_mount,
+        "-v",
+        &registry_mount,
+        "-w",
+        "/build",
+        &image,
+        "cargo",
+    ]);
+
+    let probe = advisory_db_probe_command(runtime, &image, &memory, &cpus);
+    Ok((
+        cmd,
+        Some(AdvisoryDbProbe {
+            image,
+            command: probe,
+        }),
+    ))
+}
+
+/// The probe's container: the audit's envelope with NO mounts (it reads only
+/// the image's own `/opt/talos-advisory-db`) and the script as its command.
+pub(crate) fn advisory_db_probe_command(
+    runtime: &'static str,
+    image: &str,
+    memory: &str,
+    cpus: &str,
+) -> SandboxCommand {
+    let script = advisory_db_probe_script();
+    let mut cmd = SandboxCommand::container_run(runtime);
+    cmd.args([
+        "--rm",
+        "--network=none",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,size=16m",
+        "--memory",
+        memory,
+        "--cpus",
+        cpus,
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
+        "--user",
+        "1000:1000",
+        "--cap-drop=ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        image,
+        "sh",
+        "-c",
+        &script,
+    ]);
+    cmd
+}
+
+/// Build a [`SandboxCommand`] that runs an arbitrary sandboxed TOOL (jco,
+/// componentize-py) against a compile workspace — the generic sibling of
+/// [`build_command`], which hardcodes `cargo` + the registry mount.
+///
+/// Sandboxed mode mounts ONLY the workspace (read-write, at `/build`) and
+/// runs the tool with the same security envelope as the Rust path:
+/// `--network=none`, read-only rootfs, tmpfs `/tmp`, memory/cpu limits,
+/// non-root, all capabilities dropped. Callers pass paths RELATIVE to the
+/// workspace in the tool args — the container working dir is `/build` and
+/// the host-fallback Command has `current_dir(workspace)` set, so the same
+/// relative args resolve in both modes.
+///
+/// Host fallback (container off / no runtime) returns a scrubbed
+/// `host_command(tool)` — the caller MUST gate that path through
+/// `require_host_lang_toolchain_allowed` (use [`will_sandbox`] to decide),
+/// because these tools execute user-supplied code at compile time
+/// (componentize-py runs Python introspection; jco evaluates module
+/// structure via StarlingMonkey).
+///
+/// `tool` must be a bare program name from this crate (no caller/user
+/// input) — asserted against a path-free charset as defense in depth.
+pub fn tool_command(tool: &str, workspace: &Path) -> Result<SandboxCommand> {
+    // Defense in depth: refuse anything that isn't a simple program name.
+    // `tool` is always a crate-internal constant ("jco", "componentize-py");
+    // this assert keeps that true if a future caller plumbs user input here.
+    if tool.is_empty()
+        || !tool
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("invalid sandbox tool name: '{tool}'");
+    }
+
+    if !container_enabled() {
+        tracing::debug!(
+            tool,
+            "Container compilation disabled — using direct host tool"
+        );
+        let mut cmd = host_command(tool);
+        cmd.current_dir(workspace);
+        return Ok(cmd);
+    }
+
+    let Some(runtime) = detect_runtime() else {
+        // Same fallback policy as build_command: the caller applies the
+        // production host-toolchain gate before running this Command.
+        tracing::warn!(
+            tool,
+            "Container compilation enabled but no runtime found — \
+             falling back to direct host tool"
+        );
+        let mut cmd = host_command(tool);
+        cmd.current_dir(workspace);
+        return Ok(cmd);
+    };
+
+    let image = nonempty_env_or("AEGIX_BUILDER_IMAGE", DEFAULT_IMAGE);
+    if !image
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b".:/_-".contains(&b))
+        || image.is_empty()
+    {
+        bail!(
+            "AEGIX_BUILDER_IMAGE contains invalid characters: '{}'. \
+             Only alphanumeric, '.', ':', '/', '_', '-' are allowed.",
+            image
+        );
+    }
+    let memory = nonempty_env_or("AEGIX_BUILDER_MEMORY", DEFAULT_MEMORY);
+    let cpus = nonempty_env_or("AEGIX_BUILDER_CPUS", DEFAULT_CPUS);
+
+    let workspace_abs = workspace
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve workspace path: {}", workspace.display()))?;
+    let workspace_mount = format!("{}:/build:rw", workspace_abs.display());
+
+    let mut cmd = SandboxCommand::container_run(runtime);
+    cmd.args([
+        "--rm",
+        // SECURITY: identical envelope to build_command — see its comments.
+        "--network=none",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,size=1g",
+        "--memory",
+        &memory,
+        "--cpus",
+        &cpus,
+        // SECURITY: process-count ceiling — memory/cpu bound consumption,
+        // this bounds fork-bomb fan-out (see CONTAINER_PIDS_LIMIT).
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
+        "--user",
+        "1000:1000",
+        "--cap-drop=ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        // Writable per-run scratch HOME: the rootfs is read-only, and jco's
+        // wizer step writes a wasmtime cache under the user's home — and it
+        // resolves that home via the passwd db (getpwuid), NOT $HOME, because
+        // componentize-js spawns wizer with a scrubbed env. A tmpfs at the
+        // image user's passwd home makes the cache writable regardless of how
+        // any tool resolves it, and dies with the container (nothing persists
+        // across runs — deliberate: a poisoned cache can't outlive its run).
+        "--tmpfs",
+        "/home/builder:rw,size=512m,uid=1000,gid=1000",
+        "-v",
+        &workspace_mount,
+        "-w",
+        "/build",
+        &image,
+        tool,
+    ]);
+    Ok(cmd)
+}
+
+#[cfg(test)]
+/// Crate-wide test serialization lock for env-var-touching tests.
+///
+/// `std::env::set_var` is process-global; if two tests in different
+/// modules race on `AEGIX_COMPILATION_CONTAINER` or
+/// `AEGIX_COMPILATION_ALLOW_HOST_FALLBACK` (or `RUST_ENV`), one's
+/// teardown can clobber the other's setup mid-assertion. The fix is
+/// not to remove env-var coupling — `compile_sandbox_required()` and
+/// `container_enabled()` are env-driven by design — but to serialize
+/// the tests that mutate that shared state.
+///
+/// Every test in this crate that calls `std::env::set_var` /
+/// `remove_var` MUST acquire `TEST_ENV_LOCK` first. The lock is held
+/// across the env mutations + assertions. It is a `tokio::sync::Mutex`
+/// rather than `std::sync::Mutex` because one test holds it across an
+/// `.await` (`host_command_does_not_inherit_the_controller_env`), and a
+/// std guard held across an await point can deadlock the runtime's
+/// worker thread (clippy `await_holding_lock`). Tokio's mutex does not
+/// poison, so a prior test panicking mid-assertion leaves it usable —
+/// `set_var`/`remove_var` clean up regardless.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Acquire `TEST_ENV_LOCK` from a synchronous `#[test]`.
+///
+/// Async tests (`#[tokio::test]`) must `TEST_ENV_LOCK.lock().await`
+/// instead — `blocking_lock` panics when called from inside a runtime.
+#[cfg(test)]
+pub(crate) fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK.blocking_lock()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn container_disabled_returns_plain_cargo() {
+        let _g = env_lock();
+        // Force container off via env var
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+
+        let ws = PathBuf::from("/tmp/test-workspace");
+        let reg = PathBuf::from("/tmp/test-registry");
+        let wit = PathBuf::from("/tmp/test-wit");
+
+        let cmd = build_command(&ws, &reg, &wit, None).unwrap();
+        // When container is disabled, the command should be plain "cargo"
+        let program = format!("{:?}", cmd.as_std().get_program());
+        assert!(program.contains("cargo"), "Expected cargo, got {}", program);
+
+        // Clean up env
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+    }
+
+    #[test]
+    fn direct_cargo_sets_target_dir_when_cache_provided() {
+        let _g = env_lock();
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+        // The host command forwards CARGO_TARGET_DIR from the allowlist, so a
+        // test process that inherited one (`CARGO_TARGET_DIR=… cargo test`)
+        // would see it on the no-cache command. Hermetic by removing it for
+        // the test and restoring it after (package CB; found when a deploy
+        // verification ran this binary with the variable exported).
+        let inherited_target_dir = std::env::var_os("CARGO_TARGET_DIR");
+        std::env::remove_var("CARGO_TARGET_DIR");
+
+        let ws = PathBuf::from("/tmp/test-workspace");
+        let reg = PathBuf::from("/tmp/test-registry");
+        let wit = PathBuf::from("/tmp/test-wit");
+        let cache = PathBuf::from("/tmp/test-target-cache/user-a");
+
+        let cmd = build_command(&ws, &reg, &wit, Some(&cache)).unwrap();
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            envs.iter().any(|(k, v)| *k == "CARGO_TARGET_DIR"
+                && v.map(|v| v == cache.as_os_str()).unwrap_or(false)),
+            "direct-cargo path must point CARGO_TARGET_DIR at the per-user cache, got {envs:?}"
+        );
+
+        // Without a cache the env must NOT be set — the legacy behavior
+        // (inherit process env or default to {workspace}/target) stands.
+        let cmd = build_command(&ws, &reg, &wit, None).unwrap();
+        assert!(
+            !cmd.as_std()
+                .get_envs()
+                .any(|(k, _)| k == "CARGO_TARGET_DIR"),
+            "no-cache path must not override CARGO_TARGET_DIR"
+        );
+
+        if let Some(v) = inherited_target_dir {
+            std::env::set_var("CARGO_TARGET_DIR", v);
+        }
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+    }
+
+    #[test]
+    fn container_enabled_env_var_parsing() {
+        let _g = env_lock();
+        for (val, expected) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("yes", true),
+            ("false", false),
+            ("FALSE", false),
+            ("0", false),
+            ("no", false),
+        ] {
+            std::env::set_var("AEGIX_COMPILATION_CONTAINER", val);
+            assert_eq!(
+                container_enabled(),
+                expected,
+                "AEGIX_COMPILATION_CONTAINER={val} should be {expected}"
+            );
+        }
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+    }
+
+    /// The empty-env class (lint check 73), pinned as an EQUIVALENCE rather
+    /// than a value: `AEGIX_COMPILATION_CONTAINER=""` must give the same
+    /// answer as leaving it unset. Asserting a literal `false` would depend on
+    /// ambient `is_production()`, which this test does not control; asserting
+    /// equivalence holds either way and is exactly the property that broke.
+    /// Pre-fix the `Ok` arm bound `Ok("")` and `!matches!("", "false"|"0"|"no")`
+    /// was TRUE, so a Helm placeholder forced containerised compilation ON in
+    /// development — the opposite of the unset default — and a dev box with no
+    /// container runtime then fail-closed and refused to compile anything.
+    #[test]
+    fn container_enabled_empty_env_is_same_as_unset() {
+        let _g = env_lock();
+
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+        let unset = container_enabled();
+
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "");
+        let empty = container_enabled();
+
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+        assert_eq!(
+            empty, unset,
+            "an empty AEGIX_COMPILATION_CONTAINER must behave exactly as unset"
+        );
+    }
+
+    /// G-9: a deployment that faces users and still sets the retired switch
+    /// does not boot, whatever the value; development ignores it.
+    #[test]
+    fn the_retired_host_fallback_is_refused_at_boot_where_the_sandbox_is_required() {
+        for value in ["acknowledge-single-tenant-rce-risk", "true", "1"] {
+            let err = refuse_retired_host_fallback(true, Some(value))
+                .expect_err("set in a deployment that faces users");
+            assert!(err.to_string().contains(RETIRED_HOST_FALLBACK), "{err}");
+        }
+        assert!(refuse_retired_host_fallback(true, None).is_ok());
+        assert!(refuse_retired_host_fallback(true, Some("  ")).is_ok());
+        assert!(refuse_retired_host_fallback(false, Some("true")).is_ok());
+    }
+
+    /// G-9: the sandbox requirement follows the hardening predicate, so
+    /// `RUST_ENV=staging` (how `docker-compose.prod.yml` runs) requires it,
+    /// where `is_production()` did not.
+    #[test]
+    fn the_sandbox_is_required_wherever_the_deployment_faces_users() {
+        let _g = env_lock();
+        let prev = std::env::var("RUST_ENV").ok();
+        for (env, required) in [
+            ("production", true),
+            ("staging", true),
+            ("development", false),
+        ] {
+            std::env::set_var("RUST_ENV", env);
+            assert_eq!(compile_sandbox_required(), required, "{env}");
+        }
+        match prev {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
+        }
+    }
+
+    #[test]
+    fn tool_command_disabled_mode_runs_host_tool_with_workspace_cwd() {
+        let _g = env_lock();
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+
+        let ws = PathBuf::from("/tmp/test-tool-workspace");
+        let cmd = tool_command("componentize-py", &ws).unwrap();
+        let program = format!("{:?}", cmd.as_std().get_program());
+        assert!(
+            program.contains("componentize-py"),
+            "disabled mode must run the bare tool, got {program}"
+        );
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(ws.as_path()),
+            "host fallback must run from the workspace so relative args resolve"
+        );
+
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+    }
+
+    #[tokio::test]
+    async fn host_command_does_not_inherit_the_controller_env() {
+        let _g = TEST_ENV_LOCK.lock().await;
+        // A stand-in for WORKER_SHARED_KEY / AEGIX_MASTER_KEY / DATABASE_URL:
+        // present in the controller process, must be ABSENT in the child.
+        std::env::set_var("AEGIX_TEST_SECRET_SHOULD_NOT_LEAK", "leak-canary-9f3a");
+        let slot = crate::sandbox_run::CompileSlot::acquire(std::sync::Arc::new(
+            tokio::sync::Semaphore::new(1),
+        ))
+        .await
+        .expect("fresh semaphore");
+        let out = host_command("env")
+            .run(std::time::Duration::from_secs(10), &slot)
+            .await
+            .expect("`env` must be spawnable in the test environment");
+        std::env::remove_var("AEGIX_TEST_SECRET_SHOULD_NOT_LEAK");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.contains("leak-canary-9f3a"),
+            "host fallback leaked a non-allowlisted env var:\n{text}"
+        );
+        // …while the toolchain still finds its binaries.
+        assert!(
+            text.lines().any(|l| l.starts_with("PATH=")),
+            "PATH must survive the scrub:\n{text}"
+        );
+    }
+
+    #[test]
+    fn host_env_allowlist_carries_no_secret_shaped_names() {
+        for k in HOST_SPAWN_ENV_ALLOWLIST {
+            let upper = k.to_ascii_uppercase();
+            assert!(
+                !upper.ends_with("_KEY")
+                    && !upper.ends_with("_URL")
+                    && !upper.ends_with("_TOKEN")
+                    && !upper.contains("SECRET")
+                    && !upper.contains("PASSWORD")
+                    && !upper.contains("CREDENTIAL"),
+                "{k} looks like a credential name and must not be inherited by a host spawn"
+            );
+        }
+    }
+
+    #[test]
+    fn build_and_audit_host_mode_use_the_scrubbed_env() {
+        let _g = env_lock();
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+        std::env::set_var("AEGIX_TEST_SECRET_SHOULD_NOT_LEAK", "leak-canary-9f3a");
+        let ws = PathBuf::from("/tmp/test-host-workspace");
+        let cache = PathBuf::from("/tmp/test-host-cache");
+        for cmd in [
+            build_command(&ws, &ws, &ws, Some(&cache)).unwrap(),
+            audit_command(&ws, &ws).unwrap(),
+        ] {
+            let envs: Vec<(String, Option<String>)> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            // `env_clear` + explicit re-add means the explicit set IS the
+            // whole child env: PATH is on it, the canary is not.
+            assert!(envs.iter().any(|(k, _)| k == "PATH"));
+            assert!(envs
+                .iter()
+                .all(|(k, _)| k != "AEGIX_TEST_SECRET_SHOULD_NOT_LEAK"));
+        }
+        let build = build_command(&ws, &ws, &ws, Some(&cache)).unwrap();
+        assert!(build
+            .as_std()
+            .get_envs()
+            .any(|(k, v)| k == "CARGO_TARGET_DIR" && v == Some(cache.as_os_str())));
+        std::env::remove_var("AEGIX_TEST_SECRET_SHOULD_NOT_LEAK");
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+    }
+
+    #[test]
+    fn tool_command_rejects_non_program_names() {
+        let _g = env_lock();
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+        // Paths, spaces, and shell-ish shapes must all be refused — the tool
+        // name is a crate-internal constant, and this pins that contract.
+        for bad in ["/usr/bin/evil", "jco componentize", "../jco", "", "a;b"] {
+            assert!(
+                tool_command(bad, &PathBuf::from("/tmp")).is_err(),
+                "{bad:?} must be rejected as a tool name"
+            );
+        }
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+    }
+
+    #[test]
+    fn will_sandbox_false_when_container_disabled() {
+        let _g = env_lock();
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+        assert!(
+            !will_sandbox(),
+            "container disabled must mean no sandbox — the M-13 host gate applies"
+        );
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+    }
+
+    /// Package CA / G-9: every combination of the inputs. Where the sandbox
+    /// is required, a disabled container and a missing runtime are both
+    /// refused; nothing admits a host compile there.
+    #[test]
+    fn sandbox_decision_covers_every_input() {
+        use HostReason::*;
+        use SandboxDecision::*;
+        for required in [false, true] {
+            assert_eq!(
+                sandbox_decision(true, Some("podman"), required),
+                Container("podman"),
+                "a present runtime is always used (required={required})"
+            );
+            let host_or_refuse = |reason| {
+                if required {
+                    Refuse(reason)
+                } else {
+                    Host(reason)
+                }
+            };
+            assert_eq!(
+                sandbox_decision(true, None, required),
+                host_or_refuse(NoRuntime)
+            );
+            assert_eq!(
+                sandbox_decision(false, None, required),
+                host_or_refuse(ContainerDisabled)
+            );
+            // A detected runtime does not rescue disabled container mode.
+            assert_eq!(
+                sandbox_decision(false, Some("docker"), required),
+                host_or_refuse(ContainerDisabled)
+            );
+        }
+    }
+
+    /// 2026-11-03: every sandbox decision has one availability. A present
+    /// runtime is a container compile, a host decision a host compile, and a
+    /// refusal carries the `build` step's refusal sentence — the one
+    /// `build_command` fails with — naming the cause.
+    #[test]
+    fn availability_covers_every_sandbox_decision() {
+        use HostReason::*;
+        use SandboxDecision::*;
+        assert_eq!(
+            availability_of(Container("podman")),
+            CompileAvailability::Available {
+                mode: CompileMode::Container { runtime: "podman" }
+            }
+        );
+        assert_eq!(
+            availability_of(Container("podman"))
+                .mode()
+                .map(CompileMode::as_str),
+            Some("container")
+        );
+        for reason in [ContainerDisabled, NoRuntime] {
+            let host = availability_of(Host(reason));
+            assert_eq!(
+                host,
+                CompileAvailability::Available {
+                    mode: CompileMode::Host
+                }
+            );
+            assert!(host.is_available() && host.switch_on());
+            assert_eq!(host.refusal_reason(), None);
+            let refused = availability_of(Refuse(reason));
+            assert!(!refused.is_available() && refused.switch_on());
+            assert_eq!(refused.mode(), None);
+            let text = refused.refusal_reason().expect("a refusal has a reason");
+            assert_eq!(text, sandbox_refusal("build", reason));
+            assert!(text.contains("(build)"), "{text}");
+            assert!(
+                text.contains("podman or docker with the builder image")
+                    && text.contains("AEGIX_MODULE_COMPILATION=false")
+                    && text.contains("AEGIX_REGISTRY_URL"),
+                "the refusal names both ways out: {text}"
+            );
+        }
+        assert!(availability_of(Refuse(NoRuntime))
+            .refusal_reason()
+            .unwrap()
+            .contains("neither podman nor docker was found in PATH"));
+        assert!(availability_of(Refuse(ContainerDisabled))
+            .refusal_reason()
+            .unwrap()
+            .contains("AEGIX_COMPILATION_CONTAINER disables it"));
+        let off = CompileAvailability::SwitchedOff;
+        assert!(!off.switch_on() && !off.is_available());
+        assert_eq!(
+            off.refusal_reason(),
+            Some(crate::COMPILATION_DISABLED_MESSAGE)
+        );
+    }
+
+    /// 2026-11-03: the report and the compile read ONE decision. Where the
+    /// sandbox is required and container mode is off, `sandbox_availability`
+    /// says refused with exactly the sentence `build_command` returns as its
+    /// error — the same resolution, so the status report cannot say
+    /// "available" for a compile that would fail. In development the same
+    /// environment is a host compile and `build_command` builds one.
+    #[test]
+    fn the_availability_report_and_build_command_read_one_decision() {
+        let _g = env_lock();
+        let ws = PathBuf::from("/tmp/test-workspace");
+        let reg = PathBuf::from("/tmp/test-registry");
+        let wit = PathBuf::from("/tmp/test-wit");
+        let prev_profile = std::env::var("AEGIX_SECURITY_PROFILE").ok();
+        std::env::remove_var("AEGIX_SECURITY_PROFILE");
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "production");
+        let availability = sandbox_availability();
+        let CompileAvailability::SandboxUnavailable { reason } = &availability else {
+            panic!("production with container mode off refuses: {availability:?}");
+        };
+        let err = match build_command(&ws, &reg, &wit, None) {
+            Err(e) => e,
+            Ok(_) => panic!("build_command refuses where the report says refused"),
+        };
+        assert_eq!(err.to_string(), *reason);
+
+        std::env::set_var("RUST_ENV", "development");
+        assert_eq!(
+            sandbox_availability(),
+            CompileAvailability::Available {
+                mode: CompileMode::Host
+            }
+        );
+        assert!(build_command(&ws, &reg, &wit, None).is_ok());
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+        match prev_profile {
+            Some(v) => std::env::set_var("AEGIX_SECURITY_PROFILE", v),
+            None => std::env::remove_var("AEGIX_SECURITY_PROFILE"),
+        }
+    }
+
+    /// Package CA / G-9: `AEGIX_COMPILATION_CONTAINER=false` where the sandbox
+    /// is required refuses both entry points and names the variable; the
+    /// retired acknowledgement no longer admits a host compile (until
+    /// 2026-10-15 it did). Development is unchanged.
+    #[test]
+    fn container_disabled_where_the_sandbox_is_required_is_refused() {
+        let _g = env_lock();
+        let ws = PathBuf::from("/tmp/test-workspace");
+        let reg = PathBuf::from("/tmp/test-registry");
+        let wit = PathBuf::from("/tmp/test-wit");
+        std::env::set_var("AEGIX_COMPILATION_CONTAINER", "false");
+        for env in ["production", "staging"] {
+            std::env::set_var("RUST_ENV", env);
+            for ack in [None, Some("acknowledge-single-tenant-rce-risk")] {
+                match ack {
+                    Some(v) => std::env::set_var(RETIRED_HOST_FALLBACK, v),
+                    None => std::env::remove_var(RETIRED_HOST_FALLBACK),
+                }
+                for (step, result) in [
+                    ("build", build_command(&ws, &reg, &wit, None).map(|_| ())),
+                    ("audit", audit_command(&ws, &reg).map(|_| ())),
+                ] {
+                    let err = result.expect_err("a host compile is refused");
+                    let msg = format!("{err}");
+                    assert!(
+                        msg.contains("AEGIX_COMPILATION_CONTAINER disables it"),
+                        "{env} {step}: {msg}"
+                    );
+                    assert!(msg.contains("no host fallback"), "{env} {step}: {msg}");
+                }
+            }
+        }
+
+        std::env::remove_var(RETIRED_HOST_FALLBACK);
+        std::env::set_var("RUST_ENV", "development");
+        assert!(
+            build_command(&ws, &reg, &wit, None).is_ok(),
+            "development is unchanged"
+        );
+        assert!(audit_command(&ws, &reg).is_ok(), "development is unchanged");
+
+        std::env::remove_var("AEGIX_COMPILATION_CONTAINER");
+        std::env::remove_var("RUST_ENV");
+    }
+
+    fn epoch_days_ago(days: u64) -> u64 {
+        (std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400 + 3600))
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// G-21 end to end: the gate dates what the PROBE (the builder image)
+    /// reports, not the controller's copy. A stand-in runtime prints a stale
+    /// builder database; the controller's copy does not enter into it.
+    #[tokio::test]
+    async fn the_gate_dates_the_builder_copy_through_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n' {} {}\n",
+                epoch_days_ago(200),
+                epoch_days_ago(120)
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime: &'static str =
+            Box::leak(runtime.to_string_lossy().into_owned().into_boxed_str());
+
+        let slot = crate::sandbox_run::CompileSlot::acquire(std::sync::Arc::new(
+            tokio::sync::Semaphore::new(1),
+        ))
+        .await
+        .expect("fresh semaphore");
+        let image = "talos-builder:g21-stale-test";
+        let probe = crate::container::AdvisoryDbProbe {
+            image: image.to_string(),
+            command: crate::container::advisory_db_probe_command(runtime, image, "1g", "1"),
+        };
+        let age = crate::advisory_db::builder_advisory_db_age_days(probe, &slot).await;
+        assert_eq!(age.as_ref().ok(), Some(&120), "{age:?}");
+
+        // Production refuses a compile on that reading.
+        let refused =
+            crate::check_measured_advisory_db_age_as(crate::container::ADVISORY_DB_PATH, age, true)
+                .expect_err("a 120-day builder database is refused in production");
+        assert!(refused.to_string().contains("120 days old"), "{refused}");
+
+        // An image with no database (empty probe output) is unreadable, not
+        // fresh.
+        let empty = dir.path().join("empty-runtime");
+        std::fs::write(&empty, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty: &'static str = Box::leak(empty.to_string_lossy().into_owned().into_boxed_str());
+        let image = "talos-builder:g21-empty-test";
+        let unreadable = crate::advisory_db::builder_advisory_db_age_days(
+            crate::container::AdvisoryDbProbe {
+                image: image.to_string(),
+                command: crate::container::advisory_db_probe_command(empty, image, "1g", "1"),
+            },
+            &slot,
+        )
+        .await;
+        assert!(
+            matches!(
+                unreadable,
+                Err(crate::advisory_db::AdvisoryDbAgeError::Unreadable(_))
+            ),
+            "{unreadable:?}"
+        );
+    }
+}

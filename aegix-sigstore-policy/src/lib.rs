@@ -1,0 +1,808 @@
+//! Sigstore identity-regexp policy — the single source of truth for
+//! validating the `--certificate-identity-regexp` passed to `cosign
+//! verify`.
+//!
+//! This crate exists because the check was duplicated: the worker had the
+//! strong validator ([`validate_sigstore_identity_regexp`]) while the
+//! controller's OCI catalog-sync (`aegix-registry`) carried an ad-hoc
+//! substring matcher that only rejected a handful of exact catch-alls —
+//! so the controller trusted wildcard-owner regexps the worker would
+//! reject (security review 2026-07-19, P4). Both processes now call this
+//! one function, so the identity-pinning strength cannot drift.
+//!
+//! The POLICY enum had the same history one level up (2026-09-13, package
+//! AR): `SigstorePolicy` / `from_env_str` / `raw_env_is_explicit` existed as
+//! two byte-identical copies — `aegix-worker-runtime::module_fetcher` and
+//! `aegix-registry::sync` — each carrying a comment promising to "mirror"
+//! the other. Identical today; nothing but a reader kept them so. Both now
+//! import [`SigstorePolicy`] from here, and the source pins in this crate's
+//! tests fail if either grows a private copy again.
+//!
+//! Pure, dependency-light (regex only) so it drops into both the
+//! WASM-host worker and the controller without dragging in a web
+//! framework.
+
+/// Why a candidate `--certificate-identity-regexp` was rejected. Each
+/// variant carries a human-readable explanation via [`Self::human_reason`]
+/// so callers can log an actionable message. Pure data so it's easy to
+/// match on / test.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SigstoreRegexpRejection {
+    /// The string is empty — the caller should treat this as
+    /// "explicitly not configured" rather than a parse error, but in
+    /// `Required` mode it's still a hard failure (see callsite).
+    Empty,
+    /// One of the known catch-all patterns: `.*`, `.+`, `.`, `^.*$`,
+    /// etc. A regex this broad accepts any Fulcio cert identity, which
+    /// is the same as having no verification at all.
+    TooBroad,
+    /// The pattern doesn't compile as a regex. Fail closed early so
+    /// `cosign verify` doesn't error in production with an opaque
+    /// upstream message.
+    InvalidRegex,
+    /// The pattern would match a GitHub repo or workflow URL prefix
+    /// without ever anchoring the trailing `@` separator. Per the
+    /// CLAUDE.md guidance: without the `@`, an attacker who creates a
+    /// fork named `template-publish.yml-evil.yml` can match the same
+    /// prefix.
+    MissingWorkflowAnchor,
+    /// The pattern starts with `https://github.com/` (the GitHub-Actions
+    /// Fulcio identity prefix) but does not contain `.github/workflows/`.
+    /// Sigstore identities for GitHub Actions OIDC ALWAYS include the
+    /// workflow path — a pattern like `^https://github\.com/.*` would
+    /// match every signed artifact from every owner/repo on github.com,
+    /// defeating the per-workflow trust anchor.
+    MissingGithubWorkflowPath,
+    /// The pattern contains a wildcard between `github.com/` and the
+    /// workflow path (`github.com/.*\.github/workflows/` or similar).
+    /// This expands the trust set to any owner/repo with a matching
+    /// workflow filename — including a forked repo with the same
+    /// filename. Pin the owner/repo literally.
+    UnpinnedGithubOwnerRepo,
+    /// Pattern starts with `https://` but is missing the `^` start-of-string
+    /// anchor. Cosign uses `regex::Regex::is_match` semantics — a missing
+    /// `^` means the literal `https://...` could appear anywhere inside
+    /// the SAN URI. While GitHub Actions OIDC SANs are well-structured,
+    /// a `^` anchor is cheap defense in depth (and matches the
+    /// documented operator examples in this crate's `human_reason()` text).
+    MissingStartAnchor,
+    /// A GitHub workflow pattern that does not pin the REF after the `@`.
+    /// `…/template-publish\.yml@` matches a certificate minted by that
+    /// workflow on ANY branch — including one anyone with push access can
+    /// create — so the pin must name `@refs/heads/<branch>$` (literal branch,
+    /// end-anchored) or `@refs/tags/<prefix>`. Refused under `Required`,
+    /// warned under `Audit` (see [`validate_sigstore_identity_regexp_for_policy`]).
+    UnpinnedWorkflowRef,
+}
+
+impl SigstoreRegexpRejection {
+    pub fn human_reason(&self) -> &'static str {
+        match self {
+            Self::Empty => "AEGIX_SIGSTORE_IDENTITY_REGEXP is empty",
+            Self::TooBroad => {
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP matches anything — pin it to your \
+                 workflow URL pattern (e.g. \
+                 `^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$`)"
+            }
+            Self::InvalidRegex => {
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP is not a valid regex — `cosign verify` will reject every artifact"
+            }
+            Self::MissingWorkflowAnchor => {
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP looks like a GitHub workflow pattern \
+                 but is missing the trailing `@` anchor — a fork named \
+                 `workflow.yml-evil.yml` could match the same prefix. \
+                 End the pattern with the pinned ref, e.g. `@refs/heads/main$`."
+            }
+            Self::MissingGithubWorkflowPath => {
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP targets `github.com` but does not \
+                 require the `.github/workflows/` path — every Sigstore identity \
+                 issued by GitHub Actions OIDC contains that path, so a pattern \
+                 without it would match unrelated artifacts from any owner/repo. \
+                 Use a pattern like \
+                 `^https://github\\.com/OWNER/REPO/\\.github/workflows/WORKFLOW\\.yml@refs/heads/main$`."
+            }
+            Self::UnpinnedGithubOwnerRepo => {
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP has a wildcard between `github.com/` \
+                 and `.github/workflows/` — owner and repo MUST be literal so a \
+                 fork with the same workflow filename can't satisfy the regex. \
+                 Replace `github\\.com/.*` with `github\\.com/OWNER/REPO/`."
+            }
+            Self::MissingStartAnchor => {
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP starts with `https://` but is \
+                 missing the `^` start-of-string anchor. Add `^` at the front \
+                 (e.g. `^https://github\\.com/OWNER/REPO/...`)."
+            }
+            Self::UnpinnedWorkflowRef => {
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP pins the workflow file but not the \
+                 git ref after `@`, so a signature minted by that workflow on ANY \
+                 branch verifies. End the pattern with a literal, end-anchored ref, \
+                 e.g. `...template-publish\\.yml@refs/heads/main$` (or \
+                 `@refs/tags/v` for release tags)."
+            }
+        }
+    }
+}
+
+/// Validate `regexp` for use as `--certificate-identity-regexp` in
+/// `cosign verify`. Pure function so the security policy is easy to
+/// test and cannot drift between callsites. Returns `Ok(())` if the
+/// pattern is acceptable; `Err(reason)` otherwise.
+///
+/// Policy:
+/// 1. Empty string is rejected (callers may special-case Empty for
+///    `Disabled` policy mode, but the underlying check stays the
+///    same).
+/// 2. Known catch-all patterns are rejected. Treating `.*` /
+///    `.+` / `.` / `^.*$` / `^.+$` as too broad covers the most
+///    common foot-gun — an operator who sets the regexp to "any"
+///    while leaving `AEGIX_SIGSTORE_REQUIRED=true` would silently
+///    defeat verification.
+/// 3. The pattern must compile as a regex.
+/// 4. Patterns targeting `github.com/.../.github/workflows/...`
+///    MUST carry the `@` ref separator after the workflow file.
+///    Missing it is spoofable via a fork repo named
+///    `workflow.yml-evil.yml`. This STRUCTURAL check accepts a bare
+///    trailing `@`; the ref itself (`@refs/heads/main$`) is required
+///    under `Required` by [`validate_sigstore_identity_regexp_for_policy`]
+///    — callers must use that entry point.
+/// 5. `github.com` patterns must reference `.github/workflows/` and
+///    pin the owner/repo literally (no wildcard between host and the
+///    workflow path).
+/// 6. `https://`-prefixed patterns must carry a `^` start anchor.
+pub fn validate_sigstore_identity_regexp(regexp: &str) -> Result<(), SigstoreRegexpRejection> {
+    if regexp.is_empty() {
+        return Err(SigstoreRegexpRejection::Empty);
+    }
+    // Reject known catch-all patterns. Trim whitespace first so a
+    // pasted env-var with stray spaces still triggers the check.
+    let trimmed = regexp.trim();
+    matches!(
+        trimmed,
+        ".*" | ".+" | "." | "^.*$" | "^.+$" | "^.$" | "^.*" | ".*$"
+    )
+    .then(|| Err::<(), _>(SigstoreRegexpRejection::TooBroad))
+    .transpose()?;
+    // The pattern must compile or `cosign` will reject every artifact.
+    if regex::Regex::new(regexp).is_err() {
+        return Err(SigstoreRegexpRejection::InvalidRegex);
+    }
+    // Wasm-security review 2026-05-23: a `https://`-prefixed pattern
+    // without a leading `^` matches the URI substring anywhere — cheap
+    // defense-in-depth to require the start-anchor that all the doc
+    // examples already use. We don't require `^` on non-URL patterns
+    // because there are legitimate non-anchored uses (e.g. SAN-email
+    // patterns).
+    if regexp.starts_with("https://") {
+        return Err(SigstoreRegexpRejection::MissingStartAnchor);
+    }
+    // Workflow-URL convention: if the pattern mentions
+    // `.github/workflows/`, the file extension `.yml` (or `.yaml`)
+    // must be immediately followed by `@` so the ref separator is
+    // anchored. Without it, a fork repo named
+    // `workflow.yml-evil.yml` would match the same prefix.
+    //
+    // The check looks for the `@` to appear AFTER `workflows/` in the
+    // pattern source. Whether the REF after it is pinned is decided by
+    // `workflow_ref_is_pinned` (policy-aware): the canonical form is
+    // `…template-publish\.yml@refs/heads/main$`.
+    if let Some(workflows_idx) = regexp.find(".github/workflows/") {
+        // Slice past the `workflows/` literal so any preceding `@`
+        // (would be unusual but harmless) doesn't accidentally
+        // satisfy the check.
+        let after_workflows = &regexp[workflows_idx + ".github/workflows/".len()..];
+        if !after_workflows.contains('@') {
+            return Err(SigstoreRegexpRejection::MissingWorkflowAnchor);
+        }
+    }
+    // L-14 (2026-05-22): additional anchoring checks for github.com
+    // patterns. Sigstore identities issued by GitHub Actions OIDC
+    // always have the form
+    // `https://github.com/{owner}/{repo}/.github/workflows/{file}.yml@{ref}`.
+    // A pattern that targets github.com but is missing either the
+    // `.github/workflows/` path or pins the owner/repo with a
+    // wildcard would expand the trust set far beyond the operator's
+    // intent (any fork with the same workflow name signs as us).
+    //
+    // We match both `github\.com/` (regex-escaped) and `github.com/`
+    // (raw) since operators write the pattern either way.
+    let github_idx = regexp
+        .find("github\\.com/")
+        .map(|i| (i, "github\\.com/".len()))
+        .or_else(|| regexp.find("github.com/").map(|i| (i, "github.com/".len())));
+    if let Some((idx, prefix_len)) = github_idx {
+        // 1. Pattern must reference a workflow path. Without it, every
+        //    OIDC identity from any GitHub repo would satisfy the
+        //    regex (e.g. `^https://github\.com/.*`).
+        if !regexp.contains(".github/workflows/") {
+            return Err(SigstoreRegexpRejection::MissingGithubWorkflowPath);
+        }
+        // 2. Owner/repo segment between `github.com/` and
+        //    `.github/workflows/` must be literal — no wildcards.
+        //    `.` (any-char), `.*`, `.+`, `\w+`, `[^/]+`, `\S+`
+        //    between the two anchors all defeat per-repo pinning.
+        let after_host = &regexp[idx + prefix_len..];
+        if let Some(workflows_at) = after_host.find(".github/workflows/") {
+            let owner_repo_segment = &after_host[..workflows_at];
+            // Bare `.` is the canonical wildcard; `.*` / `.+` / `[]`
+            // / `\w` likewise. Backslash-escaped `\.` is a literal
+            // dot in the repo name (e.g. `my.repo`) and is fine, so
+            // we strip those before scanning. Same for `\-`.
+            let scan = owner_repo_segment
+                .replace("\\.", "")
+                .replace("\\-", "")
+                .replace("\\_", "");
+            // Any of these tokens between host and workflows path
+            // indicates a wildcard.
+            let suspicious_tokens = [".*", ".+", "[^", "\\w", "\\S", "\\d", "(?", ".{", "()"];
+            if suspicious_tokens.iter().any(|t| scan.contains(t)) {
+                return Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo);
+            }
+            // A bare `.` (any-character) outside an escape is also
+            // suspicious. Scan for it in the post-strip text.
+            if scan.contains('.') {
+                return Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Does a GitHub workflow pattern pin the git REF after its `@`?
+///
+/// Accepts `@refs/heads/<literal branch>$` and `@refs/tags/<literal prefix>…`.
+/// A pattern with no `.github/workflows/` path is out of range (`true`): the
+/// structural validator decides those. Pure; `false` means "any ref".
+#[must_use]
+pub fn workflow_ref_is_pinned(regexp: &str) -> bool {
+    let Some(wf) = regexp.find(".github/workflows/") else {
+        return true;
+    };
+    let after = &regexp[wf..];
+    let Some(at) = after.find('@') else {
+        return false;
+    };
+    let reference = &after[at + 1..];
+    if let Some(branch) = reference.strip_prefix("refs/heads/") {
+        // A literal branch name, end-anchored: `main` without `$` also
+        // matches `main-evil`.
+        let Some(name) = branch.strip_suffix('$') else {
+            return false;
+        };
+        let literal = name
+            .replace("\\.", "")
+            .replace("\\-", "")
+            .replace("\\_", "");
+        return !literal.is_empty()
+            && literal
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_'));
+    }
+    if let Some(tag) = reference.strip_prefix("refs/tags/") {
+        // A literal first character: `v.*` pins release tags, `.*` pins nothing.
+        return tag
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    }
+    false
+}
+
+/// [`validate_sigstore_identity_regexp`] plus the ref pin, decided per policy.
+///
+/// * `Err(r)` — refuse (every structural rejection, and an unpinned ref under
+///   `Required`).
+/// * `Ok(Some(UnpinnedWorkflowRef))` — accept with a WARNING (`Audit` /
+///   `Disabled`): existing deployments whose pattern ends at `@` keep
+///   verifying during the migration window instead of losing verification.
+/// * `Ok(None)` — fully pinned.
+pub fn validate_sigstore_identity_regexp_for_policy(
+    regexp: &str,
+    policy: SigstorePolicy,
+) -> Result<Option<SigstoreRegexpRejection>, SigstoreRegexpRejection> {
+    validate_sigstore_identity_regexp(regexp)?;
+    if workflow_ref_is_pinned(regexp) {
+        return Ok(None);
+    }
+    match policy {
+        SigstorePolicy::Required => Err(SigstoreRegexpRejection::UnpinnedWorkflowRef),
+        SigstorePolicy::Audit | SigstorePolicy::Disabled => {
+            Ok(Some(SigstoreRegexpRejection::UnpinnedWorkflowRef))
+        }
+    }
+}
+
+/// The operator's `AEGIX_SIGSTORE_REQUIRED` env var name — ONE spelling for
+/// the worker's boot gate and the controller's OCI-sync gate.
+pub const SIGSTORE_POLICY_ENV: &str = "AEGIX_SIGSTORE_REQUIRED";
+
+/// How strictly OCI artifacts (worker: WASM layers; controller: the catalog
+/// `_index` and each template) must be Sigstore-verified before use.
+///
+/// * `Disabled` — no verification (dev). The SILENT default for an
+///   unset/empty value; both production gates refuse that state unless the
+///   operator spelled `disabled` (or an alias) explicitly.
+/// * `Audit` — verify, log, continue (migration window).
+/// * `Required` — verify, refuse on failure (production).
+///
+/// A value that is none of the spellings is not a policy: the parser returns
+/// [`UnrecognisedSigstorePolicy`], and both consumers refuse to run with it in
+/// every environment (security review 2026-10-14, E-7). Until then a typo
+/// such as `requried` meant `Disabled` outside production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigstorePolicy {
+    Disabled,
+    Audit,
+    Required,
+}
+
+/// [`SIGSTORE_POLICY_ENV`] holds a value that is not one of the policy
+/// spellings. Carries the value (trimmed, at most 64 characters) so the
+/// operator sees what was read; the variable names a mode, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecognisedSigstorePolicy {
+    pub value: String,
+}
+
+impl std::fmt::Display for UnrecognisedSigstorePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{SIGSTORE_POLICY_ENV}={:?} is not a Sigstore policy: set `required` (verify, \
+             refuse on failure), `audit` (verify, log, continue) or `disabled` (no \
+             verification, an explicit acceptance of the risk)",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for UnrecognisedSigstorePolicy {}
+
+impl SigstorePolicy {
+    /// Read and parse [`SIGSTORE_POLICY_ENV`]. Unset/empty → `Disabled`;
+    /// unrecognised → `Err`. See [`SigstorePolicy::raw_env_is_explicit`] for
+    /// the production gates' explicitness test over the same raw string.
+    pub fn from_env() -> Result<Self, UnrecognisedSigstorePolicy> {
+        Self::from_env_str(&std::env::var(SIGSTORE_POLICY_ENV).unwrap_or_default())
+    }
+
+    /// Pure parse. Recognised values (case-insensitive, trimmed):
+    ///   * `required` / `true` / `1`                → `Required`
+    ///   * `audit` / `warn`                         → `Audit`
+    ///   * `disabled` / `off` / `0` / `false` / `no` → `Disabled` (explicit opt-out)
+    ///   * empty or whitespace                      → `Disabled` (silent default)
+    ///   * anything else                            → `Err`
+    ///
+    /// The silent-default arm is POLICED by the production gates, which refuse
+    /// to run unless [`raw_env_is_explicit`](Self::raw_env_is_explicit) holds
+    /// — the 2026-05-22 wasm-security review's MEDIUM-4: an operator who
+    /// forgot the variable got Sigstore silently disabled with no startup
+    /// warning. An unknown value is an `Err` that both consumers refuse in
+    /// every environment (E-7).
+    pub fn from_env_str(raw: &str) -> Result<Self, UnrecognisedSigstorePolicy> {
+        // allow-inline-env-bool: a three-valued policy (package AR), not a boolean;
+        // `yes`/`on` are deliberately not Sigstore spellings.
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "required" => Ok(Self::Required),
+            "audit" | "warn" => Ok(Self::Audit),
+            "disabled" | "off" | "0" | "false" | "no" | "" => Ok(Self::Disabled),
+            _ => Err(UnrecognisedSigstorePolicy {
+                value: raw.trim().chars().take(64).collect(),
+            }),
+        }
+    }
+
+    /// Was the operator EXPLICIT? Distinguishes "set `=disabled`, accepting
+    /// the risk" from "forgot to set anything" — the production gates key on
+    /// this, not on the parsed value. Every spelling `from_env_str`
+    /// recognises counts as explicit; nothing else does.
+    #[must_use]
+    pub fn raw_env_is_explicit(raw: &str) -> bool {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "true"
+                | "1"
+                | "required"
+                | "audit"
+                | "warn"
+                | "disabled"
+                | "off"
+                | "0"
+                | "false"
+                | "no"
+        )
+    }
+}
+
+/// The registry credential variables both processes read for an OCI pull.
+pub const OCI_REGISTRY_USERNAME_ENV: &str = "OCI_REGISTRY_USERNAME";
+pub const OCI_REGISTRY_PASSWORD_ENV: &str = "OCI_REGISTRY_PASSWORD";
+
+/// The environment `cosign verify` reads a private registry's credentials
+/// from, derived from the pair the pull itself uses (2026-11-03).
+///
+/// `cosign` takes a registry login from a Docker config or from
+/// `COSIGN_REGISTRY_USERNAME` / `COSIGN_REGISTRY_PASSWORD` (the environment
+/// form of its `--registry-username` / `--registry-password` flags; cosign
+/// 2.4.1, the images' version, and 3.0.6 both honour it — measured against a
+/// private GHCR package: without them `UNAUTHORIZED: authentication required`
+/// before any signature is looked at). Neither process writes a Docker
+/// config, so a private catalog under `AEGIX_SIGSTORE_REQUIRED=required` was
+/// refused at verification however the pull was authenticated. Every
+/// `cosign verify` the controller's sync or the worker's fetcher spawns
+/// applies this to its command (`Command::envs`); it is the ONE place the
+/// mapping is spelled.
+///
+/// Empty when either variable is unset or empty: a half pair sends nothing,
+/// since cosign would otherwise attempt a basic login with an empty field.
+/// Pure over its arguments so a test needs no environment; the two-argument
+/// form is what both call sites pass `std::env::var(...)` into.
+pub fn cosign_registry_credentials_env(
+    username: Option<String>,
+    password: Option<String>,
+) -> Vec<(&'static str, String)> {
+    match (username, password) {
+        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => vec![
+            ("COSIGN_REGISTRY_USERNAME", u),
+            ("COSIGN_REGISTRY_PASSWORD", p),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// [`cosign_registry_credentials_env`] over the process environment.
+pub fn cosign_registry_credentials_env_from_process() -> Vec<(&'static str, String)> {
+    cosign_registry_credentials_env(
+        std::env::var(OCI_REGISTRY_USERNAME_ENV).ok(),
+        std::env::var(OCI_REGISTRY_PASSWORD_ENV).ok(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_rejected() {
+        assert_eq!(
+            validate_sigstore_identity_regexp(""),
+            Err(SigstoreRegexpRejection::Empty)
+        );
+    }
+
+    #[test]
+    fn catch_all_rejected() {
+        for p in [".*", ".+", ".", "^.*$", "^.+$", "^.$", "^.*", ".*$"] {
+            assert_eq!(
+                validate_sigstore_identity_regexp(p),
+                Err(SigstoreRegexpRejection::TooBroad),
+                "pattern {p:?} should be TooBroad"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_regex_rejected() {
+        assert_eq!(
+            validate_sigstore_identity_regexp("^(unterminated"),
+            Err(SigstoreRegexpRejection::InvalidRegex)
+        );
+    }
+
+    #[test]
+    fn github_owner_wildcarded_is_rejected() {
+        // The exact P4 bypass: wildcard owner passes the controller's
+        // old ad-hoc matcher but must be rejected here.
+        let pattern = "^https://github\\.com/.*/talos/\\.github/workflows/template-publish\\.yml@";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo)
+        );
+    }
+
+    #[test]
+    fn github_repo_wildcarded_is_rejected() {
+        let pattern = "^https://github\\.com/example-org/.+/\\.github/workflows/x\\.yml@";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo)
+        );
+    }
+
+    #[test]
+    fn github_missing_workflow_anchor_is_rejected() {
+        let pattern =
+            "^https://github\\.com/example-org/talos/\\.github/workflows/template-publish\\.yml";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingWorkflowAnchor)
+        );
+    }
+
+    #[test]
+    fn github_missing_workflow_path_is_rejected() {
+        let pattern = "^https://github\\.com/example-org/talos/releases@";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingGithubWorkflowPath)
+        );
+    }
+
+    #[test]
+    fn unanchored_https_pattern_is_rejected() {
+        let pattern = "https://github\\.com/example-org/talos/\\.github/workflows/x\\.yml@";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingStartAnchor)
+        );
+    }
+
+    /// STRUCTURAL pass only: the ref-less `@` form is still refused under
+    /// Required by the policy-aware entry point (see
+    /// `a_workflow_pin_without_a_ref_is_refused_under_required`).
+    #[test]
+    fn pinned_owner_repo_is_accepted() {
+        let pattern = "^https://github\\.com/example-org/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$";
+        assert!(
+            validate_sigstore_identity_regexp_for_policy(pattern, SigstorePolicy::Required)
+                == Ok(None),
+            "canonical pinned form must pass under Required"
+        );
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "{:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn escaped_dot_in_owner_repo_is_literal() {
+        let pattern =
+            "^https://github\\.com/my\\.org/my\\.repo/\\.github/workflows/x\\.yml@refs/heads/main$";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "{:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn non_https_pattern_does_not_require_anchor() {
+        // SAN-email identities are a legitimate non-anchored use.
+        let pattern = "user@example\\.com";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "{:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    const AT_ONLY: &str =
+        "^https://github\\.com/example-org/talos/\\.github/workflows/template-publish\\.yml@";
+    const MAIN_PINNED: &str = "^https://github\\.com/example-org/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$";
+
+    #[test]
+    fn a_workflow_pin_without_a_ref_is_refused_under_required() {
+        assert_eq!(
+            validate_sigstore_identity_regexp_for_policy(AT_ONLY, SigstorePolicy::Required),
+            Err(SigstoreRegexpRejection::UnpinnedWorkflowRef)
+        );
+        // The migration window: Audit keeps verifying and warns.
+        assert_eq!(
+            validate_sigstore_identity_regexp_for_policy(AT_ONLY, SigstorePolicy::Audit),
+            Ok(Some(SigstoreRegexpRejection::UnpinnedWorkflowRef))
+        );
+        assert_eq!(
+            validate_sigstore_identity_regexp_for_policy(MAIN_PINNED, SigstorePolicy::Required),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn ref_pin_shapes() {
+        let wf = "^https://github\\.com/o/r/\\.github/workflows/p\\.yml@";
+        for pinned in [
+            "refs/heads/main$",
+            "refs/heads/release/v2$",
+            "refs/heads/my\\.branch$",
+            "refs/tags/v.*",
+            "refs/tags/v[0-9]+$",
+        ] {
+            assert!(workflow_ref_is_pinned(&format!("{wf}{pinned}")), "{pinned}");
+        }
+        for loose in [
+            "",
+            ".*",
+            "refs/heads/main", // matches main-evil
+            "refs/heads/.*$",
+            "refs/heads/$",
+            "refs/tags/.*",
+            "refs/pull/1/merge$",
+        ] {
+            assert!(
+                !workflow_ref_is_pinned(&format!("{wf}{loose}")),
+                "{loose:?}"
+            );
+        }
+        // Non-workflow identities are the structural validator's business.
+        assert!(workflow_ref_is_pinned("user@example\\.com"));
+    }
+
+    // ---- SigstorePolicy (moved here from both consumers, 2026-09-13) ----
+
+    #[test]
+    fn sigstore_policy_parses_every_recognised_spelling() {
+        for v in [
+            "required",
+            "true",
+            "1",
+            "REQUIRED",
+            "Required",
+            " REQUIRED ",
+        ] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                Ok(SigstorePolicy::Required),
+                "{v:?}"
+            );
+        }
+        for v in ["audit", "warn", "  audit  "] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                Ok(SigstorePolicy::Audit),
+                "{v:?}"
+            );
+        }
+        for v in ["disabled", "off", "0", "false", "no", "\tDISABLED\n"] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                Ok(SigstorePolicy::Disabled),
+                "{v:?}"
+            );
+        }
+        // Silent default: unset/empty only.
+        for v in ["", "   ", "\t\n"] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                Ok(SigstorePolicy::Disabled),
+                "{v:?}"
+            );
+        }
+    }
+
+    /// E-7 (2026-10-14): a value that is none of the spellings is an error,
+    /// never `Disabled` — a misspelt `required` must not run unverified.
+    #[test]
+    fn an_unrecognised_policy_is_an_error() {
+        for v in [
+            "typo", "requried", "enabled", "maybe", "true-ish", "yes", "on",
+        ] {
+            let err = SigstorePolicy::from_env_str(v).expect_err(v);
+            assert_eq!(err.value, v.trim());
+            assert!(err.to_string().contains(SIGSTORE_POLICY_ENV), "{err}");
+        }
+        // The carried value is capped, so a pasted blob is not echoed whole.
+        let long = "x".repeat(500);
+        assert_eq!(
+            SigstorePolicy::from_env_str(&long)
+                .expect_err("long")
+                .value
+                .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn sigstore_raw_env_is_explicit_distinguishes_silent_from_chosen() {
+        for v in [
+            "required",
+            "true",
+            "1",
+            "audit",
+            "warn",
+            "disabled",
+            "off",
+            "0",
+            "false",
+            "no",
+            "  REQUIRED  ",
+        ] {
+            assert!(
+                SigstorePolicy::raw_env_is_explicit(v),
+                "`{v}` must be explicit"
+            );
+        }
+        for v in [
+            "",
+            "  ",
+            "\t\n",
+            "yes-please",
+            "true-ish",
+            "maybe",
+            "off-ish",
+            "enabled",
+        ] {
+            assert!(
+                !SigstorePolicy::raw_env_is_explicit(v),
+                "`{v}` must NOT be explicit"
+            );
+        }
+    }
+
+    /// Explicit ⇔ recognised: every string the parser classifies by a named
+    /// arm is explicit, and the silent-default arm is exactly the
+    /// not-explicit set — so the two functions cannot drift apart.
+    #[test]
+    fn explicit_is_exactly_the_recognised_set() {
+        for v in [
+            "required", "true", "1", "audit", "warn", "disabled", "off", "0", "false", "no",
+        ] {
+            assert!(SigstorePolicy::raw_env_is_explicit(v));
+        }
+        for v in ["", "typo", "enabled", "yes", "on"] {
+            // `yes` / `on` are deliberately NOT sigstore spellings: this is a
+            // three-valued policy, not `aegix_config::bool_env`'s vocabulary.
+            assert!(!SigstorePolicy::raw_env_is_explicit(v));
+            if v.is_empty() {
+                assert_eq!(
+                    SigstorePolicy::from_env_str(v),
+                    Ok(SigstorePolicy::Disabled)
+                );
+            } else {
+                assert!(SigstorePolicy::from_env_str(v).is_err(), "{v:?}");
+            }
+        }
+    }
+
+    /// SOURCE PIN, stated as textual: neither consumer may grow its own
+    /// `SigstorePolicy` again. Both copies were byte-identical when they were
+    /// folded in here; a third would be the same class one step further.
+    fn carries_no_private_policy_enum(name: &str, src: &str) {
+        assert!(
+            !src.contains("enum SigstorePolicy"),
+            "{name}: private SigstorePolicy enum"
+        );
+        assert!(
+            !src.contains("fn from_env_str"),
+            "{name}: private from_env_str"
+        );
+        assert!(
+            !src.contains("fn raw_env_is_explicit"),
+            "{name}: private raw_env_is_explicit"
+        );
+        assert!(
+            src.contains("aegix_sigstore_policy::SigstorePolicy"),
+            "{name}: does not import the shared enum"
+        );
+    }
+
+    #[test]
+    fn neither_consumer_carries_a_private_policy_enum() {
+        carries_no_private_policy_enum(
+            "aegix-worker-runtime",
+            include_str!("../../aegix-worker-runtime/src/module_fetcher.rs"),
+        );
+    }
+
+    #[test]
+    fn cosign_registry_credentials_follow_the_pull_pair() {
+        let both = cosign_registry_credentials_env(Some("owner".into()), Some("tok".into()));
+        assert_eq!(
+            both,
+            vec![
+                ("COSIGN_REGISTRY_USERNAME", "owner".to_string()),
+                ("COSIGN_REGISTRY_PASSWORD", "tok".to_string()),
+            ]
+        );
+        // A half pair, an empty field and an unset pair all send nothing:
+        // cosign would otherwise attempt a basic login with an empty field.
+        assert!(cosign_registry_credentials_env(Some("owner".into()), None).is_empty());
+        assert!(cosign_registry_credentials_env(None, Some("tok".into())).is_empty());
+        assert!(
+            cosign_registry_credentials_env(Some(String::new()), Some("tok".into())).is_empty()
+        );
+        assert!(
+            cosign_registry_credentials_env(Some("owner".into()), Some(String::new())).is_empty()
+        );
+        assert!(cosign_registry_credentials_env(None, None).is_empty());
+    }
+}

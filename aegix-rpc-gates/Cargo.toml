@@ -1,0 +1,37 @@
+[package]
+name = "aegix-rpc-gates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "The two gates a controller puts in front of a worker's signed data-plane RPC (the dispatch binding and the actor write ceiling), over a small ledger trait, with no database, metrics-registry or engine dependency: a controller with Postgres and a controller with an in-memory ledger decide by the same code (structural check 109)."
+
+[dependencies]
+# `Requirement`: whether a worker key must name a dispatch. The type only;
+# this crate reads no environment.
+aegix-config = { path = "../aegix-config" }
+# The wire types the gates read: `DispatchBinding`, the crypto-scheme tag,
+# the run statuses a state write honours, the gated subjects.
+aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
+# THE write-ceiling decision (`write_ceiling_denies`) and its audit
+# vocabulary, shared with the worker's gate and the engine's envelope gate.
+aegix-workflow-engine-core = { path = "../aegix-workflow-engine-core" }
+# `CONTROLLER_RPC_IDENTITY`, the reserved id the controller signs under.
+aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
+# The dispatch-binding gate's bounded positive cache.
+dashmap.workspace = true
+# Admission parses a request before it verifies it.
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The parity tests: an op the controller gates is an op the worker gates,
+# spelled identically.
+aegix-capability-world = { path = "../aegix-capability-world" }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

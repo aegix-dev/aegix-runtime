@@ -1,0 +1,109 @@
+[package]
+name = "worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Internal workspace crate — not published to crates.io. Set `publish = false`
+# + a license string so cargo-deny's unlicensed-crate check passes without
+# requiring legal review for code that never leaves this repo.
+publish.workspace = true
+license.workspace = true
+
+# The deployable worker BINARY. The library half (wasmtime WASM host:
+# AegixRuntime, AegixContext, host/ modules, module_fetcher, sql_validator,
+# wit_inspector, …) lives in `aegix-worker-runtime`; `src/lib.rs` here is a
+# thin re-export shim so `worker::…` paths keep resolving. Only bin-side
+# modules remain: main.rs, metrics_server, secret_claim, self_register.
+
+[dependencies]
+# The extracted WASM host runtime — everything the bin executes jobs with.
+aegix-auth-types = { path = "../aegix-auth-types" }
+# `otlp`: this binary exports traces (JAEGER_ENDPOINT / OTEL_EXPORTER_OTLP_*),
+# so it takes the OTLP exporter the runtime library leaves out (check 109).
+# `oci`: it runs modules pulled from an OCI registry (`oci://` module URIs).
+# `prometheus`: it serves `/metrics` (`metrics_server.rs`) from the registry
+# `metrics::init_telemetry` installs. Both are off in the runtime library and
+# in `aegix-runtime` (2026-11-02, check 109).
+aegix-worker-runtime = { path = "../aegix-worker-runtime", features = ["otlp", "oci", "prometheus"] }
+# The build identity self-registration reports, composed as the controller composes its own.
+aegix-build-info = { path = "../aegix-build-info" }
+
+# Core async runtime
+tokio = { workspace = true, features = ["full"] }
+async-nats.workspace = true
+# The worker's Ed25519 identity as a NATS user nkey (worker::nats_identity).
+nkeys.workspace = true
+aegix-nats-tls = { path = "../aegix-nats-tls" }
+aegix-task-supervision = { path = "../aegix-task-supervision" }
+
+# Core utilities
+anyhow.workspace = true
+serde_json.workspace = true
+# Wipe opened secret plaintext (claim reply bytes, per-step maps) on drop.
+zeroize = { workspace = true, features = ["serde"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["default", "env-filter", "fmt"] }
+uuid = { workspace = true, features = ["serde", "v4"] }
+aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
+aegix-workflow-engine-core = { path = "../aegix-workflow-engine-core" }
+aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
+aegix-shutdown = { path = "../aegix-shutdown" }
+aegix-config = { path = "../aegix-config" }
+
+# HTTP client (self_register boot-time identity registration)
+reqwest = { workspace = true, features = ["json", "gzip", "brotli", "deflate", "stream", "rustls"] }
+
+# Async utilities
+futures-util.workspace = true
+
+# Hashing / encoding (job-result signing + cache keys)
+sha2.workspace = true
+hex.workspace = true
+
+# Constant-time comparison (metrics-server auth token, result verification)
+subtle.workspace = true
+
+# Random number generation (secret-claim nonces, self-register jitter)
+aegix-random = { path = "../aegix-random" }
+
+# Redis (OCI module cache wiring in main.rs)
+redis = { workspace = true, features = ["default", "tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # rustls for rediss:// (Upstash, ElastiCache TLS)
+aegix-redis = { path = "../aegix-redis" }
+aegix-replay-guard = { path = "../aegix-replay-guard" }
+# The marker a dispatch refused for want of the replay store is answered with
+# (B2-3); the controller's retry classifier reads the same constant.
+aegix-reason-class = { path = "../aegix-reason-class" }
+# rustls direct dep so worker/main.rs can install the ring CryptoProvider
+# at startup — required since rustls 0.23 stopped auto-selecting one when
+# multiple crates pull rustls in (redis + reqwest in our case).
+rustls = { workspace = true, features = ["ring"] }
+
+# Observability (OTLP trace-context propagation + Prometheus metrics endpoint)
+opentelemetry = { workspace = true, features = ["metrics", "trace"] }
+prometheus.workspace = true
+tracing-opentelemetry.workspace = true
+
+bytes.workspace = true
+
+[dev-dependencies]
+# Integration tests (tests/) compile guest fixtures and poke the runtime
+# directly; the runtime itself comes through aegix-worker-runtime.
+# wasmtime's defaults without `cache` (see the root manifest), plus
+# memory-protection-keys.
+wasmtime = { workspace = true, features = [
+  "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat", "profiling",
+  "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump",
+  "debug-builtins", "runtime", "component-model", "component-model-async", "threads",
+  "stack-switching", "std", "debug", "compile-time-builtins", "wit-parser", "memory-protection-keys",
+] }
+wat.workspace = true  # Convert WAT text to a minimal component for AOT tests
+wit-component.workspace = true
+wit-parser.workspace = true  # Resolve the minimal-node world for kill-switch integration fixtures
+async-trait.workspace = true  # dispatch_replay tests: a stand-in shared store
+
+[features]
+default = []
+
+
+[lints]
+workspace = true

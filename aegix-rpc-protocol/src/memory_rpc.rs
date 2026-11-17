@@ -1,0 +1,805 @@
+//! # Actor memory NATS-RPC
+//!
+//! Wire protocol between the worker's WIT `agent-memory::*` host
+//! functions and the controller-side memory service.
+//!
+//! Moving memory ops off the worker's direct DB pool is a defence-in-
+//! depth step: every other WASM-bearing surface in Aegix (secrets,
+//! workflow state, actors) is brokered through the controller, so the
+//! worker doesn't need `DATABASE_URL` or an embedding-provider URL —
+//! a compromised sandbox can't exfiltrate rows or query the wrong
+//! tenant even if it escapes the wasmtime boundary. Every request is
+//! HMAC-signed with `WORKER_SHARED_KEY` via [`crate::rpc_auth`].
+//!
+//! ## Subjects
+//!
+//! A single subject [`SUBJECT_MEMORY_OP`] multiplexes all operations
+//! via the [`MemoryOp`] enum. The controller serves the request by
+//! dispatching to the matching `aegix_memory::` helper against its
+//! DB pool, then replies with a [`MemoryRpcReply`].
+
+use crate::dispatch_binding::{self, DispatchBinding};
+use crate::rpc_auth;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub const SUBJECT_MEMORY_OP: &str = "talos.memory.op";
+pub const SUBJECT_NAME: &str = "memory_rpc"; // canonical signing subject
+
+pub const REQUEST_TIMEOUT_MS: u64 = 3_000;
+/// Controller handles up to this many concurrent requests — protects
+/// the DB connection pool and embedding provider from fan-out storms.
+pub const MAX_IN_FLIGHT: usize = 16;
+/// Maximum entries a single `ListKeys` or `Search` request may ask for.
+pub const MAX_RESULT_LIMIT: u32 = 200;
+
+/// MCP-1026 (2026-05-15): structural caps lifted into `verify()` for
+/// sibling parity with MCP-1024 (state_rpc), MCP-1025 (graph_rpc), and
+/// integration_state_rpc::validate_op. Pre-fix `validate_finite` in
+/// `verify()` only rejected non-finite numerics; the actual size caps
+/// for key / prefix / query / exclude_kinds lived at the subscriber
+/// (MCP-1005) or inside `persist_memory_with_metadata` (lib.rs:452 /
+/// :581). Folding them into verify() means cross-process consumers
+/// trusting verify() inherit the invariant without copy-paste.
+///
+/// `query` cap mirrors graph_rpc's MAX_QUERY_LEN (4096) since both
+/// fields land in similar O(N) Lucene / pgvector paths.
+///
+/// `exclude_kinds` caps mirror the MCP-1005 subscriber-side
+/// constants (64 entries × 64 chars/entry).
+pub const MAX_SEARCH_QUERY_LEN: usize = 4096;
+pub const MAX_PREFIX_LEN: usize = crate::MAX_MEMORY_KEY_CHARS;
+pub const MAX_EXCLUDE_KINDS: usize = 64;
+pub const MAX_EXCLUDE_KIND_LEN: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum MemoryOp {
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: serde_json::Value,
+        memory_type: String,
+        ttl_hours: Option<f64>,
+        /// Optional structured metadata stored in a dedicated JSONB column.
+        /// Never mixed into `value` — read paths return `value` exactly as stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+    Delete {
+        key: String,
+    },
+    ListKeys {
+        prefix: Option<String>,
+    },
+    Search {
+        query: String,
+        limit: u32,
+        min_score: f64,
+        /// Results whose `metadata.kind` appears in this list are filtered out.
+        ///
+        /// Convention: writers that persist *synthetic* output (LLM briefs,
+        /// recall Q+A pairs, synthesized daily summaries) stamp
+        /// `metadata.kind` with a stable label. Callers on the read side
+        /// pass the labels they want excluded so that synthesize → persist →
+        /// search chains don't feed the LLM its own prior output.
+        ///
+        /// Empty list = no exclusion (equivalent to the pre-filter behavior).
+        /// Participates in the HMAC canonical byte stream so the list cannot
+        /// be stripped in flight.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude_kinds: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRpcRequest {
+    pub actor_id: Uuid,
+    /// The whole op, wrapped so its signature covers the EXACT wire text.
+    /// Wrapping the ENVELOPE (not per-`Value`-field like the pre-#598
+    /// canonical scheme) fixes `value`, `metadata`, `ttl_hours` AND
+    /// `min_score` in one move — every float-bearing field is bound as raw
+    /// text with no re-derivation — and closes a latent footgun: a new
+    /// field added to `MemoryOp::Set` is signed by construction, never
+    /// silently left out of a hand-built body. See
+    /// [`rpc_auth::RawSigned`].
+    pub op: rpc_auth::RawSigned<MemoryOp>,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: Vec<u8>,
+    /// RFC 0010 P2 inc.3: self-reported signer identity. Empty under the legacy
+    /// HMAC scheme; the worker's id under Ed25519 (the controller resolves the
+    /// verifying key by it). `#[serde(default)]` keeps scheme-0 wire bytes
+    /// byte-identical (absent field ⇒ empty string).
+    #[serde(default)]
+    pub worker_id: String,
+    /// Unsigned dispatch hint: 0 = legacy HMAC, 1 = per-worker Ed25519. Never
+    /// part of the signed input, so a flip on the wire just routes to a verify
+    /// path whose signature can't be satisfied without the right key.
+    #[serde(default)]
+    pub crypto_scheme: u8,
+    /// The dispatch this call is made for (2026-10-29): the job's run and its
+    /// own `module_executions` row, signed. Absent only from a caller that
+    /// runs no dispatch — the controller's rehearsal runtime — and from a
+    /// worker older than the field. Absent, the wire and the signed body are
+    /// byte-identical to before the field. See [`crate::dispatch_binding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<DispatchBinding>,
+}
+
+impl MemoryRpcRequest {
+    /// An UNBOUND request: for a caller that runs no dispatch — the
+    /// controller's rehearsal runtime (`run_sandbox`, `test_module`), whose
+    /// own signing identity the controller admits unbound — and for tests.
+    /// A worker's host call names its dispatch with [`Self::new_signed_bound`];
+    /// the controller refuses an unbound request from a worker key.
+    pub fn new_signed(actor_id: Uuid, op: MemoryOp) -> Option<Self> {
+        Self::new_signed_bound(actor_id, None, op)
+    }
+
+    /// Build a signed, time-stamped request for `dispatch`. Returns `None`
+    /// when no HMAC key is registered, or when any signed numeric field is
+    /// non-finite (NaN/Inf — IEEE 754 NaN has multiple bit patterns
+    /// that would produce non-deterministic signatures).
+    pub fn new_signed_bound(
+        actor_id: Uuid,
+        dispatch: Option<DispatchBinding>,
+        op: MemoryOp,
+    ) -> Option<Self> {
+        validate_finite(&op)?;
+        // MCP-1149 (2026-05-16): structural validation BEFORE signing.
+        // Pre-fix `new_signed` skipped `validate_structure` — the worker
+        // would sign and ship oversized keys / queries / prefixes /
+        // exclude_kinds entries, NATS would forward them, and the
+        // controller's `verify()` would reject them. The worker had
+        // already paid the HMAC compute over the oversized body + NATS
+        // bandwidth.
+        //
+        // Sibling pattern to `integration_state_rpc::new_signed` (which
+        // already runs `validate_op` at sign time). The defense-in-depth
+        // posture is preserved: `verify()` still runs `validate_structure`
+        // on the controller side, so a compromised worker that bypasses
+        // this check still fails the gate.
+        //
+        // Cheap-gate-first per the MCP-1026 / MCP-1033 sweep: this is the
+        // same validator that runs in verify(), so the raw-bytes build +
+        // HMAC compute below only fires for well-formed payloads.
+        validate_structure(&op)?;
+        let timestamp_ms = rpc_auth::now_ms();
+        let nonce = rpc_auth::random_nonce();
+        // Mint the exact wire text ONCE, here, inside the worker — the
+        // guest only ever supplied `Value`-semantics (see host/memory.rs,
+        // which parses the guest string to a `Value` before building the
+        // op). Everything from here signs `op.raw_bytes()`.
+        let op = rpc_auth::RawSigned::from(op);
+        let body = sign_body_bytes(&op, timestamp_ms, dispatch.as_ref());
+        let (signature, worker_id, crypto_scheme) =
+            rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body)?;
+        Some(Self {
+            actor_id,
+            op,
+            timestamp_ms,
+            nonce,
+            signature,
+            worker_id,
+            crypto_scheme,
+            dispatch,
+        })
+    }
+
+    /// Verify signature + freshness. Every failure is fail-closed and
+    /// uniform to the CALLER — the returned [`rpc_auth::VerifyFailure`] is a
+    /// controller-side diagnostic that the admission gate collapses into one
+    /// indistinguishable wire reply (see the type's docs for the oracle
+    /// constraint).
+    ///
+    /// Gate ORDER is load-bearing and unchanged from the pre-classification
+    /// version: freshness → finiteness → structural caps → crypto, so a
+    /// malformed or stale request never pays the HMAC/Ed25519 compute
+    /// (MCP-1026 / MCP-1149).
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
+        if !rpc_auth::verify_freshness(self.timestamp_ms) {
+            return Err(VerifyFailure::Stale);
+        }
+        if validate_finite(self.op.get()).is_none() {
+            return Err(VerifyFailure::NonFinite);
+        }
+        // MCP-1026 (2026-05-15): structural caps inside verify(). Same
+        // sibling pattern as state_rpc (MCP-1024), graph_rpc (MCP-1025),
+        // and integration_state_rpc::validate_op. Cheap-gate-first so
+        // an oversized field short-circuits before the HMAC compute —
+        // reads the already-parsed op, no re-serialisation.
+        if validate_structure(self.op.get()).is_none() {
+            return Err(VerifyFailure::OversizedStructure);
+        }
+        let body = sign_body_bytes(&self.op, self.timestamp_ms, self.dispatch.as_ref());
+        rpc_auth::verify_rpc(
+            SUBJECT_NAME,
+            self.actor_id,
+            &self.nonce,
+            &body,
+            &self.worker_id,
+            &self.signature,
+            self.crypto_scheme,
+        )
+    }
+}
+
+/// MCP-1026: structural validation for signed `memory_rpc` payloads.
+///
+/// What we check (cheap, non-allocating where possible):
+/// - `key` (Get/Set/Delete): non-empty after trim, ≤ MAX_MEMORY_KEY_CHARS,
+///   no null bytes or control chars. Mirrors `validate_memory_key` in
+///   aegix_memory::lib so callers can't ship a key shape verify() accepts
+///   that the persist path then refuses.
+/// - `prefix` (ListKeys): if present, ≤ MAX_PREFIX_LEN. (Empty prefix is
+///   meaningful: "list all keys".)
+/// - `query` (Search): non-empty after trim, ≤ MAX_SEARCH_QUERY_LEN.
+/// - `limit` (Search): 1..=MAX_RESULT_LIMIT.
+/// - `exclude_kinds` (Search): ≤ MAX_EXCLUDE_KINDS entries, each
+///   ≤ MAX_EXCLUDE_KIND_LEN. Mirrors MCP-1005 subscriber caps.
+/// - `memory_type` (Set): must be a recognised value
+///   (`is_valid_memory_type`).
+///
+/// What we do NOT check here:
+/// - `value` / `metadata` byte size — those are bounded by
+///   MAX_VALUE_BYTES / MAX_METADATA_BYTES at persist time (lib.rs:452 /
+///   :581). Verifying here would require walking the JSON value, which is
+///   expensive. The persist-path check is the right boundary.
+fn validate_structure(op: &MemoryOp) -> Option<()> {
+    fn ok_key(k: &str) -> bool {
+        let trimmed = k.trim();
+        if trimmed.is_empty() || trimmed.len() > crate::MAX_MEMORY_KEY_CHARS {
+            return false;
+        }
+        if k.contains('\0') || k.chars().any(|c| c.is_control() && c != '\t') {
+            return false;
+        }
+        true
+    }
+    match op {
+        MemoryOp::Get { key } | MemoryOp::Delete { key } => {
+            if !ok_key(key) {
+                return None;
+            }
+        }
+        MemoryOp::Set {
+            key, memory_type, ..
+        } => {
+            if !ok_key(key) {
+                return None;
+            }
+            if !crate::is_valid_memory_type(memory_type) {
+                return None;
+            }
+        }
+        MemoryOp::ListKeys { prefix } => {
+            if let Some(p) = prefix {
+                if p.len() > MAX_PREFIX_LEN {
+                    return None;
+                }
+            }
+        }
+        MemoryOp::Search {
+            query,
+            limit,
+            exclude_kinds,
+            ..
+        } => {
+            if query.trim().is_empty() || query.len() > MAX_SEARCH_QUERY_LEN {
+                return None;
+            }
+            if *limit == 0 || *limit > MAX_RESULT_LIMIT {
+                return None;
+            }
+            if exclude_kinds.len() > MAX_EXCLUDE_KINDS {
+                return None;
+            }
+            if exclude_kinds.iter().any(|k| k.len() > MAX_EXCLUDE_KIND_LEN) {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+#[cfg(test)]
+mod structural_tests {
+    //! MCP-1026: pin every per-variant structural check.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_canonical_get() {
+        assert!(validate_structure(&MemoryOp::Get { key: "foo".into() }).is_some());
+    }
+
+    #[test]
+    fn accepts_canonical_set() {
+        assert!(validate_structure(&MemoryOp::Set {
+            key: "foo".into(),
+            value: json!({"x": 1}),
+            memory_type: "working".into(),
+            ttl_hours: None,
+            metadata: None,
+        })
+        .is_some());
+    }
+
+    #[test]
+    fn rejects_empty_key() {
+        assert!(validate_structure(&MemoryOp::Get { key: "".into() }).is_none());
+        assert!(validate_structure(&MemoryOp::Get { key: "   ".into() }).is_none());
+    }
+
+    #[test]
+    fn rejects_oversized_key() {
+        let big = "k".repeat(crate::MAX_MEMORY_KEY_CHARS + 1);
+        assert!(validate_structure(&MemoryOp::Get { key: big }).is_none());
+    }
+
+    #[test]
+    fn rejects_null_byte_in_key() {
+        assert!(validate_structure(&MemoryOp::Get {
+            key: "foo\0bar".into()
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_control_char_in_key() {
+        assert!(validate_structure(&MemoryOp::Get {
+            key: "foo\x07bar".into() // BEL
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_memory_type() {
+        assert!(validate_structure(&MemoryOp::Set {
+            key: "foo".into(),
+            value: json!(null),
+            memory_type: "bogus".into(),
+            ttl_hours: None,
+            metadata: None,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_oversized_search_query() {
+        let big = "q".repeat(MAX_SEARCH_QUERY_LEN + 1);
+        assert!(validate_structure(&MemoryOp::Search {
+            query: big,
+            limit: 10,
+            min_score: 0.5,
+            exclude_kinds: vec![],
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_empty_search_query() {
+        assert!(validate_structure(&MemoryOp::Search {
+            query: "   ".into(),
+            limit: 10,
+            min_score: 0.5,
+            exclude_kinds: vec![],
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_excessive_search_limit() {
+        assert!(validate_structure(&MemoryOp::Search {
+            query: "alice".into(),
+            limit: MAX_RESULT_LIMIT + 1,
+            min_score: 0.5,
+            exclude_kinds: vec![],
+        })
+        .is_none());
+        assert!(validate_structure(&MemoryOp::Search {
+            query: "alice".into(),
+            limit: 0,
+            min_score: 0.5,
+            exclude_kinds: vec![],
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_too_many_exclude_kinds() {
+        let kinds: Vec<String> = (0..MAX_EXCLUDE_KINDS + 1)
+            .map(|i| format!("k{i}"))
+            .collect();
+        assert!(validate_structure(&MemoryOp::Search {
+            query: "alice".into(),
+            limit: 10,
+            min_score: 0.5,
+            exclude_kinds: kinds,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_oversized_exclude_kind_entry() {
+        let big = "e".repeat(MAX_EXCLUDE_KIND_LEN + 1);
+        assert!(validate_structure(&MemoryOp::Search {
+            query: "alice".into(),
+            limit: 10,
+            min_score: 0.5,
+            exclude_kinds: vec![big],
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_oversized_prefix() {
+        let big = "p".repeat(MAX_PREFIX_LEN + 1);
+        assert!(validate_structure(&MemoryOp::ListKeys { prefix: Some(big) }).is_none());
+    }
+
+    #[test]
+    fn accepts_listkeys_with_no_prefix() {
+        assert!(validate_structure(&MemoryOp::ListKeys { prefix: None }).is_some());
+    }
+
+    #[test]
+    fn accepts_listkeys_with_empty_prefix() {
+        // Empty prefix means "list all keys" — different from absent;
+        // both legitimate.
+        assert!(validate_structure(&MemoryOp::ListKeys {
+            prefix: Some(String::new())
+        })
+        .is_some());
+    }
+}
+
+/// Reject MemoryOp payloads that contain non-finite f64 values. NaN
+/// has 2^52 distinct bit patterns and `to_le_bytes()` preserves the
+/// exact pattern — different patterns produce different signatures
+/// for logically-equivalent inputs, breaking verify even for honest
+/// callers. Reject early so the sign path is deterministic.
+fn validate_finite(op: &MemoryOp) -> Option<()> {
+    match op {
+        MemoryOp::Set { ttl_hours, .. } => {
+            if let Some(t) = ttl_hours {
+                if !t.is_finite() {
+                    return None;
+                }
+            }
+            Some(())
+        }
+        MemoryOp::Search { min_score, .. } => {
+            if !min_score.is_finite() {
+                return None;
+            }
+            Some(())
+        }
+        _ => Some(()),
+    }
+}
+
+/// The signed body: the request's freshness timestamp followed by the
+/// EXACT wire bytes of the op.
+///
+/// Layout: `timestamp_ms (i64 LE) || op.raw_bytes()`.
+///
+/// The timestamp is an envelope field (outside the op) so it stays a
+/// fixed 8-byte LE prefix. `op.raw_bytes()` is the JSON text of the op as
+/// it appears on the wire — minted once at construction, captured
+/// verbatim on deserialise, NEVER re-derived (see [`rpc_auth::RawSigned`]).
+/// That is the whole fix: the old hand-built body re-serialised
+/// `MemoryOp::Set.value` / `metadata` via `canonical_json_bytes` and
+/// re-encoded `ttl_hours` / `min_score` as `to_le_bytes` of a re-parsed
+/// f64, and serde_json's non-idempotent float round trip made an honest
+/// sender and receiver disagree. Binding the raw text removes every
+/// re-derivation, and — because the receiver hashes the sender's exact
+/// bytes — also removes any dependence on key ordering or serde enum-tag
+/// stability that the old fixed-tag concatenation existed to defend.
+///
+/// Only change this layout in a coordinated controller+worker deploy —
+/// any mismatch invalidates every signature.
+///
+/// A present dispatch binding is appended LAST (`dispatch_binding::append_signed`,
+/// 2026-10-29); absent, nothing is appended and the body is what it was.
+fn sign_body_bytes(
+    op: &rpc_auth::RawSigned<MemoryOp>,
+    timestamp_ms: i64,
+    dispatch: Option<&DispatchBinding>,
+) -> Vec<u8> {
+    let raw = op.raw_bytes();
+    let mut buf = Vec::with_capacity(8 + raw.len() + dispatch_binding::SIGNED_LEN);
+    buf.extend_from_slice(&timestamp_ms.to_le_bytes());
+    buf.extend_from_slice(raw);
+    dispatch_binding::append_signed(&mut buf, dispatch);
+    buf
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRpcReply {
+    pub result: Result<MemoryOpResult, MemoryRpcError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MemoryOpResult {
+    /// JSON-encoded value as stored in actor_memory.value.
+    GetValue {
+        value: String,
+        /// Row creation time, Unix epoch SECONDS (UTC). Populated for
+        /// `get-entry`; `None` on replies from pre-`get-entry` controllers
+        /// (DX-19, 2026-07-14). `#[serde(default)]` + `skip_serializing_if`
+        /// keep the wire format compatible across mixed controller/worker
+        /// versions: an old controller omits the field (worker fills
+        /// `None`); an old worker ignores the extra field. The bare `get`
+        /// host fn reads only `value`, so its behavior is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at_unix: Option<u64>,
+        /// Expiry time, Unix epoch SECONDS (UTC); `None` when the entry has
+        /// no TTL. See `created_at_unix` for the compatibility rationale.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_unix: Option<u64>,
+        /// Canonical `memory_type` the value was stored under. See
+        /// `created_at_unix` for the compatibility rationale.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_type: Option<String>,
+    },
+    Ok,
+    Keys {
+        keys: Vec<String>,
+    },
+    SearchHits {
+        hits: Vec<MemoryHit>,
+        method: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryHit {
+    pub key: String,
+    pub value: String,
+    pub score: f32,
+    /// Per-row `metadata` JSONB serialized as a JSON string, or None
+    /// when the row has NULL metadata. Lets sandbox callers display
+    /// `kind` / `source` / `generated_at` context alongside each hit
+    /// without re-querying the DB. Serialized-string rather than
+    /// structured value so the wire format stays compatible with the
+    /// signed canonical bytes — a Value would require deterministic
+    /// key ordering across every provider.
+    #[serde(default)]
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MemoryRpcError {
+    NotAvailable,
+    KeyNotFound,
+    InvalidInput(String),
+    Unauthorized,
+    StorageFull,
+    Internal(String),
+    Timeout,
+    /// The actor's `max_write_ceiling` refuses this mutation, or the ceiling
+    /// could not be read and the gate failed closed.
+    ///
+    /// **Carries no payload, and that is the design.** The two refusal
+    /// reasons ("this actor is readonly" / "I could not read the rule") are
+    /// distinguished for the OPERATOR — `talos_audit` log field, `talos_rpc`
+    /// outcome tag — and collapsed for the CALLER, exactly as
+    /// `caller_facing_unauthorized` collapses every `Unauthorized` reason for
+    /// the same reason: splitting them on the wire hands a holder of the
+    /// fleet-shared key an actor-EXISTENCE oracle (a `Policy` refusal proves
+    /// the actor row exists; an `Unreadable` one does not), and neither
+    /// reason admits a different caller action — both are terminal for the
+    /// op, so there is nothing a legitimate worker could do with the split.
+    ///
+    /// **Wire compatibility.** `MemoryRpcError` is an externally-tagged serde
+    /// enum, so a worker built before this variant existed cannot decode it.
+    /// That path was MEASURED (`old_worker_cannot_decode_write_ceiling_but_
+    /// fails_safe`), not assumed: `call_memory_op` maps the decode failure to
+    /// `Internal("reply decode: …")` and `map_mem_err`'s catch-all maps that
+    /// to `wit_agent_memory::Error::NotAvailable` — byte-identical to what the
+    /// worker's OWN ceiling gate returns to the guest. An old worker
+    /// therefore sees the right answer with a misleading log line, and never
+    /// a panic and never a success. Appended last per the wire-format
+    /// stability rule.
+    WriteCeiling,
+}
+
+#[cfg(test)]
+mod write_ceiling_wire_compat_tests {
+    //! #754 added `MemoryRpcError::WriteCeiling`. `MemoryRpcError` is an
+    //! externally-tagged serde enum, so a worker built before the variant
+    //! existed CANNOT decode it. That is not a reason to avoid the variant —
+    //! it is a reason to MEASURE what an old worker does with the bytes, and
+    //! to pin the answer.
+    //!
+    //! The measured chain, end to end: `call_memory_op` decodes the reply with
+    //! `serde_json::from_slice::<MemoryRpcReply>` and maps a decode failure to
+    //! `MemoryRpcError::Internal("reply decode: …")`; `map_mem_err` maps
+    //! `Internal` to `wit_agent_memory::Error::NotAvailable` — which is
+    //! byte-for-byte what the worker's OWN ceiling gate returns to the guest.
+    //! So an old worker sees the correct guest-visible answer, with a
+    //! misleading log line, and never a panic and never a success. The
+    //! worker-side half of that chain is pinned in
+    //! `aegix_worker_runtime::host::memory`'s own tests; this half pins the
+    //! wire bytes and the decode outcome.
+    use super::*;
+
+    /// `MemoryRpcError` exactly as it was BEFORE #754. Spelled out rather than
+    /// referenced so this test keeps measuring the OLD decoder even as the
+    /// real enum grows.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    enum LegacyMemoryRpcError {
+        NotAvailable,
+        KeyNotFound,
+        InvalidInput(String),
+        Unauthorized,
+        StorageFull,
+        Internal(String),
+        Timeout,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyMemoryRpcReply {
+        #[allow(dead_code)]
+        result: Result<MemoryOpResult, LegacyMemoryRpcError>,
+    }
+
+    /// The literal bytes a post-#754 controller puts on the wire for a
+    /// ceiling refusal. Pinned: a rename of the variant is a WIRE change, and
+    /// a wire change to a signed protocol's reply must be a deliberate act.
+    #[test]
+    fn write_ceiling_reply_has_a_stable_wire_form() {
+        let reply = MemoryRpcReply {
+            result: Err(MemoryRpcError::WriteCeiling),
+        };
+        assert_eq!(
+            serde_json::to_string(&reply).unwrap(),
+            r#"{"result":{"Err":"WriteCeiling"}}"#
+        );
+    }
+
+    /// The refusal carries NO payload, so it cannot leak WHY. The two refusal
+    /// reasons — "this actor is readonly" and "the rule could not be read" —
+    /// are distinguished for the operator and collapsed for the caller,
+    /// because a `Policy` refusal would otherwise prove to a holder of the
+    /// FLEET-SHARED key that the named actor row exists. Same rule, and the
+    /// same reasoning, as `caller_facing_unauthorized`.
+    #[test]
+    fn write_ceiling_reply_is_reason_independent() {
+        // There is exactly one encoding, whatever the controller-side reason.
+        let a = serde_json::to_string(&MemoryRpcReply {
+            result: Err(MemoryRpcError::WriteCeiling),
+        })
+        .unwrap();
+        let b = serde_json::to_string(&MemoryRpcReply {
+            result: Err(MemoryRpcError::WriteCeiling),
+        })
+        .unwrap();
+        assert_eq!(a, b);
+        // And it is not the shape of any variant that carries a message.
+        assert!(!a.contains("readonly"));
+        assert!(!a.contains("unreadable"));
+        assert!(!a.contains("actor"));
+    }
+
+    /// MEASURED, not assumed: an old worker cannot decode it — and the failure
+    /// is a `serde` error, not a panic and not a silently-successful parse
+    /// into some other variant.
+    #[test]
+    fn an_old_worker_cannot_decode_write_ceiling_and_fails_safe() {
+        let bytes = serde_json::to_vec(&MemoryRpcReply {
+            result: Err(MemoryRpcError::WriteCeiling),
+        })
+        .unwrap();
+        let decoded: Result<LegacyMemoryRpcReply, _> = serde_json::from_slice(&bytes);
+        assert!(
+            decoded.is_err(),
+            "an old worker must FAIL to decode the new variant — a successful \
+              decode into some other variant would be the dangerous outcome"
+        );
+        // The decode error is what `call_memory_op` turns into
+        // `MemoryRpcError::Internal("reply decode: …")`, whose guest-visible
+        // mapping is `NotAvailable` — the same answer the worker's own gate
+        // gives. Pinned worker-side in `map_mem_err`'s tests.
+
+        // The CONVERSE also holds: every pre-#754 reply still decodes on a
+        // post-#754 worker, so this is a one-directional break in the safe
+        // direction only.
+        for legacy in [
+            r#"{"result":{"Err":"NotAvailable"}}"#,
+            r#"{"result":{"Err":"KeyNotFound"}}"#,
+            r#"{"result":{"Err":"Unauthorized"}}"#,
+            r#"{"result":{"Err":"StorageFull"}}"#,
+            r#"{"result":{"Err":"Timeout"}}"#,
+            r#"{"result":{"Err":{"Internal":"boom"}}}"#,
+            r#"{"result":{"Err":{"InvalidInput":"bad key"}}}"#,
+            r#"{"result":{"Ok":{"kind":"ok"}}}"#,
+        ] {
+            serde_json::from_str::<MemoryRpcReply>(legacy)
+                .unwrap_or_else(|e| panic!("legacy reply {legacy} must still decode: {e}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod get_entry_wire_compat_tests {
+    //! DX-19 (2026-07-14): the `get-entry` addition grew `MemoryOpResult::
+    //! GetValue` three optional fields. Prove the wire format stays
+    //! compatible in BOTH directions across a mixed controller/worker fleet.
+    use super::*;
+
+    /// A reply produced by a PRE-`get-entry` controller (no new fields)
+    /// must still deserialize on a new worker — the fields default to None.
+    #[test]
+    fn old_get_value_reply_json_deserializes_with_none_fields() {
+        // Byte-for-byte what an old controller emits: only `kind` + `value`.
+        let old = r#"{"result":{"Ok":{"kind":"get_value","value":"\"hello\""}}}"#;
+        let reply: MemoryRpcReply = serde_json::from_str(old).expect("old reply must decode");
+        match reply.result {
+            Ok(MemoryOpResult::GetValue {
+                value,
+                created_at_unix,
+                expires_at_unix,
+                memory_type,
+            }) => {
+                assert_eq!(value, "\"hello\"");
+                assert_eq!(created_at_unix, None);
+                assert_eq!(expires_at_unix, None);
+                assert_eq!(memory_type, None);
+            }
+            other => panic!("expected GetValue, got {other:?}"),
+        }
+    }
+
+    /// A new controller with the fields set MUST serialize them, and the
+    /// None case MUST omit them (skip_serializing_if) so the bytes match
+    /// the legacy shape exactly — the `get` behavior is byte-identical.
+    #[test]
+    fn new_get_value_none_serializes_to_legacy_bytes() {
+        let none_reply = MemoryRpcReply {
+            result: Ok(MemoryOpResult::GetValue {
+                value: "\"hello\"".into(),
+                created_at_unix: None,
+                expires_at_unix: None,
+                memory_type: None,
+            }),
+        };
+        let bytes = serde_json::to_string(&none_reply).unwrap();
+        assert_eq!(
+            bytes,
+            r#"{"result":{"Ok":{"kind":"get_value","value":"\"hello\""}}}"#
+        );
+
+        let some_reply = MemoryRpcReply {
+            result: Ok(MemoryOpResult::GetValue {
+                value: "\"hello\"".into(),
+                created_at_unix: Some(1_752_500_000),
+                expires_at_unix: Some(1_752_600_000),
+                memory_type: Some("episodic".into()),
+            }),
+        };
+        // Round-trips cleanly when the fields are present.
+        let s = serde_json::to_string(&some_reply).unwrap();
+        let back: MemoryRpcReply = serde_json::from_str(&s).unwrap();
+        match back.result {
+            Ok(MemoryOpResult::GetValue {
+                created_at_unix,
+                expires_at_unix,
+                memory_type,
+                ..
+            }) => {
+                assert_eq!(created_at_unix, Some(1_752_500_000));
+                assert_eq!(expires_at_unix, Some(1_752_600_000));
+                assert_eq!(memory_type.as_deref(), Some("episodic"));
+            }
+            other => panic!("expected GetValue, got {other:?}"),
+        }
+    }
+}

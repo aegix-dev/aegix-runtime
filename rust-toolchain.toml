@@ -1,0 +1,20 @@
+[toolchain]
+# Pin the Rust version so local dev, CI, and Docker builds all see the
+# same set of clippy lints and rustfmt rules. Without this, a build that
+# asks for `stable` floats with whatever upstream releases (every 6 weeks)
+# and drift causes CI-only failures the moment a new lint lands.
+#
+# Bump strategy: when a new stable ships and we want to pick up
+# language features / lint improvements, run `rustup install <new>`
+# locally, run `cargo clippy --workspace -- -D warnings`, fix anything
+# that breaks, then bump this pin in the same PR. Always pin to a
+# specific minor version; never use `stable`.
+#
+# The same release is pinned in other places, bumped together:
+# `rust-version` in Cargo.toml, and the rust base image (by digest) of every
+# Dockerfile that builds from one. The repository this file is developed in
+# pins it in its CI workflows too, and its lint refuses a bump that missed
+# one of them; a tree exported from it has no such check, so look for the
+# release number before changing it here.
+channel = "1.99"
+components = ["rustfmt", "clippy"]

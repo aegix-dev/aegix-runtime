@@ -1,0 +1,1973 @@
+pub mod dispatch_binding;
+pub mod fleet_identity;
+pub mod legacy_env;
+pub mod process_posture;
+pub mod security_profile;
+
+use std::env;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+/// Read an env var, returning `default` when the var is unset OR set to
+/// an empty string.
+///
+/// MCP-615 (2026-05-12): pre-fix the helper used
+/// `env::var(var).unwrap_or_else(|_| default.to_string())` which returns
+/// `""` (not the default) when the operator sets the var to an empty
+/// string. Helm `values.yaml` placeholders (`rustEnv: ""`,
+/// `executionRetentionDays: ""`) routinely produce this shape and
+/// silently shadowed every downstream default — same empty-env-var
+/// class as MCP-590/591/597/598/599/611. Same fix shape:
+/// `.ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())`.
+///
+/// Callers that need to distinguish "unset" from "empty value" should
+/// reach for `env::var` directly. Most config-style helpers want
+/// "use the default when no value is provided," for which this is the
+/// correct shape.
+pub fn get_env(var: &str, default: &str) -> String {
+    env::var(var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Returns true iff `var` is set AND its value is non-empty.
+///
+/// **This is the one correct way to ask "is this env var configured?"**
+/// `std::env::var(var).is_ok()` is NOT: it returns `true` for `Ok("")`, so a
+/// Helm `values.yaml` placeholder (`talosMasterKey: ""`) or a shell
+/// `export FOO=` reads as "configured" while every downstream consumer in
+/// this workspace treats an empty value as absent — [`get_env`] falls through
+/// to its default, [`read_env_or_file`] falls through to `<VAR>_FILE`.
+///
+/// The class has been repaired eleven times under distinct ticket numbers
+/// (MCP-590/591/592/597/598/599/611/615/620/621/625) and kept coming back
+/// because every fix was local to one call site. MCP-625 is the canonical
+/// writeup: four `security_audit` key checks reported "AEGIX_MASTER_KEY is
+/// configured" and awarded +15 points while `kek_provider` refused to load
+/// the empty key — "operators saw a green dashboard while critical security
+/// primitives were disabled". Structural lint check 73 now fails the build on
+/// the bad shape and points here.
+///
+/// Note the asymmetry this helper deliberately preserves: it answers
+/// "configured?", NOT "present?". Code that genuinely needs to distinguish an
+/// empty value from an unset one must call `env::var` directly and say why.
+pub fn env_var_is_set_nonempty(var: &str) -> bool {
+    env::var(var).ok().filter(|v| !v.is_empty()).is_some()
+}
+
+/// Read a secret from an environment variable or from a file whose path is
+/// given by the `<VAR>_FILE` variant (Docker secrets pattern).
+///
+/// Precedence: `<VAR>` direct value > `<VAR>_FILE` file contents > `None`.
+/// Trailing newlines are stripped from file contents. **Empty values are
+/// treated as missing on BOTH paths** so the env-vs-file precedence is
+/// consistent: `<VAR>=""` no longer takes precedence over a populated
+/// `<VAR>_FILE`, and downstream callers don't need to defensively
+/// re-check for empty.
+///
+/// MCP-597 (2026-05-12): pre-fix the env path returned `Some("")` for
+/// `<VAR>=""` while the file path returned `None` for an empty file.
+/// Same operational input (empty value), opposite behaviour. Result: a
+/// Docker secrets mount providing `JWT_PRIVATE_KEY_FILE` was silently
+/// shadowed by an upstream `JWT_PRIVATE_KEY=""` from a misconfigured
+/// values.yaml or env_file. The downstream JWT parser caught the
+/// empty PEM with an "invalid key" error so the deploy didn't go past
+/// the JWT load step — but the operator-facing error was misleading
+/// ("Invalid RSA private key PEM" instead of "JWT_PRIVATE_KEY env var
+/// is set but empty — likely a values.yaml placeholder; either fill
+/// it in or unset and rely on JWT_PRIVATE_KEY_FILE"). Sibling
+/// hardening class to MCP-590/591/592 (empty-string ct_eq bypass);
+/// here the failure mode is misleading-error rather than auth bypass,
+/// but the symmetry between the two paths is worth preserving.
+pub fn read_env_or_file(var: &str) -> Option<String> {
+    // allow-empty-env-presence: empty is still treated as unset (the function
+    // returns `None` for it below); `env_set_empty` only picks the log level.
+    let env_set_empty = match env::var(var) {
+        Ok(val) if !val.is_empty() => return Some(val),
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    let file_var = format!("{}_FILE", var);
+    if env_set_empty {
+        // Empty env var — let the file path take its turn rather than
+        // shadowing it.
+        if empty_env_shadows_a_file(env::var(&file_var).ok().as_deref()) {
+            tracing::warn!(
+                "{} env var is set to empty — treating as missing; falling back to {}_FILE",
+                var,
+                var
+            );
+        } else {
+            tracing::debug!(
+                "{} env var is set to empty and {}_FILE is unset — treating as not configured",
+                var,
+                var
+            );
+        }
+    }
+    // 2026-08-28: the `.filter(|v| !v.is_empty())` makes this function's own
+    // doc comment true. It claims "Empty values are treated as missing on BOTH
+    // paths", and that held for the file's CONTENTS (below) but not for the
+    // file's PATH: `JWT_SECRET_FILE=""` bound `Ok("")` and produced a
+    // permanent `Failed to read JWT_SECRET_FILE at ''` ERROR on a boot where
+    // nothing was configured. The return value was `None` either way, so this
+    // is log-noise rather than a behaviour change — but an ERROR that fires on
+    // a misconfiguration it cannot name is how the real ones get skipped.
+    if let Some(path) = env::var(&file_var).ok().filter(|v| !v.is_empty()) {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                let trimmed = contents
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_string();
+                if trimmed.is_empty() {
+                    tracing::warn!("{}_FILE at '{}' is empty — treating as missing", var, path);
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to read {}_FILE at '{}': {}", var, path, e);
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
+/// Whether an EMPTY `<VAR>` beside this `<VAR>_FILE` value is worth a WARN.
+///
+/// Only when the file variant is configured: that is the MCP-597 case, where
+/// an empty env var (usually a template placeholder) sits in front of a real
+/// secrets mount and the operator should know which one was used. With no
+/// file configured, empty means "not configured", exactly as for an unset
+/// variable, and is the steady state of any deployment that transports an
+/// optional variable as `${VAR:-}` (compose's `AEGIX_MASTER_KEY_PREVIOUS`
+/// outside a key rotation). A WARN there fires on every boot and says nothing.
+fn empty_env_shadows_a_file(file_var_value: Option<&str>) -> bool {
+    file_var_value.is_some_and(|path| !path.is_empty())
+}
+
+pub fn is_production() -> bool {
+    get_env("RUST_ENV", "development") == "production"
+}
+
+pub fn is_development() -> bool {
+    !is_production()
+}
+
+/// MCP-1081 (2026-05-16): canonical validator for shared-secret auth
+/// tokens at startup. Three sibling sites in `controller/main.rs`
+/// (ADMIN_SECRET_KEY, PROMETHEUS_SCRAPE_TOKEN, REGISTRY_PUBLISH_TOKEN)
+/// had identical shape pre-fix:
+///
+/// ```text
+/// let token = std::env::var(VAR).ok().filter(|v| !v.is_empty());
+/// if let Some(token) = token {
+///     if token.len() < 32 {
+///         return Err(anyhow::anyhow!("VAR is too short ..."));
+///     }
+/// }
+/// ```
+///
+/// Same N-inline-copies drift class as the canonical resolvers
+/// (admin_ops_enabled, edge_routing_enabled, dev_csrf_bypass_enabled,
+/// MCP-1064/1065/1066). Future tuning of the threshold (e.g., raise
+/// to 48 chars for stronger entropy) lands in one place. Future new
+/// shared-secret tokens get strength validation for free.
+///
+/// Empty-string handling matches the workspace-wide pattern (MCP-590/591):
+/// `=""` is treated as "unset" so an operator who explicitly clears
+/// the env var gets the unset behaviour, not a vacuous validation error.
+///
+/// `required = true` → unset/empty is an ERROR. Used for tokens that
+/// MUST be set for a feature to be active (e.g., ADMIN_SECRET_KEY
+/// when `ENABLE_ADMIN_OPS=true`).
+///
+/// `required = false` → unset/empty is OK (the request-time gate
+/// fail-closes in production per MCP-590/591). Used for optional
+/// tokens like PROMETHEUS_SCRAPE_TOKEN and REGISTRY_PUBLISH_TOKEN.
+pub fn validate_shared_secret_token(
+    env_var: &str,
+    min_len: usize,
+    required: bool,
+    rationale: &str,
+) -> std::result::Result<(), String> {
+    let value = env::var(env_var).ok().filter(|v| !v.is_empty());
+    match value {
+        Some(token) if token.len() >= min_len => Ok(()),
+        Some(token) => Err(format!(
+            "{env_var} is too short ({} chars; must be >= {min_len}). \
+             Generate with: openssl rand -hex 32. {rationale}",
+            token.len()
+        )),
+        None if required => Err(format!(
+            "{env_var} must be set (must be >= {min_len} chars). \
+             Generate with: openssl rand -hex 32. {rationale}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// MCP-1066 (2026-05-15): canonical resolver for the
+/// `ALLOW_DEV_UNSAFE_CSRF_BYPASS` flag — the dev-mode escape hatch
+/// that disables CSRF on `/graphql`. Two callers previously inlined
+/// the parse with `== "true"` case-sensitive exact match:
+///   - `controller/main.rs` startup-time guard: panics if
+///     `is_production() && ... == "true"`.
+///   - `aegix-csrf::lib::csrf_protection_graphql` request-time gate:
+///     bypasses CSRF if `!is_production() && ... == "true"`.
+///
+/// Failure mode pre-fix: an operator who accidentally sets
+/// `=1` / `=yes` / `=on` / `=TRUE` (capital T) in production would
+/// NOT trigger the startup panic (`=1 != "true"`), and the request-
+/// time gate would ALSO not activate (same predicate). Currently
+/// safe by chance — both sites use the same case-sensitive
+/// predicate. BUT if a future site routes the same env var
+/// through `bool_env_or_default`, it would accept `=1` as truthy
+/// while the production-startup guard stays inert → live CSRF
+/// bypass in production with no panic.
+///
+/// Routing both sites through this canonical resolver closes the
+/// drift hazard: any truthy token (true | 1 | yes | on,
+/// case-insensitive) in production now triggers the fail-closed
+/// panic.
+pub fn dev_csrf_bypass_enabled() -> bool {
+    bool_env_or_default("ALLOW_DEV_UNSAFE_CSRF_BYPASS", false)
+}
+
+/// MCP-1065 (2026-05-15): canonical resolver for the `ENABLE_EDGE_ROUTING`
+/// flag that chooses between per-user NATS topic `talos.jobs.{user_id}`
+/// and the shared `talos.jobs` topic for module dispatch.
+///
+/// Pre-fix four callers inlined the parse with `== "true"`
+/// case-sensitive exact-match: `aegix-gmail::dispatch`,
+/// `aegix-google-calendar::handlers`, and TWO sites in
+/// `aegix-webhooks::lib` (request-reply dispatch + DLQ replay).
+/// Operator setting `=1` / `=yes` / `=on` / `=TRUE` (capital T)
+/// would get the FALSE branch at all four sites — but a single
+/// future site that uses `eq_ignore_ascii_case("true")` (the
+/// admin-gate predicate that drifted in MCP-1064) would diverge.
+///
+/// Threat is operational/correctness not auth: if some dispatch
+/// sites honour edge routing and others don't, jobs get scattered
+/// between two topics and consumers don't see the expected traffic
+/// pattern → silent misbehaviour. Canonical helper makes the
+/// accepted-tokens set `true | 1 | yes | on` uniform across every
+/// site.
+pub fn edge_routing_enabled() -> bool {
+    bool_env_or_default("ENABLE_EDGE_ROUTING", false)
+}
+
+/// MCP-1064 (2026-05-15): canonical resolver for the `ENABLE_ADMIN_OPS`
+/// "big red button" gate. Three callers previously inlined the gate
+/// predicate with subtle drift:
+///   - `aegix-gmail::admin::authorize` accepted `"1" | "true"` (case-insensitive).
+///   - `aegix-google-calendar::admin::authorize` accepted `"1" | "true"` (case-insensitive).
+///   - `controller/main.rs` admin-secrets endpoint accepted ONLY the literal `"1"`.
+///
+/// Same env var, different behaviour across crates — pure drift
+/// hazard. An operator setting `ENABLE_ADMIN_OPS=true` would enable
+/// gmail/gcal admin but NOT controller secrets admin, with no
+/// visible signal. Routing all three callers through this single
+/// resolver collapses the predicate to one place AND widens the
+/// accepted-tokens set to the canonical `true | 1 | yes | on`
+/// (matches `bool_env_or_default`'s contract).
+///
+/// Security posture unchanged: default-off, admin endpoints require
+/// BOTH this gate AND a constant-time `X-Admin-Secret` compare
+/// against `ADMIN_SECRET_KEY` (MCP-983 hardening).
+pub fn admin_ops_enabled() -> bool {
+    bool_env_or_default("ENABLE_ADMIN_OPS", false)
+}
+
+/// Canonical resolver for the smart actor-memory-context builder feature
+/// flag (`ENABLE_SMART_MEMORY_CONTEXT`). **Default ON** (2026-07: grounded
+/// memory is the default — set `ENABLE_SMART_MEMORY_CONTEXT=false|0|no|off` to
+/// fall back to the legacy path).
+///
+/// When ON (the default), the retriever kind-filters synthetic self-outputs,
+/// applies a similarity floor ([`smart_memory_context_min_score`]), packs
+/// candidates under a byte budget ([`smart_memory_context_byte_budget`] /
+/// [`smart_memory_context_per_memory_cap`]) ranked by the fused scorer (learned
+/// per-actor weights when [`adaptive_rank_enabled`] is on), and the engine
+/// injects the context only into nodes that declare `needs_memory = true` (the
+/// default, so no consumer silently loses context).
+/// When explicitly disabled, `__actor_context__` assembly and per-node injection
+/// are byte-identical to the legacy path: the count-capped, unfiltered,
+/// `min_score = 0.0` retriever runs and every node receives the context.
+///
+/// Accepted truthy tokens match every other flag: `true | 1 | yes | on`
+/// (case-insensitive) — see [`bool_env_or_default`].
+pub fn smart_memory_context_enabled() -> bool {
+    bool_env_or_default("ENABLE_SMART_MEMORY_CONTEXT", true)
+}
+
+/// FLEET-WIDE kill-switch for actor-context (`__actor_context__`) injection —
+/// the outermost gate, independent of [`smart_memory_context_enabled`].
+/// **Default ON.** Set `ENABLE_ACTOR_CONTEXT_INJECTION=false|0|no|off` to stop
+/// grounded-memory injection ENTIRELY.
+///
+/// This is a SEPARATE axis from `ENABLE_SMART_MEMORY_CONTEXT`, which only chooses
+/// smart-vs-legacy assembly — with smart OFF the legacy path STILL injects into
+/// every node, so it is NOT an off-switch. When THIS flag is off, no node ever
+/// receives `__actor_context__` (gated at the two engine dispatch chokepoints,
+/// regardless of how the engine's actor-context got set), and the expensive
+/// trigger/scheduler assembly is short-circuited too. The escape hatch for an
+/// operator who wants grounding fully off fleet-wide (privacy posture, incident
+/// containment, A/B baseline) without unbinding every actor.
+///
+/// Accepted truthy tokens: `true | 1 | yes | on` — see [`bool_env_or_default`].
+pub fn actor_context_injection_enabled() -> bool {
+    bool_env_or_default("ENABLE_ACTOR_CONTEXT_INJECTION", true)
+}
+
+/// The env var behind [`module_compilation`].
+pub const MODULE_COMPILATION_ENV: &str = "AEGIX_MODULE_COMPILATION";
+
+/// Whether this deployment builds modules from source. **Default ON.**
+///
+/// Set `AEGIX_MODULE_COMPILATION=false|0|no|off` for a registry-only
+/// deployment: the controller then never runs a toolchain over module
+/// source — no compile, no lint, no source analysis — and every module it
+/// runs comes from the OCI registry (`AEGIX_REGISTRY_URL`, which the boot
+/// validator requires in this mode).
+///
+/// `Err` carries the raw value when the variable is set to something that
+/// is not a boolean token. This switch turns a capability off, so an
+/// unreadable value is not folded into the default the way [`bool_env`]
+/// folds one: the boot validator refuses to start on it, and
+/// [`module_compilation_enabled`] reads it as OFF.
+pub fn module_compilation() -> Result<bool, String> {
+    module_compilation_from(read_bool_env(MODULE_COMPILATION_ENV))
+}
+
+/// [`module_compilation`] as a pure function of the value read.
+pub fn module_compilation_from(read: BoolEnv) -> Result<bool, String> {
+    match read {
+        BoolEnv::Unset => Ok(true),
+        BoolEnv::Value(v) => Ok(v),
+        BoolEnv::Unreadable(raw) => Err(raw),
+    }
+}
+
+/// [`module_compilation`] for a caller that must act: an unreadable value
+/// is OFF (fail closed — the operator set the switch and it cannot be read).
+pub fn module_compilation_enabled() -> bool {
+    module_compilation().unwrap_or(false)
+}
+
+/// The env var behind [`registry_url`].
+pub const REGISTRY_URL_ENV: &str = "AEGIX_REGISTRY_URL";
+
+/// The OCI registry the shared module catalog is synced from, or `None`
+/// when this deployment seeds its catalog from the templates baked into
+/// the controller image.
+///
+/// The ONE reader. An empty or whitespace-only value is unset: a chart or
+/// compose placeholder (`AEGIX_REGISTRY_URL=""`) once skipped the disk
+/// seed in one reader while the sync loop in another declined to start,
+/// and the controller came up with no catalog at all.
+pub fn registry_url() -> Option<String> {
+    registry_url_from(env::var(REGISTRY_URL_ENV).ok())
+}
+
+/// [`registry_url`] as a pure function of the value read.
+pub fn registry_url_from(raw: Option<String>) -> Option<String> {
+    raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// The env var behind [`module_templates_dir`].
+pub const MODULE_TEMPLATES_PATH_ENV: &str = "AEGIX_MODULE_TEMPLATES_PATH";
+/// Where the controller image bakes the catalog templates.
+pub const IMAGE_MODULE_TEMPLATES_DIR: &str = "/app/module-templates";
+
+/// The directory the catalog templates (`<slug>/talos.json` + `template.rs`)
+/// are read from. The ONE reader (2026-10-30): the boot seed,
+/// `install_module_from_catalog`, `list_module_catalog`, `get_catalog_status`,
+/// `restore_pinned_modules`, `find_module_alternatives` and `swap_node_module`
+/// all ask this function. Until then six handlers spelled the image's path
+/// and the seed read `module-templates` under the working directory, so a
+/// controller run from a checkout (the end-to-end gate, `make test-e2e`)
+/// seeded a catalog it then could not install from.
+///
+/// `AEGIX_MODULE_TEMPLATES_PATH` (trimmed, non-empty) names the directory
+/// outright, whether or not it exists — an operator who names a path means
+/// it, and a missing one is reported at that path. Unset: the image's
+/// `/app/module-templates` when it exists, else `module-templates` under the
+/// working directory when it exists (`cargo run` from the workspace), else
+/// the image's path, so a missing catalog is reported where it always was.
+pub fn module_templates_dir() -> PathBuf {
+    module_templates_dir_from(env::var("AEGIX_MODULE_TEMPLATES_PATH").ok(), |p| p.is_dir())
+}
+
+/// [`module_templates_dir`] as a pure function of the value read and of
+/// which candidate directories exist.
+pub fn module_templates_dir_from(raw: Option<String>, is_dir: impl Fn(&Path) -> bool) -> PathBuf {
+    if let Some(named) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        return PathBuf::from(named);
+    }
+    let image = Path::new(IMAGE_MODULE_TEMPLATES_DIR);
+    if is_dir(image) {
+        return image.to_path_buf();
+    }
+    let checkout = Path::new("module-templates");
+    if is_dir(checkout) {
+        return checkout.to_path_buf();
+    }
+    image.to_path_buf()
+}
+
+/// The env var behind [`listen_addr`].
+pub const LISTEN_ADDR_ENV: &str = "AEGIX_LISTEN_ADDR";
+/// The address the controller has always listened on.
+pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8000";
+
+/// The socket address the controller's HTTP server binds (2026-10-30).
+/// `AEGIX_LISTEN_ADDR` (`host:port`, trimmed; empty is unset) overrides the
+/// default, which is unchanged: every image, chart and compose file publishes
+/// 8000. The override exists for a controller run from a checkout beside
+/// another (the end-to-end gate derives a port per worktree, as the
+/// integration runner does for its datastores). A value that is not a socket
+/// address is an error the caller refuses to boot on, never a fallback.
+pub fn listen_addr() -> Result<SocketAddr, String> {
+    listen_addr_from(env::var("AEGIX_LISTEN_ADDR").ok())
+}
+
+/// [`listen_addr`] as a pure function of the value read.
+pub fn listen_addr_from(raw: Option<String>) -> Result<SocketAddr, String> {
+    let raw = raw
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_string());
+    raw.parse()
+        .map_err(|e| format!("{LISTEN_ADDR_ENV}={raw:?} is not a socket address (host:port): {e}"))
+}
+
+/// Kill-switch for the boot-time warmup of LOCAL (Ollama) generation
+/// models. **Default ON.** Set `AEGIX_LLM_BOOT_WARMUP=false|0|no|off` to
+/// skip it.
+///
+/// The sibling of the embedding provider's boot warmup: after the Ollama
+/// reachability probe succeeds, a spawned task issues one minimal
+/// generation per referenced local model so the first scheduled workflow
+/// after a deploy does not pay the cold model load. The warmup is
+/// fail-soft and never delays boot, so the switch exists for hosts where
+/// the residency cost is unwanted (a shared GPU, a model set too large
+/// to hold, a deliberately cold node) rather than as a safety valve.
+///
+/// Accepted truthy tokens: `true | 1 | yes | on` — see [`bool_env_or_default`].
+pub fn llm_boot_warmup_enabled() -> bool {
+    bool_env_or_default("AEGIX_LLM_BOOT_WARMUP", true)
+}
+
+/// Route the EXPLICIT semantic-recall path (the worker `agent_memory::search`
+/// RPC + the MCP `actor_recall_semantic` / `actor_recall_hyde` handlers)
+/// through the smart-context fused ranker instead of raw pgvector-cosine order.
+/// When ON, recall overfetches then re-orders by the same relevance + recency +
+/// importance + access-frequency blend the `__actor_context__` grounding path
+/// uses — and by the learned PER-ACTOR weights when [`adaptive_rank_enabled`]
+/// is also on. **Default ON** (2026-07: grounded recall is the default) — set
+/// `ENABLE_RANKED_RECALL=false|0|no|off` to fall back to plain pgvector-cosine.
+/// Cold-start safe: with no learned weights and default config weights this is
+/// the same fused blend the grounding path uses; disabling it is byte-identical
+/// to raw cosine.
+///
+/// This is the "grounding any time memory is needed" switch: it makes every
+/// workflow that recalls memory benefit from the adaptive-memory arc with no
+/// per-workflow change. Independent of [`smart_memory_context_enabled`] (which
+/// governs the auto-injected grounding payload, a different path).
+pub fn ranked_recall_enabled() -> bool {
+    bool_env_or_default("ENABLE_RANKED_RECALL", true)
+}
+
+/// Total byte budget for the assembled `__actor_context__` payload when
+/// [`smart_memory_context_enabled`] is ON. Default 12_000 bytes (~3k
+/// tokens by the bytes/4 estimate). Overridable via
+/// `SMART_MEMORY_CONTEXT_BYTE_BUDGET`; `=0`/negative falls back to the
+/// default (destructive-zero guard, see [`positive_env_or_default`]).
+///
+/// The packer ([`crate`]-external `aegix_memory::actor_context::pack_within_budget`])
+/// walks candidates in relevance order and stops before the serialized
+/// payload would exceed this bound, so the injected context can never
+/// balloon a node's parse-fuel regardless of how large individual
+/// memories are.
+///
+/// **Reachable range** (measured 2026-09-11, the #791 class): the packer can
+/// only fill what its CANDIDATES supply, and every production caller asks
+/// for `limit = 20` (scheduler, sub-workflow resolver), each capped at
+/// [`smart_memory_context_per_memory_cap`] bytes. So a budget above
+/// `20 × per_memory_cap` (= 60 000 at the default cap) cannot be filled by
+/// count, and on any actor holding fewer than 20 memories the ceiling is
+/// lower still — the reference fleet's busiest actor holds 9. Below that
+/// the budget is the binding bound (default 12 000 vs 9 × 3 000 = 27 000
+/// available), which is the intended shape; above it the knob is inert and
+/// nothing reports that. Raise the caller limit together with the budget if
+/// you need more than 60 KB of injected context.
+pub fn smart_memory_context_byte_budget() -> usize {
+    // Floor well above the empty `{actor_id, memories:[]}` wrapper (~65 B)
+    // so the packer's `<= byte_budget` bound is always meaningful — a
+    // sub-1 KB actor context is useless anyway.
+    positive_env_or_default::<usize>("SMART_MEMORY_CONTEXT_BYTE_BUDGET", 12_000).max(1_024)
+}
+
+/// Per-memory serialized-value byte cap when
+/// [`smart_memory_context_enabled`] is ON. Default 3_000 bytes. A single
+/// memory whose serialized value exceeds this cap has its content
+/// truncated at a UTF-8 char boundary (never mid-codepoint) and marked,
+/// so one 15KB `daily_brief`/`ask_thread` value can't dominate the whole
+/// budget. Overridable via `SMART_MEMORY_CONTEXT_PER_MEMORY_CAP`;
+/// `=0`/negative falls back to the default.
+pub fn smart_memory_context_per_memory_cap() -> usize {
+    // Floor comfortably above the truncation marker (~14 B) so per-memory
+    // truncation always has room to leave meaningful content and the cap is
+    // honoured for any configured value.
+    positive_env_or_default::<usize>("SMART_MEMORY_CONTEXT_PER_MEMORY_CAP", 3_000).max(256)
+}
+
+/// Cosine-similarity floor for semantic recall when
+/// [`smart_memory_context_enabled`] is ON. Default 0.25 (the legacy path
+/// uses 0.0, i.e. no floor). Clamped to `[0.0, 1.0]`. Overridable via
+/// `SMART_MEMORY_CONTEXT_MIN_SCORE`; `=0`/negative or unparseable falls
+/// back to the default (use a small positive value like `0.05` to
+/// approximate "no floor" without losing the destructive-zero guard).
+pub fn smart_memory_context_min_score() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_MIN_SCORE", 0.25).clamp(0.0, 1.0)
+}
+
+// ── Phase 2: fused multi-signal ranking weights ─────────────────────────────
+//
+// When [`smart_memory_context_enabled`] is ON, the smart retriever blends
+// three signals per candidate into one fused score
+// (`aegix_memory::actor_context::fused_score`):
+//
+//   fused = W_RELEVANCE * relevance
+//         + W_RECENCY   * recency_decay(now - updated_at)
+//         + W_IMPORTANCE * importance(memory_type, importance_hint)
+//
+// and packs candidates in fused-score-descending order. All three weights
+// route through `positive_env_or_default` so a `=0`/negative misconfig
+// substitutes the default + WARN (a `0` weight would silently drop a whole
+// signal — the destructive-zero guard treats that as a misconfiguration; use
+// a small positive value like `0.01` to de-weight a signal intentionally).
+
+/// Upper clamp on the fused-rank weight knobs. `positive_env_or_default`
+/// rejects `NaN` and `≤0` but ACCEPTS `+Inf` (`"inf".parse::<f64>()` succeeds,
+/// `Inf > 0.0`). An `Inf` weight makes every `fused_score` `Inf`, so all
+/// candidates compare `Equal` and the ranking collapses to input order. Cap the
+/// weights at a large-but-finite value — far above any sane weight ratio — so a
+/// stray `=inf` env can't degenerate the ranking. Keeps every knob finite.
+///
+/// `pub` so the Phase-2 learned-ranker (`aegix-memory-ranking`) clamps its
+/// mapped per-actor weights to the SAME bound rather than hand-mirroring the
+/// literal (which would silently drift if this constant is retuned).
+pub const SMART_MEMORY_WEIGHT_MAX: f64 = 1_000_000.0;
+
+/// Weight on the cosine-relevance signal in the fused rank. Default 1.0.
+/// Override via `SMART_MEMORY_CONTEXT_W_RELEVANCE`.
+pub fn smart_memory_context_w_relevance() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_RELEVANCE", 1.0)
+        .min(SMART_MEMORY_WEIGHT_MAX)
+}
+
+/// Weight on the recency-decay signal in the fused rank. Default 0.3.
+/// Override via `SMART_MEMORY_CONTEXT_W_RECENCY`.
+pub fn smart_memory_context_w_recency() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_RECENCY", 0.3)
+        .min(SMART_MEMORY_WEIGHT_MAX)
+}
+
+/// Weight on the importance signal (memory-type base blended with an optional
+/// `metadata.importance` hint) in the fused rank. Default 0.5. Override via
+/// `SMART_MEMORY_CONTEXT_W_IMPORTANCE`.
+pub fn smart_memory_context_w_importance() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_IMPORTANCE", 0.5)
+        .min(SMART_MEMORY_WEIGHT_MAX)
+}
+
+/// Exponential recency half-life in DAYS: a memory `half_life` days old
+/// contributes half the recency weight of a brand-new one
+/// (`recency_decay(age) = 0.5^(age_days / half_life_days)`). Default 7.0.
+/// Override via `SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS`; `=0`/negative
+/// (which would divide-by-zero / invert the decay) falls back to the default.
+pub fn smart_memory_context_recency_halflife_days() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS", 7.0)
+}
+
+/// Baseline relevance assigned to the graph-RAG entity-context candidate
+/// (which carries no cosine score). Default 0.6; clamped to `[0.0, 1.0]`.
+/// Override via `SMART_MEMORY_CONTEXT_GRAPH_BASELINE`.
+pub fn smart_memory_context_graph_baseline() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_GRAPH_BASELINE", 0.6).clamp(0.0, 1.0)
+}
+
+/// Baseline relevance assigned to recency-layer candidates (which carry no
+/// cosine score — they were selected by `updated_at`, not similarity).
+/// Default 0.4; clamped to `[0.0, 1.0]`. Kept below the graph baseline so a
+/// bare recency row doesn't outrank an entity-graph hit on relevance alone.
+/// Override via `SMART_MEMORY_CONTEXT_RECENCY_BASELINE`.
+pub fn smart_memory_context_recency_baseline() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_RECENCY_BASELINE", 0.4).clamp(0.0, 1.0)
+}
+
+/// Phase 3a: weight on the durable access-frequency boost folded INTO the
+/// importance signal (NOT a separate fused term — `fused_score` stays 3-term).
+/// A memory the actor keeps pulling into context is nudged up by
+/// `access_weight * normalized_access_count`. Default 0.15 — small, so access
+/// frequency refines but never dominates the base/hint importance. Clamped to
+/// `[0.0, 1.0]`. Override via `SMART_MEMORY_CONTEXT_ACCESS_WEIGHT`; `=0`/negative
+/// or unparseable falls back to the default (destructive-zero guard — a `0`
+/// would silently disable the whole access signal; the additive+clamped blend
+/// keeps importance in `[0, 1]` for any value in range).
+pub fn smart_memory_context_access_weight() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT", 0.15).clamp(0.0, 1.0)
+}
+
+/// Canonical resolver for the HyDE (Hypothetical Document Embeddings) toggle
+/// on the smart actor-context semantic layer (`ENABLE_SMART_MEMORY_HYDE`).
+/// Default OFF.
+///
+/// When ON (and [`smart_memory_context_enabled`] is also ON), the semantic
+/// layer embeds a HyDE-rewritten query
+/// (`SearchMethod::HyDE` — "An answer to the question '…' would be: ") instead
+/// of the raw context hint (`SearchMethod::Direct`). Same `min_score` +
+/// `exclude_kinds` filters apply either way, and HyDE still embeds — so the
+/// tier-1 local-only embed gate inside `recall_semantic_filtered` applies
+/// unchanged.
+///
+/// Accepted truthy tokens: `true | 1 | yes | on` (case-insensitive) — see
+/// [`bool_env_or_default`].
+pub fn smart_memory_hyde_enabled() -> bool {
+    bool_env_or_default("ENABLE_SMART_MEMORY_HYDE", false)
+}
+
+// ── Phase 3b: autonomous memory consolidation ───────────────────────────────
+//
+// A default-OFF background loop that summarizes an actor's older, low-importance
+// episodic memories via a TIER-GATED LLM (tier-1 → local Ollama ONLY or SKIP;
+// tier-2 → external allowed) and consolidates them into ONE durable semantic
+// summary (atomic persist-summary + forget-sources). All knobs route through the
+// destructive-zero guards so a `=0`/negative misconfig substitutes the default
+// + WARN rather than producing a runaway or degenerate scan.
+
+/// Master switch for the autonomous consolidation loop
+/// (`ENABLE_MEMORY_CONSOLIDATION`). Default ON (2026-07, "Tier 3"): grounded
+/// memory maintains itself by default. Safe to default-on — the loop is
+/// convergent (condenses the 30-day cold episodic tail into one semantic
+/// summary and forgets the sources, so it can never amplify), the LLM leg is
+/// LOCAL-FIRST (on-host model preferred for all tiers; external only as a
+/// no-local fallback, itself budget-gated), and tier-1 stays doubly fail-safe
+/// (skipped unless `MEMORY_CONSOLIDATION_TIER1_LOCAL_OK` is separately
+/// attested). Disable with a falsey value — the scheduler is then not even
+/// spawned (zero overhead). Truthy tokens per [`bool_env_or_default`].
+pub fn memory_consolidation_enabled() -> bool {
+    bool_env_or_default("ENABLE_MEMORY_CONSOLIDATION", true)
+}
+
+/// The deployment's daily token ceiling for the PLATFORM key — the LLM calls
+/// the controller makes on an actor's behalf with no execution behind them
+/// (graph-RAG extraction, memory consolidation, dashboard generation)
+/// (`AEGIX_PLATFORM_LLM_TOKENS_PER_DAY`, security review 2026-10-14, I-2).
+/// Default 1 000 000, summed across every actor and user over the trailing
+/// 24 hours; at or above it graph-RAG and consolidation make no external
+/// call. `=0`/negative/unparsable falls back to the default.
+pub fn platform_llm_tokens_per_day() -> i64 {
+    positive_env_or_default::<i64>("AEGIX_PLATFORM_LLM_TOKENS_PER_DAY", 1_000_000)
+}
+
+/// Operator attestation that `EMBEDDING_API_URL` is an ON-HOST embedder, so
+/// a TIER-1 actor's memory text and search queries may be embedded
+/// (`AEGIX_EMBEDDING_TIER1_LOCAL_OK`). Default FALSE (fail-closed: tier-1
+/// memory is stored without a vector, and recall falls back to keyword and
+/// recency, unless the operator attests locality). The URL's shape is still
+/// checked as a sanity refusal of an obviously public host (security review
+/// 2026-10-14, I-4). Mirrors `AEGIX_GRAPH_RAG_TIER1_LOCAL_OK`.
+pub fn embedding_tier1_local_ok() -> bool {
+    bool_env_or_default("AEGIX_EMBEDDING_TIER1_LOCAL_OK", false)
+}
+
+/// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a/// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a
+/// TIER-1 actor's private memory may be summarized locally without egress
+/// (`MEMORY_CONSOLIDATION_TIER1_LOCAL_OK`). Default FALSE (fail-closed: a
+/// tier-1 actor is SKIPPED unless the operator explicitly attests locality).
+/// Mirrors graph-RAG's `AEGIX_GRAPH_RAG_TIER1_LOCAL_OK`.
+pub fn memory_consolidation_tier1_local_ok() -> bool {
+    bool_env_or_default("MEMORY_CONSOLIDATION_TIER1_LOCAL_OK", false)
+}
+
+/// Wake interval for the consolidation scheduler in seconds
+/// (`MEMORY_CONSOLIDATION_INTERVAL_SECS`). Default 86400 (daily) — the loop only
+/// ever processes the 30-day-old cold episodic tail, so an hourly wake was far
+/// more aggressive than the work warrants; daily matches reflection's cadence.
+/// `=0`/negative falls back to the default.
+pub fn memory_consolidation_interval_secs() -> u64 {
+    positive_env_or_default::<u64>("MEMORY_CONSOLIDATION_INTERVAL_SECS", 86400)
+}
+
+/// Minimum row age in DAYS before an episodic memory is eligible for
+/// consolidation (`MEMORY_CONSOLIDATION_MIN_AGE_DAYS`). Default 30.0 — only the
+/// long tail is consolidated, never recent memory. `=0`/negative falls back to
+/// the default.
+pub fn memory_consolidation_min_age_days() -> f64 {
+    positive_env_or_default::<f64>("MEMORY_CONSOLIDATION_MIN_AGE_DAYS", 30.0)
+}
+
+/// Importance ceiling for consolidation candidates
+/// (`MEMORY_CONSOLIDATION_MAX_IMPORTANCE`). Default 0.4, clamped to `[0.0, 1.0]`
+/// — only LOW-importance (or unscored NULL) rows are consolidated; high-value
+/// memory is never touched. `=0`/negative falls back to the default (0.0 would
+/// exclude everything except unscored rows).
+pub fn memory_consolidation_max_importance() -> f64 {
+    positive_env_or_default::<f64>("MEMORY_CONSOLIDATION_MAX_IMPORTANCE", 0.4).clamp(0.0, 1.0)
+}
+
+/// Number of candidate rows summarized per actor per tick
+/// (`MEMORY_CONSOLIDATION_BATCH_SIZE`). Default 20, clamped to `[3, 100]`. The
+/// floor of 3 means a trivial cluster is never "consolidated" (nothing worth
+/// summarizing). `=0`/negative falls back to the default.
+pub fn memory_consolidation_batch_size() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_CONSOLIDATION_BATCH_SIZE", 20).clamp(3, 100)
+}
+
+/// Maximum distinct actors processed per tick
+/// (`MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK`). Default 25, clamped to
+/// `[1, 500]` so one tick can't stampede the whole fleet. `=0`/negative falls
+/// back to the default.
+pub fn memory_consolidation_max_actors_per_tick() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK", 25).clamp(1, 500)
+}
+
+/// Ollama model used to generate the consolidation summary on the tier-1
+/// LOCAL-only path (`MEMORY_CONSOLIDATION_MODEL`). Default `qwen2.5:7b`.
+pub fn memory_consolidation_model() -> String {
+    let v = get_env("MEMORY_CONSOLIDATION_MODEL", "qwen2.5:7b");
+    if v.trim().is_empty() {
+        "qwen2.5:7b".to_string()
+    } else {
+        v
+    }
+}
+
+// ── Autonomous memory reflection — Phase 3 ──────────────────────────────────
+//
+// A scheduled per-actor background loop that reads across an actor's meaningful
+// (semantic+episodic) memories and synthesizes HIGHER-ORDER INSIGHTS via a
+// TIER-GATED LLM, written back as ONE `reflection`-kind semantic memory WITHOUT
+// deleting any sources (reflection AUGMENTS; consolidation retires). Default-OFF
+// and tier-gated on the same shared matrix as consolidation, with its OWN
+// operator attestation (independent control).
+
+/// Master switch for the autonomous reflection loop (`ENABLE_MEMORY_REFLECTION`).
+/// Default ON (2026-07, "Tier 3"). Safe to default-on — self-amplification is
+/// closed by construction (the loop's input scan EXCLUDES the `reflection`
+/// synthetic kind at the DB layer, so it can never reflect on its own prior
+/// output), the write is non-destructive and self-overwriting (`reflection/latest`),
+/// the LLM leg is LOCAL-FIRST + budget-gated on the external fallback, and
+/// tier-1 stays doubly fail-safe (skipped unless `MEMORY_REFLECTION_TIER1_LOCAL_OK`
+/// is attested). Disable with a falsey value — scheduler then not spawned.
+/// Truthy tokens per [`bool_env_or_default`].
+pub fn memory_reflection_enabled() -> bool {
+    bool_env_or_default("ENABLE_MEMORY_REFLECTION", true)
+}
+
+/// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a
+/// TIER-1 actor's private memory may be reflected on locally without egress
+/// (`MEMORY_REFLECTION_TIER1_LOCAL_OK`). Default FALSE (fail-closed: a tier-1
+/// actor is SKIPPED unless the operator explicitly attests locality). This is a
+/// SEPARATE attestation from consolidation's `MEMORY_CONSOLIDATION_TIER1_LOCAL_OK`
+/// — the two loops are controlled independently.
+pub fn memory_reflection_tier1_local_ok() -> bool {
+    bool_env_or_default("MEMORY_REFLECTION_TIER1_LOCAL_OK", false)
+}
+
+/// Wake interval for the reflection scheduler in seconds
+/// (`MEMORY_REFLECTION_INTERVAL_SECS`). Default 86400 (daily) — a slower cadence
+/// than consolidation, since higher-order insights change slowly. `=0`/negative
+/// falls back to the default.
+pub fn memory_reflection_interval_secs() -> u64 {
+    positive_env_or_default::<u64>("MEMORY_REFLECTION_INTERVAL_SECS", 86_400)
+}
+
+/// Maximum number of an actor's memories fed to the reflection LLM per cycle
+/// (`MEMORY_REFLECTION_INPUT_CAP`). Default 40, clamped to `[5, 200]` so a
+/// pathological actor can't blow the model's context. `=0`/negative falls back
+/// to the default.
+pub fn memory_reflection_input_cap() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_REFLECTION_INPUT_CAP", 40).clamp(5, 200)
+}
+
+/// Minimum number of meaningful memories an actor must hold before reflection
+/// runs (`MEMORY_REFLECTION_MIN_MEMORIES`). Default 8, clamped to `[3, 100]`.
+/// Below this floor there is too little to synthesize — the actor is skipped
+/// (no LLM, no write). `=0`/negative falls back to the default.
+pub fn memory_reflection_min_memories() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_REFLECTION_MIN_MEMORIES", 8).clamp(3, 100)
+}
+
+/// Maximum distinct actors processed per tick
+/// (`MEMORY_REFLECTION_MAX_ACTORS_PER_TICK`). Default 25, clamped to `[1, 500]`
+/// so one tick can't stampede the whole fleet. `=0`/negative falls back to the
+/// default.
+pub fn memory_reflection_max_actors_per_tick() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_REFLECTION_MAX_ACTORS_PER_TICK", 25).clamp(1, 500)
+}
+
+/// Ollama model used to generate the reflection on the local path
+/// (`MEMORY_REFLECTION_MODEL`). Unset or blank, it is whatever
+/// [`memory_consolidation_model`] resolves to — the operator's
+/// `MEMORY_CONSOLIDATION_MODEL` if set, else that function's default.
+///
+/// Until 2026-10-01 an unset value was the literal `qwen2.5:7b`, independent
+/// of consolidation. A deployment that pointed consolidation at a model it had
+/// pulled and left this unset then asked the local Ollama for a model it did
+/// not have, and for a tier-2 actor a failed local reflection falls back to
+/// the EXTERNAL provider — so a default nobody chose decided where an actor's
+/// memories were sent. One knob now sets both loops; set this one only to make
+/// them differ.
+pub fn memory_reflection_model() -> String {
+    let v = get_env("MEMORY_REFLECTION_MODEL", "");
+    if v.trim().is_empty() {
+        memory_consolidation_model()
+    } else {
+        v
+    }
+}
+
+// ── Adaptive per-actor memory ranking — Phase 1 (provenance) ────────────────
+//
+// Records, for each actor-bound execution that injected `__actor_context__`,
+// WHICH memory keys were in that context + their per-memory ranking-feature
+// snapshot, so a later phase can learn which memories lead to good outcomes.
+// Default-OFF: when the flag is unset the injection path is byte-identical to
+// today and no provenance rows are written.
+//
+// HARD DEPENDENCY: provenance is recorded ONLY on the smart-context path
+// (`get_relevant_actor_context_smart`), because the per-memory feature snapshot
+// (relevance/recency/importance/fused_score) exists only there — the legacy
+// path has no fused signals to record. So `ENABLE_MEMORY_RANK_PROVENANCE=1`
+// records NOTHING unless `ENABLE_SMART_MEMORY_CONTEXT=1` is ALSO set. The
+// controller logs a WARN at startup if provenance is on while smart-context is
+// off, and `provenance_recording_effective()` below encodes the dependency.
+
+/// Master switch for memory-rank provenance recording
+/// (`ENABLE_MEMORY_RANK_PROVENANCE`). Default ON (2026-07, "Tier 3") — the
+/// execution→memory→outcome signal the per-actor ranker learns from. Safe to
+/// default-on: the write is a fire-and-forget, batched single-INSERT of memory
+/// KEYS + numeric ranking features only (never memory VALUES), tenant-scoped,
+/// indexed, and retention-swept. **Provenance only actually records when
+/// [`smart_memory_context_enabled`] is ALSO on** (now also default-on) — see
+/// [`provenance_recording_effective`]. Truthy tokens per [`bool_env_or_default`].
+pub fn memory_rank_provenance_enabled() -> bool {
+    bool_env_or_default("ENABLE_MEMORY_RANK_PROVENANCE", true)
+}
+
+/// Whether memory-rank provenance will ACTUALLY record — the AND of the
+/// provenance flag and the smart-context flag it depends on (provenance is
+/// captured only on the smart-context path). Use this for the startup
+/// dependency check; `memory_rank_provenance_enabled` alone is misleading
+/// (it's on but inert when smart-context is off).
+pub fn provenance_recording_effective() -> bool {
+    memory_rank_provenance_enabled() && smart_memory_context_enabled()
+}
+
+/// Retention window (DAYS) for `execution_memory_context` rows, swept
+/// periodically (`MEMORY_RANK_PROVENANCE_RETENTION_DAYS`). Default 90, clamped
+/// to `[1, 3650]`. `=0`/negative falls back to the default (destructive-zero
+/// guard: bound directly into `now() - make_interval(days => $1)`, a `=0` sweep
+/// would delete every row).
+pub fn memory_rank_provenance_retention_days() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_RANK_PROVENANCE_RETENTION_DAYS", 90).clamp(1, 3650)
+}
+
+// ── Adaptive per-actor memory ranking — Phase 2 (learned ranker) ────────────
+//
+// Phase 2 LEARNS per-actor fused-ranking weights from the Phase-1 provenance
+// corpus (`execution_memory_context` joined to execution outcomes). A tiny
+// per-actor logistic regression over the recorded features
+// `[relevance, recency, importance, access_boost]` predicts the outcome label;
+// its coefficients ARE the adaptive per-actor blend weights. Learned weights
+// are stored in `actors.metadata.rank_weights` and injected at the ranker seam
+// in place of the global `SMART_MEMORY_CONTEXT_W_*` constants.
+//
+// TWO independent flags: `ENABLE_ADAPTIVE_RANK_TRAINING` gates the scheduled fit
+// job (which writes weights) — DEFAULT ON (2026-07 "Tier 3": the ranker learns
+// per actor by default; the fit is CPU-only, cold-start fail-closed, zero
+// egress); `ENABLE_ADAPTIVE_RANK` gates SERVING (whether
+// the ranker consults learned weights when present) — DEFAULT ON, but cold-start
+// safe: with no weights written yet it is byte-identical to global-weight
+// ranking, so it costs only a cheap per-actor SELECT and auto-adopts weights the
+// moment training is enabled and produces them. The training fit is a PURE
+// numeric computation over Phase-1 numeric signals only — no LLM, no memory
+// VALUES, zero data egress — so unlike consolidation/reflection it needs no tier
+// gate.
+
+/// SERVING switch (`ENABLE_ADAPTIVE_RANK`). **Default ON** (2026-07: grounded
+/// memory is the default) — set `ENABLE_ADAPTIVE_RANK=false|0|no|off` to force
+/// global weights only. When on, the smart ranker consults
+/// `actors.metadata.rank_weights` and — when present, parseable, and backed by
+/// enough examples — uses the learned per-actor weights instead of the global
+/// `SMART_MEMORY_CONTEXT_W_*` constants. **Cold-start safe**: with no learned
+/// weights (the state until `ENABLE_ADAPTIVE_RANK_TRAINING` runs) serving is
+/// byte-identical to global-weight behaviour — the only cost is one cheap
+/// indexed per-actor `SELECT`. This is why it defaults on: the moment training
+/// produces weights, serving picks them up with no further config. Truthy tokens
+/// per [`bool_env_or_default`].
+pub fn adaptive_rank_enabled() -> bool {
+    bool_env_or_default("ENABLE_ADAPTIVE_RANK", true)
+}
+
+/// TRAINING switch (`ENABLE_ADAPTIVE_RANK_TRAINING`) for the scheduled per-actor
+/// fit job. Default ON (2026-07, "Tier 3") — the ranker actually learns per
+/// actor. Safe to default-on: the fit is CPU-only (no LLM, no egress, no
+/// secrets), cold-start fail-closed at every layer (below `min_examples` /
+/// single-class / non-finite → keep global weights, write nothing; serving
+/// falls back to the global blend on any miss), and learned weights are clamped
+/// to the shared global ceiling with negatives dropped so ranking can never
+/// invert. Benefit is simply delayed until provenance accrues enough labeled
+/// examples. Independent of [`adaptive_rank_enabled`]. Truthy tokens per
+/// [`bool_env_or_default`].
+pub fn adaptive_rank_training_enabled() -> bool {
+    bool_env_or_default("ENABLE_ADAPTIVE_RANK_TRAINING", true)
+}
+
+/// Minimum usable labeled examples an actor must have before a learned model is
+/// fit / trusted (`ADAPTIVE_RANK_MIN_EXAMPLES`). Default 50, clamped to
+/// `[10, 100000]`. Below this the fit returns `None` (cold-start → global
+/// defaults) and serving falls back to global weights even if a stale row
+/// exists. `=0`/negative falls back to the default.
+pub fn adaptive_rank_min_examples() -> i64 {
+    positive_env_or_default::<i64>("ADAPTIVE_RANK_MIN_EXAMPLES", 50).clamp(10, 100_000)
+}
+
+/// Wake interval for the training scheduler in seconds
+/// (`ADAPTIVE_RANK_TRAINING_INTERVAL_SECS`). Default 21600 (6h), clamped to
+/// `[300, 604800]`. `=0`/negative falls back to the default.
+pub fn adaptive_rank_training_interval_secs() -> u64 {
+    positive_env_or_default::<u64>("ADAPTIVE_RANK_TRAINING_INTERVAL_SECS", 21_600)
+        .clamp(300, 604_800)
+}
+
+/// Training lookback window in DAYS (`ADAPTIVE_RANK_LOOKBACK_DAYS`). The fit only
+/// consumes provenance rows newer than `now - lookback_days`, so weights adapt
+/// to recent outcomes and a poisoned old batch ages out. Default 30, clamped to
+/// `[1, 3650]`. `=0`/negative falls back to the default.
+///
+/// **The clamp is what this variable ACCEPTS, not what the fit can USE. This
+/// knob is effective DOWNWARD only.** Three ceilings bind before 3650 and the
+/// narrowest is hardcoded:
+/// * `aegix_memory_ranking::TRAINING_FETCH_CAP` (20 000 rows per actor). The
+///   Phase-1 fetch is `ORDER BY created_at DESC LIMIT $cap`, so widening the
+///   window adds only OLDER rows, which sort last and are never read. Measured
+///   on the reference fleet 2026-09-09 at ~2 900 provenance rows/day: the
+///   configured 30-day window was a fitted **6.56 days**, and the fetched row
+///   set was byte-identical at 7, 30, 60, 90, 365 and 3650 days.
+/// * `aegix_memory::RANK_TRAINING_EXAMPLE_MAX` (50 000) — a second clamp on the
+///   caller's `limit`, ~17 days at that rate.
+/// * Execution ARCHIVAL at [`archive_after_days`] (default 30). Past it the
+///   fetch's `LEFT JOIN workflow_executions` finds nothing, so the row carries
+///   no outcome label and is dropped. **This one binds even with no row cap**,
+///   which is why lifting the cap would not restore the advertised range.
+///
+/// Raising this past the effective window does not change the model. It DOES
+/// widen `FetchProvenance::n_available`, so the truncation disclosure's dropped
+/// count grows — which reads as the change taking effect, and is why the
+/// disclosure now also reports the window in DAYS
+/// (`FetchProvenance::effective_lookback_days`, the digest's
+/// `lookback_knob_inert`, and `aegix_rank_training_lookback_shortfall_days`).
+pub fn adaptive_rank_lookback_days() -> i64 {
+    positive_env_or_default::<i64>("ADAPTIVE_RANK_LOOKBACK_DAYS", 30).clamp(1, 3650)
+}
+
+/// Maximum distinct actors fit per training tick
+/// (`ADAPTIVE_RANK_MAX_ACTORS_PER_TICK`). Default 50, clamped to `[1, 500]` so
+/// one tick can't stampede the whole fleet. `=0`/negative falls back to the
+/// default.
+pub fn adaptive_rank_max_actors_per_tick() -> i64 {
+    positive_env_or_default::<i64>("ADAPTIVE_RANK_MAX_ACTORS_PER_TICK", 50).clamp(1, 500)
+}
+
+/// Per-ORG fan-out cap for the autonomous memory loops
+/// (`MEMORY_LOOP_MAX_ACTORS_PER_ORG_PER_TICK`) — shared by consolidation,
+/// reflection, and rank-training scans. Bounds how many of ONE organization's
+/// actors a single tick may claim, so a tenant with thousands of actors can't
+/// crowd every other org out of the per-tick budget and lengthen their rotation
+/// cadence (the rotation cursor guarantees eventual coverage but not fair
+/// *pacing* across orgs).
+///
+/// **Default 0 = DISABLED** (no per-org cap): byte-identical to the historical
+/// scan for single-org / homelab deployments (the common case), and zero query
+/// overhead — the windowed variant only runs when this is set `> 0`. Multi-tenant
+/// operators set a positive value (e.g. `50`) to guarantee cross-org fairness.
+/// Negative values are treated as 0 (disabled).
+pub fn memory_loop_max_actors_per_org_per_tick() -> i64 {
+    std::env::var("MEMORY_LOOP_MAX_ACTORS_PER_ORG_PER_TICK")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(0)
+}
+
+/// Dev-mode default CORS allowlist. Named so [`check_allowed_origins`] and the
+/// [`ALLOWED_ORIGINS`] initialiser cannot drift apart.
+const DEV_DEFAULT_ALLOWED_ORIGINS: &str =
+    "http://localhost:3000,http://localhost:3001,http://localhost:3002";
+
+/// Split + validate a raw `ALLOWED_ORIGIN` value into the allowlist the CORS
+/// layer will actually enforce.
+///
+/// This is the whole of the [`ALLOWED_ORIGINS`] policy, lifted out of the
+/// `LazyLock` initialiser so it can be *evaluated without being applied*. Two
+/// callers, one implementation:
+///
+/// * [`ALLOWED_ORIGINS`] — panics on `Err`, preserving the historical
+///   fail-at-boot behaviour and the exact panic strings.
+/// * [`check_allowed_origins`] — used by `security_audit` to REPORT the
+///   configuration. It must not panic: a `LazyLock` that panics stays poisoned
+///   for the life of the process, so an audit that touched `get_allowed_origins`
+///   directly would brick every later CORS check as a side effect of *looking*.
+///
+/// Empty entries are dropped (`"a,,b"` → 2 origins), which is why a bare
+/// `ALLOWED_ORIGIN=""` yields an EMPTY allowlist rather than one empty origin —
+/// the divergence behind the 2026-08-28 `cors_origins` misreport.
+pub fn parse_allowed_origins(raw: &str, production: bool) -> Result<Vec<String>, String> {
+    let origins: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if production {
+        if origins.is_empty() {
+            return Err("ALLOWED_ORIGIN must be set in production. \
+                 Example: ALLOWED_ORIGIN=https://app.example.com"
+                .to_string());
+        }
+        for origin in &origins {
+            if origin == "*" || origin == "null" {
+                return Err(format!(
+                    "ALLOWED_ORIGIN contains '{}' which is not permitted in production",
+                    origin
+                ));
+            }
+            if !origin.starts_with("http://") && !origin.starts_with("https://") {
+                return Err(format!(
+                    "ALLOWED_ORIGIN '{}' must start with http:// or https://",
+                    origin
+                ));
+            }
+        }
+    }
+
+    Ok(origins)
+}
+
+/// Evaluate the live `ALLOWED_ORIGIN` configuration WITHOUT initialising the
+/// memoised [`ALLOWED_ORIGINS`] allowlist.
+///
+/// `Ok(origins)` additionally guarantees that touching [`get_allowed_origins`]
+/// is panic-free, so an auditor can safely read the enforced list afterwards.
+pub fn check_allowed_origins() -> Result<Vec<String>, String> {
+    // The browser-facing rule set (explicit list, no `*` / `null`, a scheme on
+    // every entry) applies wherever browser hardening is required — every
+    // `RUST_ENV` but the development spellings. Until 2026-10-14 it applied
+    // under `production` alone, so a `staging` deployment accepted `null` (the
+    // Origin a sandboxed iframe sends) as a credentialed CORS origin.
+    let production = aegix_auth_types::browser_hardening_required();
+    let default = if production {
+        "" // ALLOWED_ORIGIN must be explicitly set outside development
+    } else {
+        DEV_DEFAULT_ALLOWED_ORIGINS
+    };
+    parse_allowed_origins(&get_env("ALLOWED_ORIGIN", default), production)
+}
+
+/// Validated allowed origins, computed once at startup.
+/// Production panics happen at init time, not on every request.
+static ALLOWED_ORIGINS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let origins = match check_allowed_origins() {
+        Ok(origins) => origins,
+        // Same message, same timing (first touch), same fail-closed posture as
+        // the pre-extraction inline `panic!`s.
+        Err(e) => panic!("{}", e),
+    };
+
+    // SECURITY: Credentials are sent to all allowed origins. Each origin
+    // added expands the attack surface — a compromised origin can steal
+    // session cookies. Log when multiple origins are configured.
+    if aegix_auth_types::browser_hardening_required() && origins.len() > 1 {
+        eprintln!(
+            "SECURITY WARNING: {} CORS origins configured with credentials. \
+             Each origin can receive session cookies. Verify all are trusted: {:?}",
+            origins.len(),
+            origins
+        );
+    }
+
+    origins
+});
+
+pub fn get_allowed_origins() -> Vec<String> {
+    ALLOWED_ORIGINS.clone()
+}
+
+pub fn is_allowed_origin(origin: &str) -> bool {
+    ALLOWED_ORIGINS.iter().any(|o| o == origin)
+}
+
+/// MCP-1000 (2026-05-15): defense-in-depth against open-redirect via
+/// a misconfigured `FRONTEND_URL`. Pre-fix `get_frontend_url()` was a
+/// thin wrapper around `get_env(...)` with zero validation, while two
+/// of four callers (`aegix-atlassian::callback_handler`,
+/// `aegix-gmail::gmail_callback_handler`) maintained their own inline
+/// validation that rejected any path-separator after the scheme. The
+/// other two callers (`aegix-slack::slack_callback_handler` and
+/// `controller::oauth_callback_handler`) had no validation at all and
+/// would happily `format!("{}/settings?...", frontend_url, ...)` into
+/// a path-injected URL.
+///
+/// Threat: if an operator (or env-injection bug) sets
+/// `FRONTEND_URL=https://attacker.com/redirect?to=`, the OAuth-callback
+/// redirect becomes `https://attacker.com/redirect?to=/settings?...`
+/// and the browser navigates to attacker.com — a classic open redirect.
+/// The fix returns the localhost default + WARN log when the configured
+/// value contains a `/` after the `://`. Matches the inline validation
+/// in atlassian/gmail exactly (same predicate `!after.contains('/')`),
+/// so behaviour for those two callers is unchanged and slack/oauth-
+/// callback gain the protection for free.
+///
+/// Trailing slashes (`https://app.example.com/`) and any
+/// scheme-mismatched (no `http://`/`https://`) values are also rejected
+/// — operators typically set `https://host` exactly per the helm chart
+/// docs. Misconfig surfaces as a single WARN at startup; valid setups
+/// pay nothing.
+pub fn get_frontend_url() -> String {
+    let raw = get_env("FRONTEND_URL", "http://localhost:3000");
+    if is_valid_frontend_url(&raw) {
+        return raw;
+    }
+    tracing::warn!(
+        frontend_url = %raw,
+        "FRONTEND_URL failed validation (must be http(s)://host with no path); falling back to http://localhost:3000"
+    );
+    "http://localhost:3000".to_string()
+}
+
+/// MCP-1155 (2026-05-16): canonical `BASE_URL` resolver. Sibling of
+/// [`get_frontend_url`].
+///
+/// Pre-fix `BASE_URL` was read inline at 10+ sites
+/// (`aegix-mcp-handlers::webhooks` ×3, `aegix-mcp-handlers::advanced`
+/// ×4, `aegix-api::schema::webhooks` ×2, `aegix-api::schema::modules`,
+/// `aegix-actor-policies::evaluator`, `aegix-google-calendar` ×2)
+/// each calling `aegix_config::get_env("BASE_URL", "http://localhost:8000")`
+/// or the equivalent inline `std::env::var(...).filter(!is_empty)`
+/// shape. None of those sites validated the value before formatting
+/// it into a webhook URL via
+/// `format!("{}/webhooks/{}", base_url, id)`.
+///
+/// Same open-redirect-via-misconfig threat as the MCP-1000
+/// FRONTEND_URL fix: an operator (or env-injection bug) setting
+/// `BASE_URL=https://attacker.com/redirect?to=` produces webhook
+/// URLs that point external services at attacker.com on every
+/// inbound delivery. The mis-rendering is also operator-confusing —
+/// "I set BASE_URL but my webhook URLs have garbage" tells the
+/// operator nothing about WHY.
+///
+/// Same predicate (`is_valid_frontend_url`) — the rules are
+/// identical: scheme + host(+port), no path / query / fragment.
+/// Misconfig falls back to the canonical localhost default + a
+/// single startup WARN.
+///
+/// New callers should use this instead of
+/// `aegix_config::get_env("BASE_URL", ...)` directly. The eight
+/// existing `aegix-mcp-handlers` callsites + two `aegix-api` callsites
+/// route through this helper post-MCP-1155.
+pub fn get_base_url() -> String {
+    let raw = get_env("BASE_URL", "http://localhost:8000");
+    if is_valid_frontend_url(&raw) {
+        return raw;
+    }
+    tracing::warn!(
+        base_url = %raw,
+        "BASE_URL failed validation (must be http(s)://host with no path); falling back to http://localhost:8000"
+    );
+    "http://localhost:8000".to_string()
+}
+
+/// The variable an operator sets to put action links on an address of their
+/// own choosing ([`action_links_base_url`]).
+pub const ACTION_LINKS_BASE_URL_ENV: &str = "AEGIX_ACTION_LINKS_BASE_URL";
+
+/// Why a value of [`ACTION_LINKS_BASE_URL_ENV`] was refused. Carries no part
+/// of the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionLinksBaseError {
+    /// Not `https://`. A link carries a capability token in its path, so it
+    /// is never minted for a plaintext address.
+    NotHttps,
+    /// Something other than a scheme and a host (and a port): a path, a
+    /// query, a fragment, userinfo, whitespace, or no host at all.
+    NotAnOrigin,
+}
+
+impl ActionLinksBaseError {
+    /// What an operator is told.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotHttps => "it must begin with https://",
+            Self::NotAnOrigin => {
+                "it must be https://host or https://host:port, with no path, query, fragment \
+                 or user information"
+            }
+        }
+    }
+}
+
+/// Read a value of [`ACTION_LINKS_BASE_URL_ENV`].
+///
+/// * unset or blank → `Ok(None)`: action links go out on the deployment's
+///   public address, exactly as before this setting existed;
+/// * `https://host[:port]` → `Ok(Some(origin))`;
+/// * anything else → `Err`. A caller must then mint NOTHING. This setting
+///   exists to keep a link (its token, and the label its page shows) off the
+///   public address, so a mistyped value must not send links out on the very
+///   address it was set to avoid.
+///
+/// Pure, so the rule is testable without the environment.
+pub fn parse_action_links_base(raw: Option<&str>) -> Result<Option<String>, ActionLinksBaseError> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if !value.starts_with("https://") {
+        return Err(ActionLinksBaseError::NotHttps);
+    }
+    if !is_valid_frontend_url(value) {
+        return Err(ActionLinksBaseError::NotAnOrigin);
+    }
+    Ok(Some(value.to_string()))
+}
+
+/// The address action links are minted on, when the operator has set one
+/// ([`ACTION_LINKS_BASE_URL_ENV`]). See [`parse_action_links_base`] for the
+/// three answers; `Err` means "mint nothing", never "use the public one".
+pub fn action_links_base_url() -> Result<Option<String>, ActionLinksBaseError> {
+    parse_action_links_base(std::env::var(ACTION_LINKS_BASE_URL_ENV).ok().as_deref())
+}
+
+#[cfg(test)]
+mod action_links_base_tests {
+    use super::{parse_action_links_base, ActionLinksBaseError as E};
+
+    #[test]
+    fn unset_or_blank_is_no_override() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(parse_action_links_base(raw), Ok(None), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_https_origin_is_used_as_given() {
+        for raw in [
+            "https://links.example",
+            "https://links.example:8443",
+            "  https://talos.tailnet.example  ",
+        ] {
+            assert_eq!(
+                parse_action_links_base(Some(raw)),
+                Ok(Some(raw.trim().to_string())),
+                "{raw}"
+            );
+        }
+    }
+
+    /// A link's path is a capability token. A value that is not an https
+    /// origin is refused; it is never repaired and never ignored.
+    #[test]
+    fn anything_else_is_refused() {
+        for raw in [
+            "http://links.example",
+            "links.example",
+            "ftp://links.example",
+            "//links.example",
+        ] {
+            assert_eq!(
+                parse_action_links_base(Some(raw)),
+                Err(E::NotHttps),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "https://",
+            "https://links.example/",
+            "https://links.example/base",
+            "https://links.example?x=1",
+            "https://links.example#frag",
+            "https://user@links.example",
+            "https://links.example@other.example",
+            "https://links .example",
+        ] {
+            assert_eq!(
+                parse_action_links_base(Some(raw)),
+                Err(E::NotAnOrigin),
+                "{raw}"
+            );
+        }
+    }
+}
+
+/// The variable an operator sets to have a run that an ACTION LINK started
+/// report its failure to the phone that tapped ([`tap_failure_ntfy_url`]).
+pub const TAP_FAILURE_NTFY_URL_ENV: &str = "AEGIX_TAP_FAILURE_NTFY_URL";
+
+/// The vault path the notice's bearer token is read from, for the run's own
+/// user: the path `notify-ntfy` documents for its `AUTH_HEADER`.
+pub const TAP_FAILURE_NTFY_TOKEN_PATH: &str = "ntfy/token";
+
+/// Where a tap-failure notice is published: an ntfy server and one topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfyAddress {
+    /// `https://host` or `https://host:port`, no trailing slash.
+    pub origin: String,
+    /// 1 to 64 letters, digits, `_` or `-`, as ntfy admits.
+    pub topic: String,
+}
+
+impl NtfyAddress {
+    /// The address a message is POSTed to (the topic rides in the JSON body,
+    /// as `notify-ntfy` sends it).
+    #[must_use]
+    pub fn publish_url(&self) -> String {
+        format!("{}/", self.origin)
+    }
+}
+
+/// Why a value of [`TAP_FAILURE_NTFY_URL_ENV`] was refused. Carries no part of
+/// the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapFailureNtfyError {
+    /// Not `https://`: the request carries a bearer token.
+    NotHttps,
+    /// Not `https://host[:port]/<topic>`: a missing or second path segment, a
+    /// query, a fragment, userinfo, whitespace, or no host.
+    NotAnAddress,
+    /// The topic is not 1 to 64 letters, digits, `_` or `-`.
+    BadTopic,
+}
+
+impl TapFailureNtfyError {
+    /// What an operator is told.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotHttps => "it must begin with https://",
+            Self::NotAnAddress => {
+                "it must be https://host/<topic> or https://host:port/<topic>, with no query, \
+                 fragment or user information"
+            }
+            Self::BadTopic => "the topic must be 1 to 64 letters, digits, '_' or '-'",
+        }
+    }
+}
+
+/// Read a value of [`TAP_FAILURE_NTFY_URL_ENV`].
+///
+/// * unset or blank → `Ok(None)`: no notice is sent, as before the setting
+///   existed;
+/// * `https://host[:port]/<topic>` → `Ok(Some(address))`;
+/// * anything else → `Err`. A caller sends NOTHING: a bearer token travels
+///   with every notice, so a mistyped address is never repaired into one.
+///
+/// Pure, so the rule is testable without the environment.
+pub fn parse_tap_failure_ntfy_url(
+    raw: Option<&str>,
+) -> Result<Option<NtfyAddress>, TapFailureNtfyError> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(after_scheme) = value.strip_prefix("https://") else {
+        return Err(TapFailureNtfyError::NotHttps);
+    };
+    let Some((host, topic)) = after_scheme.split_once('/') else {
+        return Err(TapFailureNtfyError::NotAnAddress);
+    };
+    let origin = format!("https://{host}");
+    if !is_valid_frontend_url(&origin) {
+        return Err(TapFailureNtfyError::NotAnAddress);
+    }
+    if topic.contains(['/', '?', '#']) {
+        return Err(TapFailureNtfyError::NotAnAddress);
+    }
+    let topic_ok = !topic.is_empty()
+        && topic.len() <= 64
+        && topic
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !topic_ok {
+        return Err(TapFailureNtfyError::BadTopic);
+    }
+    Ok(Some(NtfyAddress {
+        origin,
+        topic: topic.to_string(),
+    }))
+}
+
+/// Where a tap-failure notice goes, when the operator has set one
+/// ([`TAP_FAILURE_NTFY_URL_ENV`]). See [`parse_tap_failure_ntfy_url`] for the
+/// three answers; `Err` means "send nothing", never "send somewhere else".
+pub fn tap_failure_ntfy_url() -> Result<Option<NtfyAddress>, TapFailureNtfyError> {
+    parse_tap_failure_ntfy_url(std::env::var(TAP_FAILURE_NTFY_URL_ENV).ok().as_deref())
+}
+
+#[cfg(test)]
+mod tap_failure_ntfy_tests {
+    use super::{parse_tap_failure_ntfy_url, NtfyAddress, TapFailureNtfyError as E};
+
+    #[test]
+    fn unset_or_blank_sends_nothing() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(parse_tap_failure_ntfy_url(raw), Ok(None), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_server_and_one_topic_are_read() {
+        assert_eq!(
+            parse_tap_failure_ntfy_url(Some("https://ntfy.example/talos-daily")),
+            Ok(Some(NtfyAddress {
+                origin: "https://ntfy.example".into(),
+                topic: "talos-daily".into(),
+            }))
+        );
+        let with_port = parse_tap_failure_ntfy_url(Some("  https://ntfy.example:8443/t_1  "))
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_port.origin, "https://ntfy.example:8443");
+        assert_eq!(with_port.topic, "t_1");
+        assert_eq!(with_port.publish_url(), "https://ntfy.example:8443/");
+    }
+
+    /// A bearer token travels with the notice. A value that is not an https
+    /// server with exactly one topic is refused, never repaired.
+    #[test]
+    fn anything_else_is_refused() {
+        assert_eq!(
+            parse_tap_failure_ntfy_url(Some("http://ntfy.example/t")),
+            Err(E::NotHttps)
+        );
+        for raw in [
+            "https://ntfy.example",
+            "https://ntfy.example/",
+            "https://ntfy.example/a/b",
+            "https://ntfy.example/t?auth=x",
+            "https://ntfy.example/t#f",
+            "https://user@ntfy.example/t",
+            "https://ntfy .example/t",
+            "https:///t",
+        ] {
+            assert!(
+                matches!(
+                    parse_tap_failure_ntfy_url(Some(raw)),
+                    Err(E::NotAnAddress | E::BadTopic)
+                ),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            parse_tap_failure_ntfy_url(Some("https://ntfy.example/bad topic")),
+            Err(E::BadTopic)
+        );
+        let long = format!("https://ntfy.example/{}", "a".repeat(65));
+        assert_eq!(parse_tap_failure_ntfy_url(Some(&long)), Err(E::BadTopic));
+    }
+}
+
+/// Returns true if `raw` is `http(s)://host(:port)` with no path,
+/// query, or fragment. Mirrors the inline validation in
+/// `aegix-atlassian::callback_handler` and
+/// `aegix-gmail::gmail_callback_handler` so all four OAuth-callback
+/// paths share one contract.
+///
+/// `pub` since 2026-07-17: `aegix-public-url` applies the SAME origin
+/// contract to `AEGIX_PUBLIC_BASE_URL` and ngrok-discovered tunnel
+/// URLs — one predicate, four env vars, no drift.
+pub fn is_valid_frontend_url(raw: &str) -> bool {
+    let after_scheme = match raw.strip_prefix("https://") {
+        Some(s) => s,
+        None => match raw.strip_prefix("http://") {
+            Some(s) => s,
+            None => return false,
+        },
+    };
+    // Reject empty host AND any path/query/fragment indicators. The
+    // path check (`/`) is the canonical inline-implementation
+    // predicate; query (`?`) and fragment (`#`) checks are
+    // strictly-more-defensive — neither produces an open redirect on
+    // their own but both produce broken concatenated URLs that we
+    // don't want to silently emit.
+    //
+    // MCP-1169 (2026-05-17): also reject `@` (userinfo) and
+    // whitespace / control chars. Pre-fix `https://attacker.com@victim.com`
+    // (URL with userinfo `attacker.com` and host `victim.com`)
+    // passed the validator — `strip_prefix("https://")` returned
+    // `attacker.com@victim.com`, which contains none of `/`,`?`,`#`.
+    // The browser parses that URL as a navigation to victim.com,
+    // benign in that order. But the INVERSE shape — `https://victim.com@attacker.com`
+    // — produces an open redirect: operator's
+    // `FRONTEND_URL` would format URLs like `{frontend}/settings?...`
+    // → `https://victim.com@attacker.com/settings?...` → browser
+    // navigates to attacker.com with userinfo `victim.com`. Same
+    // open-redirect class as MCP-1000 originally closed for path
+    // shapes, sibling to MCP-1157 which rejects `@` in OKTA_DOMAIN
+    // for the same reason. Whitespace + control chars are
+    // additional canonical hostname-invalid shapes that can produce
+    // HTTP header smuggling when the URL is interpolated into a
+    // `Location:` header.
+    !after_scheme.is_empty()
+        && !after_scheme.contains('/')
+        && !after_scheme.contains('?')
+        && !after_scheme.contains('#')
+        && !after_scheme.contains('@')
+        && !after_scheme
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// MCP-1094 (2026-05-16): canonical OAuth-callback `error` sanitiser.
+///
+/// All four OAuth-callback handlers (aegix-slack, aegix-gmail,
+/// aegix-atlassian, controller `oauth_callback_handler`) take the
+/// provider-supplied `error` query param and urlencode it directly into
+/// a redirect URL aimed at the dashboard:
+///
+/// ```text
+/// {frontend_url}/settings?gmail_error={error}
+/// ```
+///
+/// Pre-fix the `error` value was passed through with no length cap or
+/// charset validation. Per RFC 6749 §4.1.2.1 the OAuth `error` field is
+/// a fixed enum (`invalid_request`, `access_denied`, …) — at most ~30
+/// chars of `[a-z_]`. But the parameter is attacker-controllable: a
+/// phishing link of the form
+///
+/// ```text
+/// https://api.example.com/auth/slack/callback?error=Your+account+suspended+contact+support%40attacker.com
+/// ```
+///
+/// produced a same-host server redirect whose query string carried the
+/// attacker's social-engineering payload to the dashboard. The frontend
+/// renders the value as if it were a legitimate Slack/Google/Atlassian
+/// error — and the URL persists in browser history, proxy logs, and
+/// Referer headers, so the payload spreads beyond the page render.
+///
+/// This helper validates: 1–64 chars, ASCII `[a-z0-9_-]` only (covers
+/// every RFC 6749 OAuth error AND every provider extension currently in
+/// use: Google's `interaction_required`/`login_required`/
+/// `consent_required`/`account_selection_required`, Microsoft's
+/// `invalid_grant`/`invalid_client`/`invalid_token`, GitHub's
+/// `application_suspended`, Slack's `invalid_team_for_non_distributed_app`).
+/// Anything else returns the generic `"oauth_error"` sentinel — the
+/// frontend can map that to a "something went wrong, please try again"
+/// message without trusting attacker-supplied text.
+///
+/// Returns a borrowed `&str` so the common (valid) case is allocation-free.
+#[must_use]
+pub fn sanitize_oauth_error_code(raw: &str) -> &str {
+    const MAX_OAUTH_ERROR_LEN: usize = 64;
+    const FALLBACK: &str = "oauth_error";
+    if raw.is_empty() || raw.len() > MAX_OAUTH_ERROR_LEN {
+        return FALLBACK;
+    }
+    let all_ok = raw
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if all_ok {
+        raw
+    } else {
+        FALLBACK
+    }
+}
+
+/// Number of days to retain workflow executions before cleanup. Default: 30.
+///
+/// MCP-1063 (2026-05-15): route through `positive_env_or_default` so
+/// `EXECUTION_RETENTION_DAYS=0` (Helm placeholder) and negative values
+/// substitute the default + WARN instead of becoming destructive. The
+/// consumer in `controller/main.rs::execution_retention_cleanup_loop`
+/// binds this directly into
+/// `started_at < NOW() - INTERVAL '1 day' * $1` — with `=0` the
+/// predicate becomes `started_at < NOW()` (matches every past
+/// execution); with a negative value, `< NOW() + INTERVAL` (matches
+/// every execution). Either is total purge of the workflow_executions
+/// table on first sweep. Same `=0`/negative footgun class as
+/// MCP-638/643/661/663/664/665/703/758/1055 (worker semaphores /
+/// retention envs / embedding dimensions). Companion of MCP-1062's
+/// function-boundary defense-in-depth — fixing the env-helper closes
+/// the env-config attack vector at the source while the function
+/// guards close other callers.
+pub fn execution_retention_days() -> i32 {
+    positive_env_or_default::<i32>("EXECUTION_RETENTION_DAYS", 30)
+}
+
+/// Days an execution stays in `workflow_executions` before being MOVED to
+/// `workflow_executions_archive`. Default: 30.
+///
+/// One retention path (2026-09-04): this is the window that bounds the LIVE
+/// table. [`execution_retention_days`] used to be that window — it drove a
+/// plain `DELETE FROM workflow_executions` — and now bounds the ARCHIVE
+/// instead. Anything reasoning about "how far back can I read an execution
+/// row, or a row that CASCADEs from one" wants THIS number, not that one.
+///
+/// Two existing call sites read the same env var inline
+/// (`controller/src/bootstrap/background.rs`'s archival loop and
+/// `aegix-mcp-handlers/src/advanced.rs::handle_get_archive_policy`); both now
+/// route through here so the default cannot drift between the loop that
+/// enforces the window and the tool that reports it.
+///
+/// Same `=0`/negative hardening as its sibling, and for the same reason: the
+/// value binds into `make_interval(days => $1::int)` on a statement that
+/// DELETEs from `workflow_executions`. MCP-643 is the env-side instance of
+/// that class.
+///
+/// **Stated limit:** this reads the ENV window only. The archival loop prefers
+/// `system_settings.archive_after_days` when that row is present, so a DB
+/// override to a SHORTER window is invisible here — a reader using this to
+/// describe its own coverage may describe a window wider than the store holds.
+/// That is unchanged in kind from the helper this replaced
+/// (`EXECUTION_RETENTION_DAYS` was equally env-only) and strictly closer to
+/// the truth, but it is a real gap, not a rounding.
+pub fn archive_after_days() -> i32 {
+    positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30)
+}
+
+/// Is the opt-in `module_executions` payload-retention sweep enabled?
+/// Default: **false**, and it must stay false until the stated
+/// precondition below is met.
+///
+/// The sweep NULLs `input_data_enc` / `output_data_enc` on terminal rows.
+/// Those are AEAD ciphertexts: nulling is IRREVERSIBLE — there is no
+/// decrypt-and-restore, and the only recovery is a backup restore.
+///
+/// **Stated precondition for turning this on** (an off-by-default flag with
+/// no condition attached is a decision nobody ever gets to make): the
+/// off-host backup chain must be proven end-to-end first. As of 2026-08-13
+/// the daily `pg_dump`s live on the same disk they insure, and the restore
+/// drill sources the KEK from the live container rather than from escrow —
+/// so today a disk loss is still total loss, and this sweep would be
+/// removing the only copy of data whose backup has never been shown to
+/// restore without the host it protects. Enable it after that is closed,
+/// not before.
+pub fn module_payload_retention_enabled() -> bool {
+    bool_env_or_default("MODULE_PAYLOAD_RETENTION_ENABLED", false)
+}
+
+/// Age floor (DAYS) for the `module_executions` payload-retention sweep.
+/// Default: the same value as [`execution_retention_days`] (30), because
+/// that is the age at which this platform ALREADY deletes the whole parent
+/// `workflow_executions` row. Retention parity, not an independent judgement.
+///
+/// Routed through `positive_env_or_default` for the same reason
+/// `execution_retention_days` is: `=0` would make the predicate
+/// `created_at < NOW()`, i.e. prune every terminal row on the first sweep,
+/// and a negative value would prune every row including future-dated ones.
+/// Same `=0`/negative footgun family as MCP-1063.
+///
+/// **Boundary note (2026-09-04, one retention path).** The parity claim above
+/// is now about `ARCHIVE_AFTER_DAYS`, not `EXECUTION_RETENTION_DAYS`: an
+/// execution LEAVES `workflow_executions` (CASCADEing `execution_events` with
+/// it) at the archive boundary, and `EXECUTION_RETENTION_DAYS` governs how long
+/// the ARCHIVED copy is then kept. The default derivation below is
+/// DELIBERATELY left on [`execution_retention_days`] rather than switched to
+/// [`archive_after_days`]: both default to 30, so nothing changes out of the
+/// box, and switching it would SHORTEN this sweep's window for any operator
+/// running `ARCHIVE_AFTER_DAYS` below `EXECUTION_RETENTION_DAYS`. Keeping
+/// module data longer than strict parity errs in the safe direction; deleting
+/// it earlier as a side effect of an unrelated change does not. An operator who
+/// wants exact parity sets this env var explicitly.
+pub fn module_payload_retention_days() -> i32 {
+    positive_env_or_default::<i32>("MODULE_PAYLOAD_RETENTION_DAYS", execution_retention_days())
+}
+
+/// How many of the most recent `status='completed'` executions to keep
+/// payloads for, per `(module_id, user_id)`. Default: 50.
+///
+/// This is the clause that makes the sweep safe, and its floor is not a
+/// preference. `replay_module_regression` clamps its caller-supplied limit to
+/// `[1, 20]` (`aegix-mcp-handlers/src/sandbox.rs`, `validate_range_i64(args,
+/// "limit", 1, 20, 5, ..)`) and `find_latest_completed_execution_io` is a hard
+/// `LIMIT 1`; both order by exactly `completed_at DESC NULLS LAST, started_at
+/// DESC`. So no replay or scaffold path can reach past rank 20, and anything
+/// at or above 20 is provably outside their reach. 50 is that bound with a
+/// 2.5x margin.
+///
+/// **Clamped to a floor of [`MODULE_PAYLOAD_REPLAY_REACH`], not merely
+/// defaulted to it** — an operator who sets this to 5 to reclaim more space
+/// would silently empty the replay corpus for every module with more than 5
+/// completed runs, which is precisely how r303's ReplayService shipped as a
+/// no-op. Configuring it below the reach is refused, loudly, in favour of the
+/// floor.
+pub fn module_payload_retention_corpus_keep() -> i64 {
+    let configured = positive_env_or_default::<i64>("MODULE_PAYLOAD_RETENTION_CORPUS_KEEP", 50);
+    if configured < MODULE_PAYLOAD_REPLAY_REACH {
+        tracing::warn!(
+            target: "aegix_config",
+            event_kind = "module_payload_corpus_keep_below_replay_reach",
+            configured,
+            floor = MODULE_PAYLOAD_REPLAY_REACH,
+            "MODULE_PAYLOAD_RETENTION_CORPUS_KEEP={configured} is below the replay reach \
+             ({MODULE_PAYLOAD_REPLAY_REACH}); using the floor so replay_module_regression \
+             and generate_typed_scaffold keep a corpus"
+        );
+        return MODULE_PAYLOAD_REPLAY_REACH;
+    }
+    configured
+}
+
+/// The furthest rank any payload reader can reach into a module's completed
+/// history. Mirrors the `[1, 20]` clamp on `replay_module_regression`'s
+/// `limit`. If that clamp is ever widened, this constant must move with it —
+/// they are the same fact stated in two crates.
+pub const MODULE_PAYLOAD_REPLAY_REACH: i64 = 20;
+
+/// Maximum rows one payload-retention batch may touch. Default: 5000,
+/// matching the existing `workflow_executions` retention DELETE's chunk size
+/// so the two sweeps have the same lock-hold profile.
+pub fn module_payload_retention_batch() -> i64 {
+    positive_env_or_default::<i64>("MODULE_PAYLOAD_RETENTION_BATCH", 5000).clamp(1, 20_000)
+}
+
+/// Is the opt-in `module_executions` ROW-retention sweep enabled?
+/// Default: **false**, and it is strictly more destructive than the payload
+/// sweep above, so it inherits that sweep's precondition unchanged.
+///
+/// # What this deletes, and when
+///
+/// When enabled, a 6-hourly sweep DELETEs whole `module_executions` rows that
+/// are simultaneously: terminal-status, older than
+/// [`module_execution_retention_days`], and outside the
+/// [`module_payload_retention_corpus_keep`] most-recent `completed` rows of
+/// their `(module_id, user_id)`. Each deleted row CASCADEs its
+/// `module_execution_logs` children (`node_execution_logs_execution_id_fkey`,
+/// `ON DELETE CASCADE`). Nothing else in the schema references
+/// `module_executions`.
+///
+/// # Why it is a separate flag from the payload sweep
+///
+/// The payload sweep clears two BYTEA columns and leaves the row — its status,
+/// duration, fuel and error text stay readable, and the `payload_pruned_at`
+/// tombstone says what happened. This sweep removes the row itself, so there
+/// is no tombstone and no reader can tell a deleted execution from one that
+/// never ran. That is a strictly larger loss, and folding it under
+/// `MODULE_PAYLOAD_RETENTION_ENABLED` would let an operator who opted into the
+/// smaller one silently get the larger.
+///
+/// # Why it exists at all when the payload sweep already frees the space
+///
+/// Measured on the dev fleet 2026-08-28, `module_executions` is 133 MB:
+/// 85 MB TOAST (payload — what the payload sweep reclaims), plus 21 MB heap
+/// and 27 MB of indexes across 19 indexes that the payload sweep cannot touch,
+/// plus 37 MB of `module_execution_logs` that only a row DELETE reclaims.
+/// Payload pruning bounds BYTES; only row deletion bounds ROW COUNT, and row
+/// count is what grows without limit (36,942 rows, of which 9,104 already
+/// point at a `workflow_executions` parent that was deleted 30 days ago).
+///
+/// **Stated precondition for turning this on** (unchanged from the payload
+/// sweep, because a strictly larger irreversible deletion cannot have a weaker
+/// one): the off-host backup chain must be proven end-to-end first. As of
+/// 2026-08-13 the daily `pg_dump`s live on the same disk they insure and the
+/// restore drill sources the KEK from the live container rather than from
+/// escrow. Enable it after that is closed, not before.
+pub fn module_execution_retention_enabled() -> bool {
+    bool_env_or_default("MODULE_EXECUTION_RETENTION_ENABLED", false)
+}
+
+/// Age floor (DAYS) for the `module_executions` ROW-retention sweep.
+/// Default: the same value as [`execution_retention_days`] (30) — retention
+/// PARITY with the parent row, not an independent judgement. 30 days is
+/// already the age at which this platform DELETEs the owning
+/// `workflow_executions` row and CASCADEs `execution_events` with it, so a
+/// `module_executions` row older than that has, on the dev fleet, a 100%
+/// chance of being orphaned: of the 9,018 rows older than 30 days, 9,018 have
+/// no surviving parent (measured 2026-08-28).
+///
+/// Routed through `positive_env_or_default` for the same reason its two
+/// siblings are: `=0` would make the predicate `created_at < NOW()`, deleting
+/// every terminal row on the first sweep, and a negative value would delete
+/// future-dated rows too. Same `=0`/negative footgun family as MCP-1063. The
+/// consumer refuses a non-positive value a second time at the function
+/// boundary — defense in depth, matching `prune_terminal_payloads`.
+///
+/// **Boundary note (2026-09-04, one retention path).** The parity claim above
+/// is now about `ARCHIVE_AFTER_DAYS`, not `EXECUTION_RETENTION_DAYS`: an
+/// execution LEAVES `workflow_executions` (CASCADEing `execution_events` with
+/// it) at the archive boundary, and `EXECUTION_RETENTION_DAYS` governs how long
+/// the ARCHIVED copy is then kept. The default derivation below is
+/// DELIBERATELY left on [`execution_retention_days`] rather than switched to
+/// [`archive_after_days`]: both default to 30, so nothing changes out of the
+/// box, and switching it would SHORTEN this sweep's window for any operator
+/// running `ARCHIVE_AFTER_DAYS` below `EXECUTION_RETENTION_DAYS`. Keeping
+/// module data longer than strict parity errs in the safe direction; deleting
+/// it earlier as a side effect of an unrelated change does not. An operator who
+/// wants exact parity sets this env var explicitly.
+pub fn module_execution_retention_days() -> i32 {
+    positive_env_or_default::<i32>(
+        "MODULE_EXECUTION_RETENTION_DAYS",
+        execution_retention_days(),
+    )
+}
+
+/// Maximum rows one ROW-retention batch may DELETE. Default: 5000, matching
+/// both the `workflow_executions` retention DELETE and the payload sweep so
+/// all three have the same lock-hold profile.
+///
+/// A batch is larger than it looks: each deleted row CASCADEs its
+/// `module_execution_logs` children. Measured on the dev fleet 2026-08-28
+/// that is 2.33 log rows per execution on average (p99 = 4, max = 44), so a
+/// 5000-row batch is ~16,650 row deletions in total, not 5000. The cascade is
+/// index-supported (`idx_module_execution_logs_execution_id`), so it is an
+/// index lookup per parent rather than a sequential scan.
+pub fn module_execution_retention_batch() -> i64 {
+    positive_env_or_default::<i64>("MODULE_EXECUTION_RETENTION_BATCH", 5000).clamp(1, 20_000)
+}
+
+/// MCP-1060 (2026-05-15): read a boolean env var with a canonical set
+/// of truthy / falsy tokens. Accepts `true | 1 | yes | on` (truthy) and
+/// `false | 0 | no | off` (falsy), case-insensitive, leading/trailing
+/// whitespace tolerant. Unset, empty, or unrecognised → `default`.
+///
+/// Pre-1060 three sites had inline copies of the same predicate:
+/// `aegix-auth::verify_token` (`JWT_REQUIRE_AUD`),
+/// `talos-workflow-signing::strict_mode` (`AEGIX_WORKFLOW_SIGNING_STRICT`),
+/// `worker::host_impl::ALLOW_PRIVATE_HOST_TARGETS`. Slight predicate
+/// drift across them: the worker accepted `"on"`, the other two didn't.
+/// The auth site is the per-request hot path — `verify_token` is called
+/// on every authenticated request, and the inline `env::var` read takes
+/// the process-wide environ lock + allocates a String each time.
+/// Operators routing through this helper PLUS wrapping in `LazyLock`
+/// remove the per-request env-read entirely.
+///
+/// Unrecognised values (`=foo`, `=enable`, etc.) WARN with
+/// `event_kind=env_bool_unrecognised_substituted` so misconfiguration
+/// is visible without flipping behaviour silently.
+///
+/// Sibling of `positive_env_or_default` (MCP-643).
+/// Three-valued boolean env read (2026-09-12, package AN): `Some(true)` for
+/// `true | 1 | yes | on`, `Some(false)` for `false | 0 | no | off`
+/// (case-insensitive, whitespace-tolerant), `None` when unset, empty or
+/// unrecognised — the unrecognised case WARNs exactly as
+/// [`bool_env_or_default`] does. Use this where "unset" has its own meaning
+/// (`AEGIX_REPLAY_FAIL_CLOSED` / `AEGIX_COMPILATION_CONTAINER`: unset ⇒
+/// `is_production()`); use `bool_env_or_default` for a plain default.
+///
+/// This is the ONE boolean-token vocabulary for the workspace (check 90):
+/// before it, 23 sites parsed their variable inline against sets ranging
+/// from a lone `"1"` to eight spellings, and two variables were parsed by
+/// TWO readers that disagreed — `ENABLE_EDGE_ROUTING` (`== "true"` in the
+/// engine dispatcher, the full set in `edge_routing_enabled()` used by the
+/// Gmail push) and `WORKER_ALLOW_PRIVATE_HOST_TARGETS` (`== "1"` in the SSRF
+/// resolver, the full set in the host limits) — so one env value could turn a
+/// control on at one layer and leave it off at the other.
+pub fn bool_env(var: &str) -> Option<bool> {
+    match read_bool_env(var) {
+        BoolEnv::Unset => None,
+        BoolEnv::Value(v) => Some(v),
+        BoolEnv::Unreadable(raw) => {
+            tracing::warn!(
+                target: "aegix_config",
+                event_kind = "env_bool_unrecognised_substituted",
+                var = var,
+                configured = %raw,
+                "{var}={raw:?} is not a recognised boolean token; treating it as unset"
+            );
+            None
+        }
+    }
+}
+
+/// What a boolean env var says, with the unreadable case kept apart from
+/// the unset one. [`bool_env`] folds `Unreadable` into "unset" (and WARNs),
+/// which is right for a tuning flag and wrong for a switch that turns a
+/// capability OFF: there a typo must not leave the capability on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoolEnv {
+    /// Unset, or set to an empty / whitespace-only string.
+    Unset,
+    /// One of the tokens [`bool_env`] documents.
+    Value(bool),
+    /// Set to something that is not a boolean token (the raw value).
+    Unreadable(String),
+}
+
+/// Read `var` against the one boolean-token vocabulary without deciding
+/// what an unreadable value means.
+pub fn read_bool_env(var: &str) -> BoolEnv {
+    match env::var(var) {
+        Ok(raw) => parse_bool_env(&raw),
+        Err(_) => BoolEnv::Unset,
+    }
+}
+
+/// The token vocabulary itself, as a pure function of the raw value.
+pub fn parse_bool_env(raw: &str) -> BoolEnv {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return BoolEnv::Unset;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => BoolEnv::Value(true),
+        "false" | "0" | "no" | "off" => BoolEnv::Value(false),
+        _ => BoolEnv::Unreadable(raw.to_string()),
+    }
+}
+
+pub fn bool_env_or_default(var: &str, default: bool) -> bool {
+    bool_env(var).unwrap_or(default)
+}
+
+/// MCP-643 (2026-05-13): read a positive-integer env var, treating
+/// missing, invalid, AND `=0` as "use default". Many retention /
+/// cleanup / cap config envs in the controller (ARCHIVE_AFTER_DAYS,
+/// AUDIT_LOG_RETENTION_DAYS, WASM_CACHE_*) have a destructive failure
+/// mode when set to 0 — `retention_days=0` deletes every row older
+/// than now (i.e., everything), `max_size_mb=0` evicts every cached
+/// entry on the next sweep, etc.
+///
+/// Operators typically intend `=0` to mean "unlimited" / "disabled"
+/// (common UNIX convention) but the SQL `< NOW() - interval '0 days'`
+/// or `> 0 modules` cap gives the opposite. Substitute the default +
+/// WARN so misconfiguration is visible without producing silent data
+/// loss. Sibling to MCP-639 / MCP-640 / MCP-642 (worker / reporter
+/// equivalents).
+///
+/// Generic over `T: FromStr + PartialOrd + Display + Copy` so callers
+/// can use `i32`, `i64`, `u64`, etc. The `> zero` check uses
+/// `T::default()` which is 0 for all primitive integers.
+pub fn positive_env_or_default<T>(var: &str, default: T) -> T
+where
+    T: std::str::FromStr + std::fmt::Display + Default + PartialOrd + Copy,
+{
+    let parsed = env::var(var).ok().and_then(|v| v.parse::<T>().ok());
+    match parsed {
+        Some(n) if n > T::default() => n,
+        Some(n) => {
+            tracing::warn!(
+                target: "aegix_config",
+                event_kind = "env_nonpositive_substituted",
+                var = var,
+                configured = %n,
+                default = %default,
+                "{var}={n} is a misconfiguration (would produce destructive zero/negative behaviour); using default {default}"
+            );
+            default
+        }
+        None => default,
+    }
+}
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

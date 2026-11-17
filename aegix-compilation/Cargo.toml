@@ -1,0 +1,43 @@
+[package]
+name = "aegix-compilation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dirs-next = "2.0"
+handlebars.workspace = true
+hex.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+aegix-capability-world = { path = "../aegix-capability-world" }
+aegix-config = { path = "../aegix-config" }
+aegix-engine-events = { path = "../aegix-engine-events" }
+# The advisory-database age sampler publishes through the controller's registry
+# (a leaf: prometheus + aegix-workflow-liveness, no cycle back to here).
+aegix-metrics = { path = "../aegix-metrics" }
+# The static source lint both compile paths run; one home, shared with the
+# catalog gate and the authoring lane.
+aegix-module-source = { path = "../aegix-module-source" }
+aegix-text-util = { path = "../aegix-text-util" }
+aegix-wit-inspector = { path = "../aegix-wit-inspector" }
+aegix-workflow-engine-core = { path = "../aegix-workflow-engine-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "process", "time", "io-util", "fs"] }
+tracing.workspace = true
+uuid.workspace = true
+
+# `killpg(SIGKILL)` of a timed-out host-mode sandbox child's process group
+# (see `sandbox_run`); tokio exposes `process_group` but no group kill.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "aegix-secrets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+zeroize = { workspace = true, features = ["derive"] }
+dashmap.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+hmac.workspace = true
+sha2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
+# L-13 (2026-05-22): random slot-handle allocation. Defense-in-depth
+# against guest enumeration of adjacent slot IDs; see
+# `fresh_slot_handle` in `talos_vault.rs`.
+aegix-random = { path = "../aegix-random" }
+
+[dev-dependencies]
+# capture test over the real AuditingProvider log lines (check 91's behavioural half)
+tracing-subscriber = { workspace = true, features = ["default", "fmt"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,1476 @@
+//! WIT Component Inspector
+//!
+//! Inspects compiled WASM components to determine which Aegix capability world
+//! they were compiled against.  This drives two security properties:
+//!
+//! 1. **Upload validation** — reject a component that claims to be "minimal" but
+//!    imports trusted-only interfaces such as `secrets` or `files`.
+//! 2. **AI tool discovery** — tell an LLM exactly which host interfaces a node
+//!    uses so it can reason about what the node can and cannot do.
+//!
+//! ## Implementation strategy
+//!
+//! We scan the raw WASM bytes for the UTF-8 interface name strings that the
+//! Component Model linker records in the binary's import section.  This avoids
+//! any dependency on a specific version of `wit-component` or `wasmtime`'s
+//! reflection API, and works on any valid component produced by `cargo component`.
+
+use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// Capability world enum
+// ============================================================================
+
+/// The WIT capability world a component was compiled against.
+///
+/// Ordered from least to most privileged in a **partial order**:
+///
+/// ```text
+/// minimal-node
+///     └─ network-node
+///             ├─ secrets-node
+///             ├─ filesystem-node
+///             ├─ messaging-node
+///             ├─ cache-node
+///             └─ database-node
+///                     └─ automation-node (Trusted)
+/// ```
+///
+/// The four tier-3 sub-worlds (`Secrets`, `Filesystem`, `Messaging`, `Cache`)
+/// are **incomparable** with each other — `partial_cmp` returns `None` for
+/// any pair of distinct sub-worlds.
+///
+/// `Unknown` is **not** comparable to any named tier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityWorld {
+    /// Pure computation — logging, JSON, datetime, crypto, env only.
+    /// No outbound I/O; maximum isolation.
+    Minimal,
+    /// Outbound HTTP (via aegix:core/http), webhooks, GraphQL, email, state, templates.
+    /// No raw TCP/UDP sockets.
+    Http,
+    /// All Http capabilities PLUS raw TCP/UDP sockets (wasi:sockets). Adds outbound HTTP, webhooks, GraphQL, email, state, templates, and
+    /// data-transform.  Cannot access secrets, files, cache, messaging, or DB.
+    Network,
+    /// Network + read-only access to the secrets vault.
+    Secrets,
+    /// Network + sandboxed file I/O.
+    Filesystem,
+    /// Network + NATS pub/sub messaging.
+    Messaging,
+    /// Network + Redis distributed cache.
+    Cache,
+    /// Network + secrets + direct PostgreSQL access.
+    Database,
+    /// Network + human-in-the-loop approvals.
+    Governance,
+    /// Secrets + LLM + agent-memory + governance + agent-orchestration.
+    /// No filesystem, cache, messaging, database, or object-storage.
+    Agent,
+    /// Full platform capabilities — everything in `network-node` plus secrets,
+    /// files, Redis cache, NATS messaging, and database access.
+    Trusted,
+    /// Not an Aegix component, or uses an unrecognised set of imports.
+    Unknown,
+}
+
+#[allow(dead_code)]
+impl CapabilityWorld {
+    /// Canonical compile-time list of every named, compilable world the
+    /// worker recognises. Order is deliberately "ascending privilege" so
+    /// callers iterating for UX purposes produce stable, low-to-high output.
+    /// Deliberately omits `Unknown` — it is not a selectable world.
+    ///
+    /// Controller-side schema registration uses this via `all_strs()` to
+    /// publish JSON-Schema `"enum"` values for every tool that accepts a
+    /// capability world. Maintaining the list here means controller schemas
+    /// stay in lockstep with what the worker actually parses — no drift.
+    pub const ALL: &'static [Self] = &[
+        Self::Minimal,
+        Self::Http,
+        Self::Network,
+        Self::Secrets,
+        Self::Governance,
+        Self::Messaging,
+        Self::Filesystem,
+        Self::Cache,
+        Self::Database,
+        Self::Agent,
+        Self::Trusted,
+    ];
+
+    /// Can a module at this world run OUTSIDE the workflow engine — an
+    /// in-process rehearsal (`testModule`, `test_module`) or a replay?
+    /// `Governance` needs the engine's approval pipeline and audit trail;
+    /// `Unknown` is a binary the inspector could not classify. Neither runs
+    /// standalone (2026-11-09, `docs/engineering-log/packages/2026-11-09-testmodule-asks-the-ceiling.md`).
+    /// Exhaustive, so a new world is a decision here.
+    #[must_use]
+    pub const fn runs_outside_the_engine(&self) -> bool {
+        match self {
+            Self::Governance | Self::Unknown => false,
+            Self::Minimal
+            | Self::Http
+            | Self::Network
+            | Self::Secrets
+            | Self::Filesystem
+            | Self::Messaging
+            | Self::Cache
+            | Self::Database
+            | Self::Agent
+            | Self::Trusted => true,
+        }
+    }
+
+    /// Canonical short form ("minimal", "http", ...) shared with `FromStr`
+    /// and `Display`. Returns `"unknown"` for `Unknown` so the helper is
+    /// total — callers that want to reject `Unknown` should filter before
+    /// invoking.
+    ///
+    /// Paired with the suffixed-form consumer-facing aliases used by the
+    /// MCP schemas. [`Self::as_node_str`] returns the `-node`-suffixed form.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Http => "http",
+            Self::Network => "network",
+            Self::Secrets => "secrets",
+            Self::Filesystem => "filesystem",
+            Self::Messaging => "messaging",
+            Self::Cache => "cache",
+            Self::Database => "database",
+            Self::Governance => "governance",
+            Self::Agent => "agent",
+            Self::Trusted => "trusted",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Suffixed form used by MCP tool schemas and the CapabilityWorld
+    /// references in `aegix.wit` (e.g. `"minimal-node"`, `"agent-node"`).
+    /// For `Trusted`, returns `"automation-node"` — the public-facing name —
+    /// matching the `FromStr` alias.
+    pub const fn as_node_str(&self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal-node",
+            Self::Http => "http-node",
+            Self::Network => "network-node",
+            Self::Secrets => "secrets-node",
+            Self::Filesystem => "filesystem-node",
+            Self::Messaging => "messaging-node",
+            Self::Cache => "cache-node",
+            Self::Database => "database-node",
+            Self::Governance => "governance-node",
+            Self::Agent => "agent-node",
+            Self::Trusted => "automation-node",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// All compilable capability worlds in `-node` form, in the order of
+    /// [`Self::ALL`]. This is the slice controller MCP schemas should use
+    /// to publish JSON-Schema `"enum"` values.
+    ///
+    /// Returns a static slice — no allocation.
+    pub fn all_strs() -> &'static [&'static str] {
+        // Built once, reused forever. Order mirrors ALL.
+        static ALL_STRS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        ALL_STRS
+            .get_or_init(|| {
+                CapabilityWorld::ALL
+                    .iter()
+                    .map(|w| w.as_node_str())
+                    .collect()
+            })
+            .as_slice()
+    }
+
+    /// Approximate numeric privilege level for display/logging purposes.
+    ///
+    /// NOTE: This is NOT used for ordering — `PartialOrd` is derived from
+    /// `is_subset_of` which correctly handles the branching lattice.
+    ///
+    /// Returns `None` for `Unknown` (incomparable to everything).
+    ///
+    /// Level mapping:
+    ///   Minimal=0, Http=1, Network=2, tier-3 sub-worlds=3, tier-4 (Database|Agent)=4, Trusted=5
+    fn level(&self) -> Option<u8> {
+        match self {
+            Self::Minimal => Some(0),
+            Self::Http => Some(1),
+            Self::Network => Some(2),
+            // Tier-3 sub-worlds share level 3 but are incomparable with each other.
+            Self::Secrets | Self::Filesystem | Self::Messaging | Self::Cache | Self::Governance => {
+                Some(3)
+            }
+            // Tier-4: Database and Agent are incomparable with each other.
+            Self::Database | Self::Agent => Some(4),
+            Self::Trusted => Some(5),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Returns `true` if this world's capability set is a subset of `other`'s.
+    ///
+    /// Used by `validate_capability_level` to check that a component's detected
+    /// world does not exceed its declared world.  This replaces a simple `>`
+    /// comparison with the correct partial-order semantics:
+    ///
+    /// - Any world is a subset of itself.
+    /// - `Minimal` ⊆ everything.
+    /// - `Network` ⊆ `Secrets | Filesystem | Messaging | Cache | Database | Trusted`.
+    /// - `Secrets` ⊆ `Database | Agent | Trusted`.
+    /// - `Governance` ⊆ `Agent | Trusted`.
+    /// - `Filesystem | Messaging | Cache` ⊆ `Trusted` only.
+    /// - `Database` ⊆ `Trusted` only.
+    /// - `Agent` ⊆ `Trusted` only.
+    /// - `Database` and `Agent` are incomparable (neither is a subset of the other).
+    /// - `Trusted` is only a subset of itself.
+    /// - `Unknown` is not a subset of anything (invalid component).
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        if matches!(self, Self::Unknown) || matches!(other, Self::Unknown) {
+            return false;
+        }
+        if self == other {
+            return true;
+        }
+        match (self, other) {
+            (Self::Minimal, _) => true,
+            (
+                Self::Http,
+                Self::Network
+                | Self::Secrets
+                | Self::Filesystem
+                | Self::Messaging
+                | Self::Cache
+                | Self::Database
+                | Self::Agent
+                | Self::Trusted,
+            ) => true,
+            (Self::Http, _) => false,
+            (
+                Self::Network,
+                Self::Secrets
+                | Self::Filesystem
+                | Self::Messaging
+                | Self::Cache
+                | Self::Database
+                | Self::Agent
+                | Self::Trusted,
+            ) => true,
+            (Self::Network, _) => false,
+            // Secrets can escalate to Database, Agent, or Trusted.
+            (Self::Secrets, Self::Database | Self::Agent | Self::Trusted) => true,
+            (Self::Secrets, _) => false,
+            (Self::Filesystem, Self::Trusted) => true,
+            (Self::Filesystem, _) => false,
+            (Self::Messaging, Self::Trusted) => true,
+            (Self::Messaging, _) => false,
+            (Self::Cache, Self::Trusted) => true,
+            (Self::Cache, _) => false,
+            // Governance can escalate to Agent or Trusted.
+            (Self::Governance, Self::Agent | Self::Trusted) => true,
+            (Self::Governance, _) => false,
+            // Database and Agent can only escalate to Trusted (incomparable with each other).
+            (Self::Database, Self::Trusted) => true,
+            (Self::Database, _) => false,
+            (Self::Agent, Self::Trusted) => true,
+            (Self::Agent, _) => false,
+            (Self::Trusted, _) => false,
+            (Self::Unknown, _) => unreachable!("Unknown filtered by guard above"),
+        }
+    }
+}
+
+/// Partial order derived from `is_subset_of` to guarantee consistency.
+///
+/// `a <= b` iff `a.is_subset_of(b)`. This correctly handles the branching
+/// lattice structure where worlds in different branches (e.g., Filesystem vs
+/// Database, Http vs Governance) are incomparable even though they have
+/// different numeric levels.
+impl PartialOrd for CapabilityWorld {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let a_sub_b = self.is_subset_of(other);
+        let b_sub_a = other.is_subset_of(self);
+        match (a_sub_b, b_sub_a) {
+            (true, true) => Some(std::cmp::Ordering::Equal),
+            (true, false) => Some(std::cmp::Ordering::Less),
+            (false, true) => Some(std::cmp::Ordering::Greater),
+            (false, false) => None, // incomparable
+        }
+    }
+}
+
+impl std::fmt::Display for CapabilityWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Minimal => write!(f, "minimal"),
+            Self::Http => write!(f, "http"),
+            Self::Network => write!(f, "network"),
+            Self::Secrets => write!(f, "secrets"),
+            Self::Filesystem => write!(f, "filesystem"),
+            Self::Messaging => write!(f, "messaging"),
+            Self::Cache => write!(f, "cache"),
+            Self::Database => write!(f, "database"),
+            Self::Governance => write!(f, "governance"),
+            Self::Agent => write!(f, "agent"),
+            Self::Trusted => write!(f, "trusted"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl std::str::FromStr for CapabilityWorld {
+    type Err = String;
+
+    /// Parse a capability-world string — accepts both the short form
+    /// (`"minimal"`) and the `-node`-suffixed form (`"minimal-node"`).
+    ///
+    /// Unknown strings return [`Self::Unknown`] (the parser is total) so
+    /// callers can still round-trip arbitrary user input. Validation
+    /// (rejecting `Unknown`) happens at higher layers that know the set of
+    /// acceptable worlds for a given context.
+    ///
+    /// `llm-node` is **intentionally NOT recognised here.** It is an
+    /// actor-ceiling privilege-tier label only — native LLM bindings do
+    /// not compile to a distinct WIT world in `aegix.wit`. If you receive
+    /// `"llm-node"` from the actor layer, do NOT pass it to the
+    /// compiler/worker; it is used exclusively by `create_actor` and
+    /// `grant_capability_ceiling` for RBAC rank comparison. Any attempt
+    /// to parse it here would silently map to `Unknown` — that is the
+    /// correct, safe behaviour but callers should filter it upstream
+    /// rather than depend on falling through.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "minimal" | "minimal-node" => Ok(Self::Minimal),
+            "http" | "http-node" => Ok(Self::Http),
+            "network" | "network-node" => Ok(Self::Network),
+            "secrets" | "secrets-node" => Ok(Self::Secrets),
+            "filesystem" | "filesystem-node" => Ok(Self::Filesystem),
+            "messaging" | "messaging-node" => Ok(Self::Messaging),
+            "cache" | "cache-node" => Ok(Self::Cache),
+            "database" | "database-node" => Ok(Self::Database),
+            "governance" | "governance-node" => Ok(Self::Governance),
+            "agent" | "agent-node" => Ok(Self::Agent),
+            // automation-node is the highest-privilege sandbox world (alias for Trusted)
+            "trusted" | "trusted-node" | "automation-node" => Ok(Self::Trusted),
+            _ => Ok(Self::Unknown),
+        }
+    }
+}
+
+// ============================================================================
+// World rank (privilege level — lower = less privileged)
+// ============================================================================
+
+/// Rank a WIT world string by privilege level.
+///
+/// Ranks mirror the Aegix WIT world hierarchy (aegix.wit). Tier 3 siblings
+/// (secrets/filesystem/messaging/cache/governance) share the same tier but
+/// occupy distinct ranks so that higher-ceiling agents can use lower-ranked
+/// siblings (a conservative but safe approximation of the DAG-based
+/// hierarchy).
+///
+/// `Unknown` worlds map to the most privileged rank (7) — the safest
+/// default, since refusing the call is preferable to silently allowing
+/// it. Callers that want a different default should match on the input
+/// before delegating.
+///
+/// `*-node` suffixes (`http-node`, `messaging-node`, etc.) are stripped
+/// before lookup so worker-side capability worlds and controller-side
+/// dispatch worlds rank identically.
+#[must_use]
+pub fn world_rank(world: &str) -> u8 {
+    match world.trim_end_matches("-node") {
+        "minimal" => 0,
+        "http" => 1,
+        "llm" => 2,                    // Tier 2b: http + native LLM bindings (no vault)
+        "network" => 2,                // Tier 2: raw sockets (same rank as llm)
+        "secrets" => 3,                // Tier 3a: network + secrets vault
+        "governance" => 3,             // Tier 3e: network + human approvals (same tier)
+        "messaging" => 4,              // Tier 3c: network + NATS pub/sub
+        "filesystem" => 4,             // Tier 3b: network + file I/O (same tier as messaging)
+        "cache" => 5,                  // Tier 3d: network + Redis cache
+        "database" => 6,               // Tier 4a: network + secrets + SQL
+        "agent" => 6,                  // Tier 4b: secrets + memory + governance + orchestration
+        "automation" | "trusted" => 7, // Tier 5:  all interfaces
+        _ => 7, // Unknown → most privileged (safest default: won't silently allow)
+    }
+}
+
+// ============================================================================
+// Capability-ceiling gate (partial-order lattice — the CORRECT semantics)
+// ============================================================================
+
+/// Map a capability-world string to its position in the [`CapabilityWorld`]
+/// lattice for ceiling comparison. Accepts both the short (`"secrets"`) and
+/// `-node`-suffixed (`"secrets-node"`) forms.
+///
+/// `llm-node` is an actor-ceiling-only privilege tier with **no distinct WIT
+/// world** — its capabilities are `http` + native LLM bindings (vault access
+/// is gated separately by `max_llm_tier`, never by the capability world). For
+/// lattice comparison it therefore maps to [`CapabilityWorld::Http`]: an
+/// `llm-node` ceiling permits exactly the modules an `http-node` ceiling does
+/// (it does NOT grant raw sockets / `network`, secrets, files, cache, etc.).
+///
+/// Returns `None` for any unrecognised string (including `Unknown`) so callers
+/// fail closed.
+fn lattice_world(world: &str) -> Option<CapabilityWorld> {
+    if world_short(world) == "llm" {
+        return Some(CapabilityWorld::Http);
+    }
+    // `FromStr` accepts both the short and `-node` forms for every world
+    // EXCEPT the `automation`/`trusted` alias group, where bare `automation`
+    // is not recognised (only `automation-node` / `trusted` / `trusted-node`).
+    // Try the string as given, then its `-node` form, so every spelling
+    // (`secrets`, `secrets-node`, `automation`, `automation-node`) resolves.
+    let parse = |s: &str| match s.parse::<CapabilityWorld>() {
+        Ok(CapabilityWorld::Unknown) | Err(_) => None,
+        Ok(w) => Some(w),
+    };
+    parse(world).or_else(|| parse(&format!("{}-node", world_short(world))))
+}
+
+/// Returns `true` iff a principal or module requiring `requested` capabilities
+/// is permitted to run under a `ceiling` capability world, using the
+/// **partial-order lattice** ([`CapabilityWorld::is_subset_of`]) rather than a
+/// linear rank.
+///
+/// This is the canonical actor/user capability-ceiling gate. It replaces the
+/// legacy `world_rank(requested) <= world_rank(ceiling)` comparison, which was
+/// unsound for lattice-INCOMPARABLE siblings: e.g. a `cache-node` ceiling
+/// (rank 5) wrongly admitted a `secrets-node` module (rank 3) even though
+/// `Secrets ⊄ Cache`, letting a vault-denied actor resolve real secrets at
+/// runtime (the worker enforces only the *module's* own world, never the
+/// actor's ceiling, so the ceiling gate is the only barrier).
+///
+/// `is_subset_of` strictly subsumes the old rank gate: every subset edge in
+/// the lattice has `world_rank(sub) <= world_rank(super)`, so `req_rank >
+/// max_rank` implies `!is_subset_of` — the lattice check rejects a superset of
+/// what the rank check rejected, and never loses a legitimate escalation path
+/// (`Minimal`/`Http`/`Network` → anything, `Secrets` → `Database`/`Agent`/
+/// `Trusted`, `Governance` → `Agent`/`Trusted`).
+///
+/// Fail-closed: if either side is unrecognised (malformed / legacy actor row,
+/// typo'd module world), returns `false`.
+#[must_use]
+pub fn ceiling_permits(ceiling: &str, requested: &str) -> bool {
+    match (lattice_world(ceiling), lattice_world(requested)) {
+        (Some(c), Some(r)) => r.is_subset_of(&c),
+        _ => false,
+    }
+}
+
+/// True if `world` names a recognised capability world (short `secrets` or
+/// `-node`-suffixed `secrets-node` form). Lets callers distinguish "unknown
+/// world" from "known-but-incompatible" for clear error messages, while still
+/// routing the actual compatibility decision through [`ceiling_permits`]
+/// (the lattice) rather than a local linear rank.
+#[must_use]
+pub fn is_lattice_world(world: &str) -> bool {
+    lattice_world(world).is_some()
+}
+
+// ============================================================================
+// Capability-world enumeration helpers (extracted from
+// controller/src/mcp/capability_worlds.rs)
+// ============================================================================
+
+/// Compilable capability worlds — mirror of [`CapabilityWorld::all_strs`].
+/// Consumers should prefer [`compilable_worlds_csv`] / this slice over
+/// hand-written literals.
+pub fn compilable_worlds() -> &'static [&'static str] {
+    CapabilityWorld::all_strs()
+}
+
+/// Capability worlds valid for an actor's `max_capability_world` ceiling.
+///
+/// Superset of [`compilable_worlds`] — adds `llm-node`, an actor-level
+/// privilege tier with native LLM bindings but no vault access.
+/// `llm-node` is NOT a compilable world: do not pass it to
+/// compile/run/lint tools.
+pub const ACTOR_CEILING_WORLDS: &[&str] = &[
+    "minimal-node",
+    "http-node",
+    "llm-node",
+    "network-node",
+    "secrets-node",
+    "governance-node",
+    "messaging-node",
+    "filesystem-node",
+    "cache-node",
+    "database-node",
+    "agent-node",
+    "automation-node",
+];
+
+/// CSV rendering of [`compilable_worlds`].
+pub fn compilable_worlds_csv() -> String {
+    compilable_worlds().join(", ")
+}
+
+/// The actor-ceiling worlds a `ceiling` permits, in [`ACTOR_CEILING_WORLDS`]
+/// order — the lattice rendered as a list, so a UI never re-derives it.
+///
+/// The ceilings are a partial order, not a ladder: a `database-node` ceiling
+/// does not cover `governance-node`, and an `llm-node` ceiling covers only
+/// `minimal-node` / `http-node` / `llm-node`. A client that orders the list
+/// and compares positions offers worlds this function (and every backend
+/// gate, which is [`ceiling_permits`]) refuses. An unrecognised ceiling
+/// permits nothing.
+#[must_use]
+pub fn permitted_ceiling_worlds(ceiling: &str) -> Vec<&'static str> {
+    ACTOR_CEILING_WORLDS
+        .iter()
+        .copied()
+        .filter(|world| ceiling_permits(ceiling, world))
+        .collect()
+}
+
+/// The ceiling a user holds when they have NO `user_capability_grants` row.
+/// Removing a grant puts its holder here.
+pub const DEFAULT_USER_CEILING: &str = "http-node";
+
+/// True when withdrawing a grant of `world` would WIDEN its holder's ceiling:
+/// the default they fall back to permits something `world` did not.
+///
+/// `minimal-node` is below the default, and `governance-node` is incomparable
+/// with it (a governance ceiling has no HTTP), so removing either one grants
+/// something. Every other ceiling already permits `http-node`, so removing it
+/// narrows the holder or leaves them where they were. An unrecognised world
+/// reads as widening, the refusing answer.
+#[must_use]
+pub fn withdrawing_grant_widens(world: &str) -> bool {
+    !ceiling_permits(world, DEFAULT_USER_CEILING)
+}
+
+/// The capabilities of an MCP agent role that a user's `ceiling` does not
+/// permit (security review 2026-10-14, G-3). A role names worlds (short or
+/// `-node` form); `*` and `admin` stand for every world. An unrecognised name
+/// is returned too, the refusing answer. Empty = the role fits the ceiling.
+#[must_use]
+pub fn role_capabilities_above<'a>(ceiling: &str, capabilities: &'a [String]) -> Vec<&'a str> {
+    capabilities
+        .iter()
+        .map(String::as_str)
+        .filter(|cap| {
+            let world = match *cap {
+                "*" | "admin" => "trusted-node",
+                other => other,
+            };
+            !ceiling_permits(ceiling, world)
+        })
+        .collect()
+}
+
+/// What the caller asking to change a security bound has proved
+/// (security review 2026-10-14, G-4 / G-5 / A-2).
+///
+/// A bound — a user's capability ceiling, an actor's LLM tier, egress scope or
+/// write ceiling, a module's secret or host grant — may be TIGHTENED by
+/// either. It is LOOSENED only by a session that verified a second factor: a
+/// bearer credential (an MCP agent token, an API key) is long-lived and can be
+/// held by a prompt-injected agent, which is why a cross-user grant and every
+/// secret write were already refused over MCP. The writer that holds the row
+/// lock decides, from the value it replaces; a handler names who is asking
+/// and does not classify the change itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeAuthority {
+    /// A browser session whose second factor was verified
+    /// (`require_second_factor` on the GraphQL mutation).
+    SecondFactorSession,
+    /// An MCP agent token or an API key.
+    BearerCredential,
+}
+
+impl ChangeAuthority {
+    /// Whether this caller may loosen a bound.
+    #[must_use]
+    pub fn may_loosen(self) -> bool {
+        matches!(self, Self::SecondFactorSession)
+    }
+}
+
+/// Whether a module grant list (`allowed_secrets` or `allowed_hosts`) is one
+/// a bearer credential may write: it names no `*`, the entry that grants
+/// every stored secret or every host (security review 2026-10-14, A-2 /
+/// G-23). A `*` HOST grant is written only with
+/// [`ChangeAuthority::SecondFactorSession`]; a `*` SECRET grant by nobody
+/// (D2-D, [`SECRET_WILDCARD_RETIRED`]).
+#[must_use]
+pub fn grant_list_has_wildcard(entries: &[String]) -> bool {
+    entries.iter().any(|e| e.trim() == "*")
+}
+
+/// Whether an `allowed_secrets` list names a WILDCARD: `*` (every stored
+/// secret) or a `<prefix>/*` glob (every secret under a namespace, stated as
+/// such). A bearer credential writes neither (security review 2026-10-15,
+/// A2-3: the marketplace install already refused `/*` from another
+/// publisher, `update_module_secrets` did not — two surfaces, two rules).
+///
+/// A bare entry (`oauth/gmail`) is not refused, although
+/// `vault_path_permitted` matches it as a prefix too: so does every exact path
+/// (`a/b` permits `a/b/c`), so the two cannot be told apart by their text, and
+/// a bare OAuth namespace beside a `vault://` reference in node config is the
+/// platform's documented grant for every OAuth module. The per-path rule
+/// (only a path a secret is stored at) is the one recorded as not built.
+#[must_use]
+pub fn secret_grant_list_has_wildcard(entries: &[String]) -> bool {
+    entries.iter().any(|e| {
+        let e = e.trim();
+        e == "*" || e.ends_with("/*")
+    })
+}
+
+/// THE grant rule for every writer of a module's `allowed_secrets` /
+/// `allowed_hosts` that an MCP token or API key can reach (security review
+/// 2026-10-15, A2-1): a caller that may not loosen writes no wildcard
+/// ([`secret_grant_list_has_wildcard`], [`grant_list_has_wildcard`]); a
+/// second-factor session may. `Err` is the sentence to answer with.
+pub fn refuse_wildcard_grant(
+    authority: ChangeAuthority,
+    allowed_secrets: &[String],
+    allowed_hosts: &[String],
+) -> Result<(), &'static str> {
+    // A bare `*` secret grant is refused for EVERY authority (operator
+    // decision D2-D, 2026-10-15): it delivered every secret the user can read,
+    // every OAuth access token included, into each dispatch's envelope.
+    if allowed_secrets.iter().any(|e| e.trim() == "*") {
+        return Err(SECRET_WILDCARD_RETIRED);
+    }
+    if authority.may_loosen()
+        || !(secret_grant_list_has_wildcard(allowed_secrets)
+            || grant_list_has_wildcard(allowed_hosts))
+    {
+        return Ok(());
+    }
+    Err(WILDCARD_GRANT_NEEDS_SECOND_FACTOR)
+}
+
+/// The sentence a `*` secret grant answers with, whoever writes it.
+pub const SECRET_WILDCARD_RETIRED: &str =
+    "A '*' secret grant (every stored secret) is not accepted from anyone: name the exact \
+     paths the module reads, or a '<prefix>/*' grant from a session verified with \
+     two-factor authentication.";
+
+/// The sentence a refused wildcard grant answers with.
+pub const WILDCARD_GRANT_NEEDS_SECOND_FACTOR: &str =
+    "A '*' host grant (every host) or a '<prefix>/*' secret grant needs a session verified \
+     with two-factor authentication; an MCP agent token or an API key may only name exact \
+     paths and hosts.";
+
+/// The one sentence a refused loosening answers with, on every surface.
+pub const LOOSENING_NEEDS_SECOND_FACTOR: &str =
+    "This change loosens a security bound, which needs a session verified with two-factor \
+     authentication; an MCP agent token or an API key may only tighten it. Make the change \
+     signed in to the dashboard (GraphQL), or ask a platform admin to.";
+
+/// CSV rendering of [`ACTOR_CEILING_WORLDS`].
+pub fn actor_ceiling_worlds_csv() -> String {
+    ACTOR_CEILING_WORLDS.join(", ")
+}
+
+/// True if `s` is a recognised compilable world.
+pub fn is_compilable_world(s: &str) -> bool {
+    compilable_worlds().contains(&s)
+}
+
+/// True if `s` is a recognised actor-ceiling world.
+pub fn is_actor_ceiling_world(s: &str) -> bool {
+    ACTOR_CEILING_WORLDS.contains(&s)
+}
+
+/// MCP-461: actor-side strict rank lookup.
+///
+/// `world_rank` returns 7 (most-privileged) for unknown world strings.
+/// That's the right fail-closed default for MODULE worlds (an unknown
+/// new world is treated as needing the highest ceiling), but it's the
+/// WRONG default for ACTOR `max_capability_world` values — a malformed
+/// or legacy actor row would silently inherit a tier-7 ceiling and
+/// every module would pass the ceiling check.
+///
+/// Callers that gate "actor can use module X" must use this strict
+/// variant for the actor side: it returns `None` when the actor's
+/// `max_capability_world` is not in [`ACTOR_CEILING_WORLDS`], so the
+/// authorization can reject with a clear "actor ceiling unrecognised"
+/// rather than silently grant tier-7. Caller must wire the `None`
+/// case to a rejection, not a fall-back rank.
+#[must_use]
+pub fn actor_world_rank_strict(world: &str) -> Option<u8> {
+    if !is_actor_ceiling_world(world) {
+        return None;
+    }
+    Some(world_rank(world))
+}
+
+/// Strip the trailing `-node` suffix from a capability-world string,
+/// returning the short canonical form. Idempotent — values that don't
+/// end in `-node` (already-short) are returned unchanged.
+///
+/// Many handlers + repos normalize via `world.trim_end_matches("-node")`
+/// inline; this helper centralizes the suffix rule so a future rename
+/// changes one site.
+#[must_use]
+pub fn world_short(world: &str) -> &str {
+    world.trim_end_matches("-node")
+}
+
+/// Worlds that import the `secrets::*` interface (or higher tiers
+/// that supersede it). The worker enforces this at runtime — any
+/// module whose declared world isn't in this set has its
+/// `secrets::*` calls refused with `Forbidden`.
+///
+/// Mirrored from worker/src/host_impl.rs (around line 1374).
+pub fn world_allows_secrets(world: &str) -> bool {
+    matches!(
+        world_short(world),
+        "secrets" | "database" | "agent" | "trusted" | "automation"
+    )
+}
+
+/// Worlds from which a module can reach a vault secret WITHOUT importing the
+/// `secrets` interface — the HOST-side `vault://` substitution route.
+///
+/// There are two ways a secret reaches a module and they need different
+/// capabilities:
+///
+///   * the GUEST route — the module calls `secrets::get_secret()` itself, which
+///     needs the `secrets` interface ([`world_allows_secrets`]);
+///   * the HOST route — the module puts a `vault://<path>` marker in an
+///     outbound request's headers or JSON body and the HOST resolves it at the
+///     socket (`resolve_vault_placed`), so the plaintext never enters the
+///     guest's address space at all.
+///
+/// The host route is the SAFER of the two and is what every OAuth integration
+/// on this platform uses, so a diagnostic that only knows about the guest route
+/// reports `would_succeed: false` for modules that demonstrably work — and, far
+/// worse, advises recompiling to a HIGHER capability world to fix it. Measured
+/// 2026-09-24: all 38 live nodes carrying a `vault://` config reference are
+/// `http-node`, so that advice would have widened 14 modules' privilege and
+/// fixed nothing.
+///
+/// Every lattice world except `minimal` imports `http` / `webhook` / `graphql`,
+/// which are the interfaces that perform substitution — derived from
+/// `wit/aegix.wit` and PINNED against it by
+/// `the_substitution_predicate_matches_the_wit`, so adding a world to the
+/// lattice cannot silently drift this. A world outside the lattice is NOT
+/// claimed to have the route: an unknown world is unknown, and for a diagnostic
+/// the conservative direction is to claim nothing.
+#[must_use]
+pub fn world_allows_vault_substitution(world: &str) -> bool {
+    is_lattice_world(world) && world_short(world) != "minimal"
+}
+
+/// Worlds whose nodes exist primarily to EGRESS / SEND (make outbound network
+/// calls or publish output) and therefore have NO reason to receive the
+/// injected `__actor_context__` memory view by default.
+///
+/// # Why this exists (security)
+///
+/// Grounding-by-default injects a per-actor memory view into every node that
+/// declares `needs_memory` — which DEFAULTS to `true` for backward
+/// compatibility. Combined with the `egress_scope` split (a `tier1` actor may
+/// now be `egress=public` to reach e.g. Gmail while keeping its LLM local), a
+/// default-injected memory view can reach the "send" leg of a workflow and
+/// egress to a declared host. That defeats the `docs/delivery-node-pattern.md`
+/// split (compose-with-memory node → send-with-network-NO-memory node).
+///
+/// So for these pure-egress/send worlds the injection default flips to `false`:
+/// a node in one of them receives `__actor_context__` ONLY when its config sets
+/// `needs_memory: true` EXPLICITLY. Higher worlds that legitimately REASON over
+/// memory — `agent` / `trusted` / `automation` (the "compose" leg) — are
+/// deliberately NOT here: they keep the default-`true` behaviour and rely on the
+/// author's compose/send split for egress isolation. Non-egress worlds
+/// (`minimal` / `secrets` / `cache` / `database` / `filesystem` / `governance`)
+/// also stay default-`true` — flipping them would change behaviour without
+/// closing an exfil path.
+///
+/// This is a DEFAULT only; an explicit `needs_memory` in node config always wins
+/// (the engine composes this with
+/// `aegix_workflow_engine_core::reserved_keys::explicit_needs_memory` at the
+/// injection sites — see `ParallelWorkflowEngine::node_needs_memory_for_world`).
+#[must_use]
+pub fn world_defaults_no_memory(world: &str) -> bool {
+    matches!(world_short(world), "http" | "network" | "messaging")
+}
+
+// ============================================================================
+// Write-ceiling mutation profile
+// ============================================================================
+
+/// The HTTP suite of write-ceiling-gated ops every world above `Minimal`
+/// imports (`http`, `webhook`, `graphql`, `email` in `wit/aegix.wit`).
+/// `http-fetch`/`http-fetch-all` are gated for MUTATING methods only
+/// (POST/PUT/PATCH/DELETE); GET passes — the write ceiling is a mutation
+/// control, not an egress control (see `AEGIX_WRITE_CEILING_STRICT_EGRESS`
+/// for the read-side hardening knob).
+const HTTP_SUITE_OPS: &[&str] = &[
+    "http-fetch",
+    "http-fetch-all",
+    "webhook-send",
+    "graphql-execute",
+    "email-send",
+];
+
+const MESSAGING_OPS: &[&str] = &["messaging-publish", "messaging-request"];
+const DATABASE_OPS: &[&str] = &["database-query"];
+const AGENT_MEMORY_OPS: &[&str] = &[
+    "agent-memory-set",
+    "agent-memory-delete",
+    "agent-memory-store-with-embedding",
+];
+const INTEGRATION_STATE_OPS: &[&str] = &["integration-state-set", "integration-state-delete"];
+const OBJECT_STORAGE_OPS: &[&str] = &["object-storage-put", "object-storage-delete"];
+
+/// Write-ceiling MUTATION PROFILE: the data-mutating host operations a
+/// module compiled for this world can reach. Labels are the EXACT `op`
+/// strings the worker audits via `AegixContext::write_ceiling_refuses`
+/// (`wasi:capability_denied` rows with `policy = "write-ceiling"`), so an
+/// operator can correlate each profile entry to audit events one-to-one.
+///
+/// Derived from the `wit/aegix.wit` world imports (verified 2026-07-10):
+/// every world above Minimal imports the HTTP suite; Messaging adds NATS
+/// publish/request; Database adds SQL + agent-memory; Agent adds
+/// agent-memory + integration-state; Trusted (automation-node) has all of
+/// the above plus object-storage. NOT in any profile because the worker
+/// deliberately does not ceiling-gate them: `http-stream` (read channel),
+/// Redis `cache` (ephemeral), sandboxed `files` writes (module-local
+/// scratch), and execution `state` (engine-internal durability).
+///
+/// SCOPE (#750): this is a profile of HOST OPS. It says nothing about what a
+/// module can do by RETURNING a value — the `__memory_write__` envelope
+/// reaches `actor_memory` through the controller's node-completion hook with
+/// no host call and no capability, so `Minimal`'s EMPTY profile must not be
+/// read as "this module cannot mutate anything". That route is gated by the
+/// same ceiling controller-side (`aegix_workflow_engine::write_ceiling_gate`)
+/// and audits under the same `agent-memory-set` / `write-ceiling` labels.
+///
+/// `Unknown` returns the FULL Trusted profile — fail-closed presentation:
+/// a world the inspector can't classify must be assumed capable of
+/// everything when an operator reviews it.
+pub fn write_gated_ops(world: &CapabilityWorld) -> Vec<&'static str> {
+    // Exhaustive match: a NEW world variant is a compile error here,
+    // forcing an explicit mutation-profile decision (same pattern as the
+    // worker's fs-preopen policy).
+    let extra: &[&[&str]] = match world {
+        CapabilityWorld::Minimal => return Vec::new(),
+        CapabilityWorld::Http
+        | CapabilityWorld::Network
+        | CapabilityWorld::Secrets
+        | CapabilityWorld::Governance
+        | CapabilityWorld::Cache
+        | CapabilityWorld::Filesystem => &[],
+        CapabilityWorld::Messaging => &[MESSAGING_OPS],
+        CapabilityWorld::Database => &[DATABASE_OPS, AGENT_MEMORY_OPS],
+        CapabilityWorld::Agent => &[AGENT_MEMORY_OPS, INTEGRATION_STATE_OPS],
+        CapabilityWorld::Trusted | CapabilityWorld::Unknown => &[
+            MESSAGING_OPS,
+            DATABASE_OPS,
+            AGENT_MEMORY_OPS,
+            INTEGRATION_STATE_OPS,
+            OBJECT_STORAGE_OPS,
+        ],
+    };
+    let mut ops: Vec<&'static str> = HTTP_SUITE_OPS.to_vec();
+    for group in extra {
+        ops.extend_from_slice(group);
+    }
+    ops
+}
+
+/// String-form convenience for handler code that holds the world as text
+/// (module rows store `capability_world` as a string). Unparseable input
+/// maps to `Unknown` → the fail-closed full profile.
+pub fn write_gated_ops_str(world: &str) -> Vec<&'static str> {
+    let parsed = world
+        .parse::<CapabilityWorld>()
+        .unwrap_or(CapabilityWorld::Unknown);
+    write_gated_ops(&parsed)
+}
+
+/// How the world a compiled binary IMPORTS relates to the world its source
+/// DECLARED. The verdict is decided by `aegix_compilation`'s
+/// `declaration_verdict` on the binary's IMPORT SET against the declared
+/// world's WIT imports (`aegix_wit_inspector::imports_outside_world`), not by
+/// comparing two classified worlds: `agent-node` and `database-node` are
+/// incomparable, and a binary can fit both (2026-10-16). The world-to-world
+/// classifier that lived here was deleted with that change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldDeclaration {
+    /// The same world, in either spelling (`agent` / `agent-node`).
+    Matches,
+    /// The binary needs strictly less than the source declared. Benign; the
+    /// declaration could be tightened.
+    OverDeclared,
+    /// The binary needs something the declaration does not grant, or either
+    /// side is `Unknown`. Fails closed.
+    Escalation,
+}
+
+#[cfg(test)]
+mod mutation_profile_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn minimal_mutates_nothing() {
+        assert!(write_gated_ops(&CapabilityWorld::Minimal).is_empty());
+    }
+
+    #[test]
+    fn unknown_is_fail_closed_to_the_full_profile() {
+        assert_eq!(
+            write_gated_ops(&CapabilityWorld::Unknown),
+            write_gated_ops(&CapabilityWorld::Trusted)
+        );
+        // Unparseable strings take the same fail-closed path.
+        assert_eq!(
+            write_gated_ops_str("not-a-world"),
+            write_gated_ops(&CapabilityWorld::Trusted)
+        );
+    }
+
+    #[test]
+    fn profile_is_monotone_with_the_capability_lattice() {
+        // If world A's imports are a subset of world B's, A's mutation
+        // profile must be a subset of B's — otherwise the profile claims
+        // a capability the lattice says A doesn't have (or hides one).
+        for a in CapabilityWorld::ALL {
+            for b in CapabilityWorld::ALL {
+                if a.is_subset_of(b) {
+                    let ops_a: HashSet<_> = write_gated_ops(a).into_iter().collect();
+                    let ops_b: HashSet<_> = write_gated_ops(b).into_iter().collect();
+                    assert!(
+                        ops_a.is_subset(&ops_b),
+                        "{} ⊆ {} in the lattice, but its mutation profile is not a subset",
+                        a.as_str(),
+                        b.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn str_form_accepts_short_and_node_spellings() {
+        assert_eq!(
+            write_gated_ops_str("agent-node"),
+            write_gated_ops(&CapabilityWorld::Agent)
+        );
+        assert_eq!(
+            write_gated_ops_str("agent"),
+            write_gated_ops(&CapabilityWorld::Agent)
+        );
+        assert_eq!(
+            write_gated_ops_str("automation-node"),
+            write_gated_ops(&CapabilityWorld::Trusted)
+        );
+    }
+
+    #[test]
+    fn every_profile_op_is_a_known_worker_audit_label() {
+        // The full label universe — must stay in lockstep with the worker's
+        // write_ceiling_refuses call sites (op strings are the audit key).
+        let known: HashSet<&str> = [
+            "http-fetch",
+            "http-fetch-all",
+            "webhook-send",
+            "graphql-execute",
+            "email-send",
+            "messaging-publish",
+            "messaging-request",
+            "database-query",
+            "agent-memory-set",
+            "agent-memory-delete",
+            "agent-memory-store-with-embedding",
+            "integration-state-set",
+            "integration-state-delete",
+            "object-storage-put",
+            "object-storage-delete",
+        ]
+        .into_iter()
+        .collect();
+        for w in CapabilityWorld::ALL {
+            for op in write_gated_ops(w) {
+                assert!(
+                    known.contains(op),
+                    "unknown op label {op} in {}",
+                    w.as_str()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn compilable_is_subset_of_actor_ceiling() {
+        for w in compilable_worlds() {
+            assert!(
+                ACTOR_CEILING_WORLDS.contains(w),
+                "compilable world {w} missing from actor ceiling list"
+            );
+        }
+    }
+
+    #[test]
+    fn actor_ceiling_extras_are_documented() {
+        let extras: Vec<&&str> = ACTOR_CEILING_WORLDS
+            .iter()
+            .filter(|w| !compilable_worlds().contains(w))
+            .collect();
+        assert_eq!(
+            extras,
+            vec![&"llm-node"],
+            "actor-ceiling-only worlds changed — update the docs in aegix-capability-world"
+        );
+    }
+
+    #[test]
+    fn csv_helpers_match_slice_order() {
+        assert!(compilable_worlds_csv().starts_with("minimal-node, "));
+        assert!(compilable_worlds_csv().ends_with(", automation-node"));
+        assert!(actor_ceiling_worlds_csv().contains("llm-node"));
+    }
+
+    // -- world_short --
+
+    #[test]
+    fn world_short_strips_node_suffix() {
+        assert_eq!(world_short("secrets-node"), "secrets");
+        assert_eq!(world_short("automation-node"), "automation");
+    }
+
+    #[test]
+    fn world_short_idempotent_on_short_form() {
+        assert_eq!(world_short("secrets"), "secrets");
+        assert_eq!(world_short("trusted"), "trusted");
+    }
+
+    #[test]
+    fn world_short_strips_only_trailing_node() {
+        // Substrings of "node" inside the world stay intact.
+        assert_eq!(world_short("nodemonkey-node"), "nodemonkey");
+    }
+
+    // -- world_allows_secrets --
+
+    #[test]
+    fn allows_secrets_for_secrets_tier() {
+        assert!(world_allows_secrets("secrets-node"));
+        assert!(world_allows_secrets("secrets"));
+    }
+
+    #[test]
+    fn allows_secrets_for_higher_tiers() {
+        assert!(world_allows_secrets("database-node"));
+        assert!(world_allows_secrets("agent-node"));
+        assert!(world_allows_secrets("trusted"));
+        assert!(world_allows_secrets("automation-node"));
+    }
+
+    #[test]
+    fn denies_secrets_for_lower_tiers() {
+        assert!(!world_allows_secrets("minimal-node"));
+        assert!(!world_allows_secrets("http-node"));
+        assert!(!world_allows_secrets("network-node"));
+        assert!(!world_allows_secrets("messaging-node"));
+        assert!(!world_allows_secrets("filesystem-node"));
+        assert!(!world_allows_secrets("cache-node"));
+        assert!(!world_allows_secrets("llm-node"));
+        assert!(!world_allows_secrets("governance-node"));
+    }
+
+    #[test]
+    fn denies_secrets_for_unknown_world() {
+        assert!(!world_allows_secrets("custom-node"));
+        assert!(!world_allows_secrets(""));
+    }
+
+    // -- withdrawing a grant (falls back to DEFAULT_USER_CEILING) --
+
+    #[test]
+    fn withdrawing_a_grant_widens_exactly_when_the_default_is_not_covered() {
+        let widening: Vec<&str> = ACTOR_CEILING_WORLDS
+            .iter()
+            .copied()
+            .filter(|w| withdrawing_grant_widens(w))
+            .collect();
+        assert_eq!(widening, vec!["minimal-node", "governance-node"]);
+        // The default itself is not a widening, and an unknown world is.
+        assert!(!withdrawing_grant_widens(DEFAULT_USER_CEILING));
+        assert!(withdrawing_grant_widens("custom-node"));
+        assert!(withdrawing_grant_widens(""));
+        assert!(is_actor_ceiling_world(DEFAULT_USER_CEILING));
+    }
+
+    // -- ceiling_permits (partial-order lattice gate) --
+
+    #[test]
+    fn ceiling_permits_rejects_incomparable_tier3_siblings() {
+        // The exact bypass class the 2026-05-28 review found: a ceiling
+        // intended to DENY vault access must reject a secrets module even
+        // though world_rank(secrets)=3 < world_rank(cache)=5.
+        for ceiling in [
+            "cache-node",
+            "messaging-node",
+            "filesystem-node",
+            "governance-node",
+        ] {
+            assert!(
+                !ceiling_permits(ceiling, "secrets-node"),
+                "{ceiling} must NOT permit a secrets-node module (Secrets ⊄ {ceiling})"
+            );
+        }
+        // Symmetric: a secrets ceiling must not permit cache/messaging/filesystem.
+        for requested in ["cache-node", "messaging-node", "filesystem-node"] {
+            assert!(
+                !ceiling_permits("secrets-node", requested),
+                "secrets-node must NOT permit a {requested} module"
+            );
+        }
+        // tier-4 incomparable siblings: database ⊉ agent and agent ⊉ database.
+        assert!(!ceiling_permits("database-node", "agent-node"));
+        assert!(!ceiling_permits("agent-node", "database-node"));
+        // agent does NOT include cache/messaging/filesystem/database.
+        for requested in [
+            "cache-node",
+            "messaging-node",
+            "filesystem-node",
+            "database-node",
+        ] {
+            assert!(!ceiling_permits("agent-node", requested));
+        }
+    }
+
+    #[test]
+    fn ceiling_permits_allows_legitimate_escalation_paths() {
+        // Identity.
+        for w in ACTOR_CEILING_WORLDS {
+            if *w == "llm-node" {
+                continue; // llm has no module-world form; covered separately.
+            }
+            assert!(ceiling_permits(w, w), "{w} must permit itself");
+        }
+        // Minimal/Http/Network are subsets of higher worlds.
+        assert!(ceiling_permits("secrets-node", "minimal-node"));
+        assert!(ceiling_permits("secrets-node", "http-node"));
+        assert!(ceiling_permits("secrets-node", "network-node"));
+        // Secrets escalates to Database/Agent/Trusted.
+        assert!(ceiling_permits("database-node", "secrets-node"));
+        assert!(ceiling_permits("agent-node", "secrets-node"));
+        assert!(ceiling_permits("automation-node", "secrets-node"));
+        // Governance escalates to Agent/Trusted.
+        assert!(ceiling_permits("agent-node", "governance-node"));
+        assert!(ceiling_permits("automation-node", "governance-node"));
+        // Trusted/automation permits everything compilable.
+        for w in compilable_worlds() {
+            assert!(
+                ceiling_permits("automation-node", w),
+                "automation-node must permit every compilable world ({w})"
+            );
+        }
+    }
+
+    #[test]
+    fn ceiling_permits_handles_llm_node_ceiling() {
+        // llm-node ⇒ Http for lattice purposes: permits minimal/http, denies
+        // network (sockets), secrets, and everything above http.
+        assert!(ceiling_permits("llm-node", "minimal-node"));
+        assert!(ceiling_permits("llm-node", "http-node"));
+        assert!(ceiling_permits("llm-node", "llm-node"));
+        assert!(!ceiling_permits("llm-node", "network-node"));
+        assert!(!ceiling_permits("llm-node", "secrets-node"));
+        assert!(!ceiling_permits("llm-node", "automation-node"));
+    }
+
+    #[test]
+    fn is_lattice_world_recognises_known_forms_only() {
+        // Both short and -node forms are recognised.
+        assert!(is_lattice_world("secrets"));
+        assert!(is_lattice_world("secrets-node"));
+        assert!(is_lattice_world("governance-node"));
+        assert!(is_lattice_world("minimal"));
+        // Unknown / malformed / legacy → false (so callers can report it).
+        assert!(!is_lattice_world("bogus"));
+        assert!(!is_lattice_world(""));
+        assert!(!is_lattice_world("tier1"));
+    }
+
+    #[test]
+    fn ceiling_permits_fails_closed_on_unknown() {
+        // Unknown / legacy / malformed ceiling rejects every module.
+        assert!(!ceiling_permits("bogus-node", "minimal-node"));
+        assert!(!ceiling_permits("", "minimal-node"));
+        assert!(!ceiling_permits("tier1", "minimal-node"));
+        // Unknown module world rejected even under the highest ceiling.
+        assert!(!ceiling_permits("automation-node", "bogus-node"));
+        assert!(!ceiling_permits("automation-node", ""));
+    }
+
+    #[test]
+    fn ceiling_permits_accepts_short_and_node_forms() {
+        assert!(ceiling_permits("database", "secrets"));
+        assert!(ceiling_permits("database-node", "secrets-node"));
+        assert!(ceiling_permits("database", "secrets-node"));
+        assert!(ceiling_permits("database-node", "secrets"));
+    }
+
+    #[test]
+    fn ceiling_permits_subsumes_world_rank_gate() {
+        // Property: every subset edge has rank(sub) <= rank(super), so the
+        // lattice gate is strictly stricter than the linear rank gate. Verify
+        // there is NO (ceiling, requested) pair the rank gate rejected that
+        // the lattice gate now ALLOWS (that would be a regression).
+        let worlds = compilable_worlds();
+        for &c in worlds {
+            for &r in worlds {
+                let rank_allows = world_rank(r) <= world_rank(c);
+                let lattice_allows = ceiling_permits(c, r);
+                assert!(
+                    !lattice_allows || rank_allows,
+                    "lattice allows ({c} ⊇ {r}) but rank rejected it — rank/lattice inconsistency"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pure_egress_worlds_default_to_no_memory() {
+        // The pure-egress / send worlds — curated memory must NOT reach these
+        // by default (delivery-node-pattern "send" leg + tier1+public exfil).
+        for w in ["http", "http-node", "network", "network-node", "messaging"] {
+            assert!(
+                world_defaults_no_memory(w),
+                "{w} should default to NO memory injection"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_reasoning_and_neutral_worlds_keep_memory_default() {
+        // The "compose"/reasoning worlds and the non-egress worlds keep the
+        // default-true behaviour (an explicit needs_memory:false still opts out
+        // per-node; that's decided in the engine, not here).
+        for w in [
+            "agent",
+            "agent-node",
+            "trusted",
+            "automation-node",
+            "minimal",
+            "secrets",
+            "cache",
+            "database",
+            "filesystem",
+            "governance",
+            "unknown",
+        ] {
+            assert!(
+                !world_defaults_no_memory(w),
+                "{w} must keep the default-true memory posture"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod permitted_ceiling_worlds_tests {
+    use super::*;
+
+    #[test]
+    fn an_unrecognised_ceiling_permits_nothing() {
+        assert!(permitted_ceiling_worlds("full-node").is_empty());
+        assert!(permitted_ceiling_worlds("").is_empty());
+        // Control: a recognised ceiling permits at least itself.
+        assert_eq!(
+            permitted_ceiling_worlds("minimal-node"),
+            vec!["minimal-node"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod vault_substitution_route_tests {
+    use super::{compilable_worlds, world_allows_secrets, world_allows_vault_substitution};
+
+    /// The predicate's correctness is DERIVED from `wit/aegix.wit`, not
+    /// transcribed from it: this reads the WIT's own world bodies and asserts
+    /// the answer matches "imports an interface that performs `vault://`
+    /// substitution". A world added to the lattice therefore cannot drift the
+    /// predicate silently — the way a hand-maintained `matches!` list would.
+    #[test]
+    fn the_substitution_predicate_matches_the_wit() {
+        let wit = include_str!("../../wit/aegix.wit");
+        let mut seen = 0usize;
+        for world in compilable_worlds() {
+            let head = format!("world {}-node {{", super::world_short(world));
+            let start = wit
+                .find(&head)
+                .unwrap_or_else(|| panic!("world `{world}` is not declared in wit/aegix.wit"));
+            let body = &wit[start..];
+            let end = body.find("\n}").expect("world body must terminate");
+            let body = &body[..end];
+            // These three are the host functions that call `resolve_vault_placed`.
+            let egress = ["import http;", "import webhook;", "import graphql;"]
+                .iter()
+                .any(|i| body.contains(i));
+            assert_eq!(
+                world_allows_vault_substitution(world),
+                egress,
+                "world `{world}`: predicate says {}, wit says {egress}",
+                world_allows_vault_substitution(world)
+            );
+            seen += 1;
+        }
+        // A scan that matched nothing would pass the loop vacuously.
+        assert!(
+            seen >= 10,
+            "only {seen} worlds checked — the scan is not reading the WIT"
+        );
+    }
+
+    /// The two routes are INDEPENDENT, which is the whole point: `http-node`
+    /// has the host route and not the guest route, and that combination is the
+    /// entire live config-reference population on this fleet.
+    #[test]
+    fn the_two_secret_routes_are_independent() {
+        assert!(!world_allows_secrets("http-node"));
+        assert!(world_allows_vault_substitution("http-node"));
+
+        assert!(world_allows_secrets("secrets-node"));
+        assert!(world_allows_vault_substitution("secrets-node"));
+
+        // `minimal` has neither — it imports no egress interface at all.
+        assert!(!world_allows_secrets("minimal-node"));
+        assert!(!world_allows_vault_substitution("minimal-node"));
+    }
+
+    /// An unknown world is UNKNOWN. Claiming the route for it would tell an
+    /// operator their module can reach a secret on no evidence.
+    #[test]
+    fn an_unknown_world_is_not_claimed_to_have_either_route() {
+        for w in ["banana-node", "", "full-node"] {
+            assert!(!world_allows_vault_substitution(w), "world {w:?}");
+            assert!(!world_allows_secrets(w), "world {w:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod change_authority_tests {
+    use super::*;
+
+    fn caps(list: &[&str]) -> Vec<String> {
+        list.iter().map(|c| (*c).to_string()).collect()
+    }
+
+    #[test]
+    fn only_a_second_factor_session_may_loosen() {
+        assert!(ChangeAuthority::SecondFactorSession.may_loosen());
+        assert!(!ChangeAuthority::BearerCredential.may_loosen());
+    }
+
+    #[test]
+    fn a_role_is_measured_against_the_users_ceiling() {
+        let admin_role = caps(&["automation", "secrets", "governance", "http", "minimal"]);
+        assert!(role_capabilities_above("automation-node", &admin_role).is_empty());
+        assert_eq!(
+            role_capabilities_above("http-node", &admin_role),
+            vec!["automation", "secrets", "governance"]
+        );
+        assert!(role_capabilities_above("minimal-node", &caps(&["minimal"])).is_empty());
+        assert_eq!(
+            role_capabilities_above("agent-node", &caps(&["*"])),
+            vec!["*"]
+        );
+        assert_eq!(
+            role_capabilities_above("agent-node", &caps(&["admin"])),
+            vec!["admin"]
+        );
+        assert!(role_capabilities_above("trusted-node", &caps(&["*", "admin"])).is_empty());
+        assert_eq!(
+            role_capabilities_above("trusted-node", &caps(&["no-such-world"])),
+            vec!["no-such-world"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod wildcard_grant_tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A2-1 / A2-3 (2026-10-15): one rule for every bearer-reachable grant
+    /// writer — no `*` secret or host, no `<prefix>/*` secret glob; exact
+    /// paths, bare namespaces and named hosts pass; a second-factor session
+    /// may write any of them.
+    /// D2-D: a bare `*` secret grant is refused for every authority, a
+    /// second-factor session included; `<prefix>/*` stays a session's to grant.
+    #[test]
+    fn a_star_secret_grant_is_refused_for_every_authority() {
+        let v = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        for authority in [
+            ChangeAuthority::SecondFactorSession,
+            ChangeAuthority::BearerCredential,
+        ] {
+            for secrets in [v(&["*"]), v(&[" * "]), v(&["svc/a", "*"])] {
+                assert_eq!(
+                    refuse_wildcard_grant(authority, &secrets, &[]),
+                    Err(SECRET_WILDCARD_RETIRED),
+                    "{authority:?} {secrets:?}"
+                );
+            }
+        }
+        assert_eq!(
+            refuse_wildcard_grant(ChangeAuthority::SecondFactorSession, &v(&["svc/*"]), &[]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_bearer_writes_no_wildcard_grant() {
+        let bearer = ChangeAuthority::BearerCredential;
+        let session = ChangeAuthority::SecondFactorSession;
+        for secrets in [v(&["svc/*"]), v(&["a/b", " svc/* "])] {
+            assert_eq!(
+                refuse_wildcard_grant(bearer, &secrets, &[]),
+                Err(WILDCARD_GRANT_NEEDS_SECOND_FACTOR),
+                "{secrets:?}"
+            );
+            assert_eq!(refuse_wildcard_grant(session, &secrets, &[]), Ok(()));
+        }
+        assert!(refuse_wildcard_grant(bearer, &[], &v(&["*"])).is_err());
+        assert!(refuse_wildcard_grant(session, &[], &v(&["*"])).is_ok());
+        assert_eq!(
+            refuse_wildcard_grant(
+                bearer,
+                &v(&["svc/api_key", "oauth/gmail"]),
+                &v(&["api.example.test", "*.example.test"])
+            ),
+            Ok(())
+        );
+    }
+}
+
+#[cfg(test)]
+mod runs_outside_the_engine_tests {
+    use super::*;
+
+    #[test]
+    fn governance_and_unknown_do_not_run_standalone() {
+        assert!(!CapabilityWorld::Governance.runs_outside_the_engine());
+        assert!(!CapabilityWorld::Unknown.runs_outside_the_engine());
+        for w in CapabilityWorld::ALL {
+            if *w != CapabilityWorld::Governance {
+                assert!(w.runs_outside_the_engine(), "{w}");
+            }
+        }
+    }
+}

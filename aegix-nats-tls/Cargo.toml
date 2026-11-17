@@ -1,0 +1,22 @@
+[package]
+name = "aegix-nats-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Shared NATS in-cluster TLS wiring for the controller + worker connect paths,
+# so the CA-trust logic is a single source of truth and can't drift between the
+# two binaries. The chart's in-cluster NATS terminates TLS with a self-signed
+# cert; both processes connect with a `tls://` URL and must trust it.
+[dependencies]
+async-nats.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+futures.workspace = true
+
+[lints]
+workspace = true

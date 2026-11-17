@@ -1,0 +1,22 @@
+[package]
+name = "aegix-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The one place a Redis client is made and a connection opened, so the
+# timeouts it carries and the servers a TLS connection trusts are decisions
+# made once, not the library's defaults at every call site. A leaf: `redis`
+# and nothing else. The TLS features are the ones every binary already builds
+# with (rustls, webpki roots), so this crate adds none to a binary.
+
+[dependencies]
+redis = { workspace = true, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "test-util"] }
+
+[lints]
+workspace = true

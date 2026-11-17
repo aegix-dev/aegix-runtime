@@ -1,0 +1,313 @@
+//! Canonical NATS subject registry.
+//!
+//! Every `talos.*` NATS subject the platform publishes to or subscribes on is
+//! named here ONCE. Before this module the ~two dozen subjects were spelled
+//! out as bare string literals scattered across a dozen crates (worker,
+//! controller, the OAuth integration dispatchers, the audit ledger, …), so a
+//! typo or a rename could silently split a producer from its consumer with no
+//! compile-time signal. Centralising them turns "does the worker publish where
+//! the controller listens?" into a shared-const identity the compiler checks.
+//!
+//! # Scope
+//!
+//! This module owns the **job / results / audit / approvals /
+//! worker-fleet / agent-orchestration / workflow-event / LLM-stream** subjects
+//! — the ones shared across process boundaries. Two families are canonical
+//! ELSEWHERE and are intentionally NOT duplicated here (referencing the
+//! existing const is the rule, per the platform's "one authoritative name"
+//! discipline):
+//!
+//! * **Signed data-RPC subjects** (`talos.memory.op`, `talos.graph.search`,
+//!   `talos.database.query`, `talos.state.write`, `talos.ml.predict`,
+//!   `talos.ml.fewshot`, `talos.integration_state.op`) live on their protocol
+//!   types in `aegix-memory` as `SUBJECT_*` consts (e.g.
+//!   `aegix_memory::memory_rpc::SUBJECT_MEMORY_OP`). They are re-exported here
+//!   only so the documentation table has a single reading order — the source of
+//!   truth stays in `aegix-memory`.
+//! * **`talos.alerts.execution_failed`** is `EXECUTION_FAILED_ALERT_SUBJECT` in
+//!   `aegix-execution-result-collector`. Mirrored here as [`ALERTS_EXECUTION_FAILED`]
+//!   for the registry table; that crate keeps the canonical const (adding a
+//!   job-protocol dependency there just for a string is not worth the edge).
+//!
+//! # Wire-compatibility rule
+//!
+//! The string VALUES here are load-bearing wire identifiers. Changing a value
+//! is a breaking protocol change (a rolling deploy would split producers from
+//! consumers mid-flight). Renames of the Rust CONSTS are free; the strings are
+//! frozen.
+
+// ── Namespace ────────────────────────────────────────────────────────────
+
+/// The reserved subject namespace prefix for every platform-owned NATS
+/// subject. Guest (WASM) code is denied publish rights on anything under this
+/// prefix — see `RESERVED_PUBLISH_PREFIXES` in the worker runtime. This is a
+/// PREFIX, not a subject; do not publish to it directly.
+pub const NAMESPACE_PREFIX: &str = "talos.";
+
+// ── Job dispatch ─────────────────────────────────────────────────────────
+
+/// Tenant-agnostic single-node job subject (fallback when no user context).
+/// Request → worker; the worker replies on the signed reply inbox.
+pub const JOBS: &str = "talos.jobs";
+
+/// Per-user single-node job subject: `talos.jobs.<user_id>`.
+///
+/// The OAuth integration dispatchers (Gmail / Google Calendar / Google Cloud)
+/// and the inbound webhook router publish module-bound jobs here so a
+/// per-user worker pool can subscribe to only its own tenant's work.
+#[must_use]
+pub fn jobs_for(user_id: impl std::fmt::Display) -> String {
+    format!("{JOBS}.{user_id}")
+}
+
+// ── Job results ─────────────────────────────────────────────────
+
+/// Wildcard the controller subscribes on to collect single-node job results:
+/// `talos.results.*`. (Used only where the reply-inbox path is not in play.)
+pub const RESULTS_WILDCARD: &str = "talos.results.*";
+
+/// Per-job single-node result subject: `talos.results.<job_id>`.
+#[must_use]
+pub fn results_for(job_id: impl std::fmt::Display) -> String {
+    format!("talos.results.{job_id}")
+}
+
+/// RFC 0014 P2: where a worker reports a job's progress (`waiting` for the
+/// local-inference slot, then `admitted`) — `<reply_inbox>.progress`.
+///
+/// Derived from the job's SIGNED `reply_topic`, never from the unsigned wire
+/// reply header, so it names the same controller the result will reach. A
+/// controller that predates P2 subscribes to nothing here and the messages fall
+/// on the floor, which is the whole deploy-compatibility story: no request
+/// field, no ordering constraint between worker and controller rollouts.
+#[must_use]
+pub fn job_progress_for(reply_inbox: &str) -> String {
+    format!("{reply_inbox}.progress")
+}
+
+// ── Audit ledger ───────────────────────────────────────────────────────────
+
+/// Append-only cryptographic audit-event stream. The worker (producer) publishes
+/// hash-chained, HMAC-signed `AuditEvent`s here; the `aegix-audit-ledger` WORM
+/// consumer subscribes. Fire-and-forget.
+pub const AUDIT_LEDGER: &str = "talos.audit.ledger";
+
+// ── Human-in-the-loop approvals ────────────────────────────────────────────
+
+/// Subject the worker publishes an approval REQUEST on when a governance node
+/// suspends for human review. Fire-and-forget; the controller's continuation
+/// trigger consumes it.
+pub const APPROVALS_PENDING: &str = "talos.approvals.pending";
+
+/// Per-execution approval-wait reply subject: `talos.approvals.wait.<exec_id>`.
+/// The worker publishes its `reply_topic` here so the approve/reject webhook can
+/// resume the suspended execution.
+#[must_use]
+pub fn approvals_wait_for(exec_id: impl std::fmt::Display) -> String {
+    format!("talos.approvals.wait.{exec_id}")
+}
+
+/// The subject a run's human-approval decision is published on, named from
+/// the run's signed `workflow_execution_id` by BOTH sides — the worker that
+/// waits and the controller that answers (2026-10-15, security review E2-6
+/// follow-up). Until then the worker wrote the subject into Redis
+/// (`approval:<run>`) and the controller published the decision to whatever
+/// that row held, so a process with Redis access chose where an approval
+/// decision went.
+#[must_use]
+pub fn approval_reply_subject(workflow_execution_id: impl std::fmt::Display) -> String {
+    approvals_wait_for(workflow_execution_id)
+}
+
+/// Where the controller publishes an approval decision for `workflow_execution_id`:
+/// the subject the run's own id names when a waiter has left its marker
+/// (`approval:<run>` in Redis), and nowhere when none has. The marker says
+/// only that a waiter exists; its value is never a destination.
+#[must_use]
+pub fn approval_publish_subject(
+    workflow_execution_id: uuid::Uuid,
+    marker: Option<&str>,
+) -> Option<String> {
+    marker.map(|_| approval_reply_subject(workflow_execution_id))
+}
+
+// ── Worker fleet ───────────────────────────────────────────────────────────
+
+/// Wildcard the fleet manager subscribes on to observe worker heartbeats:
+/// `talos.workers.heartbeat.>`.
+pub const WORKERS_HEARTBEAT_WILDCARD: &str = "talos.workers.heartbeat.>";
+
+/// Per-worker heartbeat subject: `talos.workers.heartbeat.<worker_id>`.
+#[must_use]
+pub fn worker_heartbeat_for(worker_id: impl std::fmt::Display) -> String {
+    format!("talos.workers.heartbeat.{worker_id}")
+}
+
+/// Fleet-wide graceful-shutdown command subject.
+///
+/// **Inert:** zero publishers, zero subscribers workspace-wide. Recorded here
+/// rather than quietly left ambiguous — see `docs/inert-mechanisms.md`.
+pub const WORKERS_CMD_SHUTDOWN: &str = "talos.workers.cmd.shutdown";
+
+/// Fleet-wide execution-cancel command subject.
+///
+/// **PLAIN subscribe, never a queue subscribe.** The controller does not know
+/// which worker holds a given execution's in-flight job, so the command has to
+/// reach EVERY worker; a queue group would deliver it to one arbitrary member
+/// and silently drop it for the rest. Workers for which the execution id is
+/// unknown treat the command as a no-op.
+///
+/// Carries a [`crate::CancelCommand`], signed. Nothing secret appears in the
+/// subject itself — it is fleet-wide and constant, so the execution id is in
+/// the (signed) BODY and never in the subject, which is visible in NATS
+/// `/subsz`.
+pub const WORKERS_CMD_CANCEL: &str = "talos.workers.cmd.cancel";
+
+// ── Controller signed-RPC subscribers ──────────────────────────────────────
+
+/// The NATS queue group every controller replica joins for the signed-RPC
+/// subjects it serves on a worker's behalf (`talos.memory.op`,
+/// `talos.graph.search`, `talos.database.query`, `talos.integration_state.op`,
+/// `talos.ml.predict`, `talos.ml.fewshot`, `talos.state.write`).
+///
+/// **A queue subscribe, never a plain one.** A plain subscribe delivers each
+/// worker request to EVERY controller replica. Measured on a live broker with
+/// two replicas (2026-09-19): with the cross-replica replay guard on, one
+/// replica executes and the other answers `Unauthorized`, and the requester
+/// takes whichever reply arrives first — the refusal, for 199 of 199 requests
+/// once the winner does 1 ms of work; with the guard off, both replicas
+/// execute (398 handler runs for 199 requests). One group name for every
+/// subject is correct: NATS scopes a queue group per subject, so members
+/// share work subject by subject.
+///
+/// Contrast [`WORKERS_CMD_CANCEL`], where fan-out to every subscriber is the
+/// design and a queue group would be the defect.
+pub const CONTROLLER_RPC_QUEUE_GROUP: &str = "talos-controller-rpc";
+
+/// Wildcard the controller's log relay binds: `wasm.log.<execution_id>`, the
+/// subject the worker publishes every guest and host log line on.
+pub const WASM_LOG_WILDCARD: &str = "wasm.log.*";
+
+/// The queue group the PERSIST half of the controller's `wasm.log.*` relay
+/// joins, so one replica stores each line (neither log table has a
+/// de-duplication key: measured 2026-09-20, two plain relays stored 100 rows
+/// for 50 lines). The BROADCAST half of the same relay is a plain subscribe
+/// by design — every replica feeds its own GraphQL subscribers. See
+/// `aegix-wasm-log-relay`.
+pub const CONTROLLER_WASM_LOG_QUEUE_GROUP: &str = "talos-controller-wasm-log";
+
+/// The queue group the controller's `talos.results.*` observer joins, so one
+/// replica handles each fire-and-forget worker result. The write behind it is
+/// status-guarded and idempotent, so a plain subscribe never wrote a wrong
+/// row; what it did at N replicas was N signature checks, N row reads and
+/// output seals, and N copies of every "unparseable" / "unverified" count and
+/// WARN per result. See `aegix-job-result-observer`.
+pub const CONTROLLER_RESULTS_QUEUE_GROUP: &str = "talos-controller-results";
+
+// ── Agent orchestration ────────────────────────────────────────────────────
+
+/// Per-target agent invoke subject: `talos.agent.<target>.invoke`. The worker's
+/// `agent-orchestration` host publishes a signed invoke envelope here.
+#[must_use]
+pub fn agent_invoke_for(target: impl std::fmt::Display) -> String {
+    format!("talos.agent.{target}.invoke")
+}
+
+/// Per-target agent message subject: `talos.agent.<target>.message`.
+#[must_use]
+pub fn agent_message_for(target: impl std::fmt::Display) -> String {
+    format!("talos.agent.{target}.message")
+}
+
+// ── Workflow events ────────────────────────────────────────────────────────
+
+/// Per-execution workflow-event subject: `talos.events.<exec_id>.<event_type>`.
+/// Emitted by the worker's `messaging` host for guest-observable lifecycle
+/// events.
+#[must_use]
+pub fn workflow_event_for(
+    exec_id: impl std::fmt::Display,
+    event_type: impl std::fmt::Display,
+) -> String {
+    format!("talos.events.{exec_id}.{event_type}")
+}
+
+// ── LLM streaming ──────────────────────────────────────────────────────────
+
+/// Per-execution LLM token-stream subject: `talos.llm.stream.<execution_id>`.
+/// The GraphQL subscription layer subscribes here to relay streamed tokens to a
+/// connected client.
+#[must_use]
+pub fn llm_stream_for(execution_id: impl std::fmt::Display) -> String {
+    format!("talos.llm.stream.{execution_id}")
+}
+
+// ── Mirrored-for-documentation subjects (canonical const lives elsewhere) ──
+
+/// Execution-failure alert subject. **Canonical const:**
+/// `aegix_execution_result_collector::EXECUTION_FAILED_ALERT_SUBJECT`. Mirrored
+/// here only for the registry table — do not import this in preference to the
+/// canonical const in the crate that owns the alert pipeline.
+pub const ALERTS_EXECUTION_FAILED: &str = "talos.alerts.execution_failed";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builders_match_frozen_wire_format() {
+        let id = "abc123";
+        assert_eq!(jobs_for(id), "talos.jobs.abc123");
+        assert_eq!(results_for(id), "talos.results.abc123");
+        assert_eq!(approvals_wait_for(id), "talos.approvals.wait.abc123");
+        assert_eq!(approval_reply_subject(id), "talos.approvals.wait.abc123");
+        assert_eq!(worker_heartbeat_for(id), "talos.workers.heartbeat.abc123");
+        assert_eq!(agent_invoke_for(id), "talos.agent.abc123.invoke");
+        assert_eq!(agent_message_for(id), "talos.agent.abc123.message");
+        assert_eq!(workflow_event_for(id, "done"), "talos.events.abc123.done");
+    }
+
+    #[test]
+    fn every_builder_and_const_is_under_the_namespace() {
+        for s in [
+            JOBS,
+            RESULTS_WILDCARD,
+            AUDIT_LEDGER,
+            APPROVALS_PENDING,
+            WORKERS_HEARTBEAT_WILDCARD,
+            WORKERS_CMD_SHUTDOWN,
+            WORKERS_CMD_CANCEL,
+            ALERTS_EXECUTION_FAILED,
+        ] {
+            assert!(s.starts_with(NAMESPACE_PREFIX), "{s} escapes the namespace");
+        }
+    }
+
+    #[test]
+    fn llm_stream_uses_execution_id() {
+        let ex = uuid::Uuid::nil();
+        assert_eq!(llm_stream_for(ex), format!("talos.llm.stream.{ex}"));
+    }
+
+    /// An approval decision goes to the subject the run's id names, whatever
+    /// the Redis marker holds — a marker naming another subject redirects
+    /// nothing — and nowhere when no waiter left a marker.
+    #[test]
+    fn an_approval_decision_goes_where_the_run_id_says_not_where_redis_says() {
+        let run = uuid::Uuid::from_u128(7);
+        let derived = format!("talos.approvals.wait.{run}");
+        for marker in [
+            "pending",
+            "talos.memory.op",
+            "talos.approvals.wait.00000000-0000-0000-0000-000000000009",
+            "",
+        ] {
+            assert_eq!(
+                approval_publish_subject(run, Some(marker)).as_deref(),
+                Some(derived.as_str()),
+                "{marker}"
+            );
+        }
+        assert_eq!(approval_publish_subject(run, None), None);
+    }
+}

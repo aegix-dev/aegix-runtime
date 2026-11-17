@@ -1,0 +1,1175 @@
+//! RFC 0010 P3 (D3b) — controller-side per-execution secret-envelope sealing.
+//!
+//! This crate owns the controller half of the claim protocol that removes
+//! `WORKER_SHARED_KEY` as a secret-decryption root on the worker (see
+//! `docs/rfcs/0010-asymmetric-worker-trust-boundary.md`, "P3 detailed design").
+//! It does NOT touch NATS — the transport wiring (the claim responder
+//! subscription, the reply publish) lives in the controller binary; this crate
+//! is the pure, testable core:
+//!
+//! * [`EnvelopeSealingMode`] — the `off` / `audit` / `required` policy flag.
+//! * [`SealContext`] — the resolved plaintext secret values for one in-flight
+//!   execution, redacted in `Debug` and zeroized on drop.
+//! * [`InFlightSeals`] — the dispatching replica's in-memory map
+//!   `exec_id → (attempt, SealContext)`. The single-claim guarantee rides on an
+//!   **atomic `take`** (`DashMap::remove_if`): the first claim for the armed
+//!   attempt removes the context and seals; any concurrent or later claim, or
+//!   a claim naming another attempt, gets `None` and is rejected. No
+//!   secretless double-run is possible.
+//! * [`handle_secret_claim`] — verify the claim's Ed25519 signature against the
+//!   worker's registered key(s), atomically take the context, seal the secrets
+//!   to the worker's ephemeral key, and return a signed [`SealedSecrets`].
+//!
+//! Single-claim is in-process ONLY, and that is sufficient: a dispatch's
+//! `claim_inbox` is a NATS inbox of the dispatching replica's connection
+//! (`nc.new_inbox()`), so a claim can only reach the replica that holds the
+//! context, and `take` is atomic there. A `RedisLease` (Lua-CAS
+//! `dispatched → claimed:<worker>`) was written for cross-replica
+//! defence-in-depth and crash recovery, but nothing ever called it — no
+//! `record_dispatch` at registration, no `try_claim` in the responder, no
+//! re-dispatch on expiry — and its `Unavailable` arm documented a fail-open
+//! posture for a check that never ran. It was deleted on 2026-10-15 rather than
+//! wired: a lease that gates nothing is a claim about the system that is not
+//! true (`docs/engineering-log/packages/2026-10-15-worker-secret-map-zeroizing.md`).
+
+use std::collections::HashMap;
+
+use dashmap::DashMap;
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use aegix_workflow_job_protocol::{
+    seal_secrets, worker_public_keys, DispatchSigningKey, DispatchVerifyingKey, SealedSecrets,
+    SecretClaim,
+};
+
+pub mod responder;
+pub use responder::{run_claim_responder, ClaimRecord, ClaimRecorder};
+
+// The worker-verifying-key registry (`set_dynamic_worker_public_keys`) is a
+// process-global that REPLACES its contents, so every test that mutates it must
+// hold THIS one lock — a per-module lock wouldn't serialize across modules in the
+// same test binary (lib::tests vs responder::tests). nextest isolates by process,
+// but `cargo test` runs them as threads, so the shared lock is required there.
+#[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// P3 secret-delivery policy, mirroring the Sigstore three-policy shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeSealingMode {
+    /// Today's inline WSK envelope — byte-identical to pre-P3. Default.
+    Off,
+    /// Controller uses claim-based sealing for claim-capable workers, still
+    /// accepts inline for others (migration window).
+    Audit,
+    /// Refuse `sealing == 0` dispatch/execution (the P4-adjacent enforcement
+    /// point for secrets).
+    Required,
+}
+
+impl EnvelopeSealingMode {
+    /// Resolve from `AEGIX_ENVELOPE_SEALING` ∈ {off, audit, required}. Unknown or
+    /// unset → `Off` (fail-safe to today's behaviour).
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("AEGIX_ENVELOPE_SEALING")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("audit") => Self::Audit,
+            Some("required") => Self::Required,
+            _ => Self::Off,
+        }
+    }
+
+    /// Whether the controller should seal claim-based for a dispatch. `true` for
+    /// `audit`/`required`, `false` for `off`.
+    #[must_use]
+    pub fn seals_claim_based(self) -> bool {
+        matches!(self, Self::Audit | Self::Required)
+    }
+
+    /// Whether a `sealing == 0` (inline WSK) dispatch must be refused.
+    #[must_use]
+    pub fn refuses_inline(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
+/// The resolved plaintext secret values for one in-flight execution, held only
+/// long enough to seal them to the claiming worker's ephemeral key. The JSON is
+/// zeroized on drop and never rendered in `Debug` (lint check 37).
+pub struct SealContext {
+    /// Serialized secret map (name → value) as the worker will open it.
+    secrets_json: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for SealContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealContext")
+            .field("secrets_json", &"<redacted>")
+            .finish()
+    }
+}
+
+impl SealContext {
+    /// Serialize a resolved secrets map into a seal context. The map is consumed
+    /// by the caller after this; the serialized copy here is the only retained
+    /// form and is zeroized on drop.
+    pub fn new<V: AsRef<str>>(secrets: &HashMap<String, V>) -> Result<Self, String> {
+        // Borrowed values (C-10): a `Zeroizing<String>` map passes without a
+        // plain copy; the JSON is identical to a String map's.
+        let view: HashMap<&str, &str> = secrets
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_ref()))
+            .collect();
+        let json = serde_json::to_vec(&view).map_err(|e| format!("serialize seal context: {e}"))?;
+        Ok(Self {
+            secrets_json: Zeroizing::new(json),
+        })
+    }
+
+    /// Seal a pre-serialized JSON payload directly: the caller serializes its
+    /// own structure and hands the bytes here, and the worker opens the same
+    /// bytes and deserializes them back (until 2026-11-05 the pipeline path
+    /// used this for its per-step secret vector). The bytes are zeroized on
+    /// drop.
+    #[must_use]
+    pub fn from_bytes(json: Vec<u8>) -> Self {
+        Self {
+            secrets_json: Zeroizing::new(json),
+        }
+    }
+
+    /// The serialized secret bytes to seal (borrowed; not cloned).
+    fn bytes(&self) -> &[u8] {
+        &self.secrets_json
+    }
+}
+
+/// A registered seal context plus the instant it was registered. The timestamp
+/// exists solely for [`InFlightSeals::sweep_older_than`] — it bounds the map
+/// against *fire-and-forget* dispatch (module-bound Gmail/GCal/webhook pushes)
+/// which, unlike the engine's request/reply path, cannot `discard` after
+/// awaiting a result. An un-claimed orphan (worker died before claiming) would
+/// otherwise linger forever.
+struct Registered {
+    at: std::time::Instant,
+    /// The `dispatch_attempt` this context was armed for. A claim is answered
+    /// only by the context of the attempt it names (finding 8, 2026-11-06).
+    attempt: u32,
+    ctx: SealContext,
+}
+
+/// Who took a job's seal context, for which attempt, and when (for the same
+/// sweep).
+struct Claimed {
+    at: std::time::Instant,
+    attempt: u32,
+    worker_id: String,
+}
+
+/// The dispatching replica's in-memory `exec_id → SealContext` map. Single-claim
+/// is guaranteed by [`Self::take`] (atomic `DashMap::remove`).
+///
+/// Beside it, `exec_id → claimant`: the worker whose authenticated claim took
+/// the context (2026-10-29). The dispatcher reads it when the job's result
+/// arrives: a sealed job's secrets went to exactly one worker, so a result
+/// signed by any other worker is refused (`claimant`). The record is written
+/// only by [`handle_secret_claim`] after a successful seal, cleared by
+/// [`Self::register`] (the re-arm before a retry opens a new claim) and
+/// [`Self::discard`], and swept with the contexts.
+#[derive(Default)]
+pub struct InFlightSeals {
+    map: DashMap<Uuid, Registered>,
+    claimed: DashMap<Uuid, Claimed>,
+}
+
+/// The process-wide claim-sealing handle a dispatch path needs: the shared
+/// in-flight seal store (also read by the claim responder) plus the responder's
+/// claim subject (stamped into `JobRequest.claim_inbox`).
+///
+/// Lives HERE — the crate every sealing participant already depends on — so
+/// both the engine-NATS dispatcher and the module-bound integration paths
+/// (gmail / gcal / webhooks, via `aegix-integration-helpers`) name the SAME
+/// type without an integration→engine-NATS dep edge. There must be exactly one
+/// instance per process (memoized by the controller); a second `InFlightSeals`
+/// would register seals the responder never sees.
+#[derive(Clone)]
+pub struct EnvelopeSealingHandle {
+    /// The shared in-flight seal store the claim responder reads.
+    pub in_flight: std::sync::Arc<InFlightSeals>,
+    /// The replica-local claim subject the responder subscribes to.
+    pub claim_subject: String,
+}
+
+impl InFlightSeals {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a job's resolved secrets for the send about to go out, under
+    /// that send's `dispatch_attempt`. Overwrites any prior context for the
+    /// same `exec_id` (a re-dispatch supersedes the stale one), and forgets
+    /// who claimed the previous one: the attempt about to be sent may be
+    /// answered by whichever worker claims THIS attempt's context. A claim
+    /// made for an earlier attempt (a slow worker still holding the previous
+    /// send) names that attempt and is refused by [`Self::take`].
+    pub fn register(&self, exec_id: Uuid, attempt: u32, ctx: SealContext) {
+        self.map.insert(
+            exec_id,
+            Registered {
+                at: std::time::Instant::now(),
+                attempt,
+                ctx,
+            },
+        );
+        self.claimed.remove(&exec_id);
+    }
+
+    /// Record that `worker_id`'s authenticated claim took `exec_id`'s context
+    /// for `attempt`. Called by [`handle_secret_claim`] once the seal
+    /// succeeded, so a claim that produced no sealed output (and re-registered
+    /// the context) names nobody.
+    pub fn record_claimant(&self, exec_id: Uuid, attempt: u32, worker_id: &str) {
+        self.claimed.insert(
+            exec_id,
+            Claimed {
+                at: std::time::Instant::now(),
+                attempt,
+                worker_id: worker_id.to_string(),
+            },
+        );
+    }
+
+    /// The attempt the recorded claimant claimed, beside [`Self::claimant`].
+    #[must_use]
+    pub fn claimed_attempt(&self, exec_id: Uuid) -> Option<u32> {
+        self.claimed.get(&exec_id).map(|c| c.attempt)
+    }
+
+    /// The worker that holds `exec_id`'s sealed secrets, if a claim has been
+    /// answered since the last `register`. `None` means nothing was handed
+    /// out: a result may then come from any worker (the job may have been
+    /// refused before any claim).
+    #[must_use]
+    pub fn claimant(&self, exec_id: Uuid) -> Option<String> {
+        self.claimed.get(&exec_id).map(|c| c.worker_id.clone())
+    }
+
+    /// Atomically take the context for `exec_id`, if one is armed for
+    /// `attempt`. The first caller wins; a concurrent or later caller gets
+    /// `None`. This is the single-claim primitive. A claim for another attempt
+    /// leaves the armed context in place (`remove_if`: no extra lookup) and
+    /// gets `None`, so a claim made for attempt N never takes N+1's secrets.
+    #[must_use]
+    pub fn take(&self, exec_id: Uuid, attempt: u32) -> Option<SealContext> {
+        self.map
+            .remove_if(&exec_id, |_, armed| armed.attempt == attempt)
+            .map(|(_, v)| v.ctx)
+    }
+
+    /// Drop an unclaimed context (job finished, failed, or was cancelled before a
+    /// claim arrived) so the map doesn't grow with dead executions.
+    pub fn discard(&self, exec_id: Uuid) {
+        self.map.remove(&exec_id);
+        self.claimed.remove(&exec_id);
+    }
+
+    /// Evict every context registered longer than `ttl` ago and return how many
+    /// were swept. The safety net for *fire-and-forget* dispatch paths that
+    /// cannot `discard`: the engine's request/reply dispatcher removes its
+    /// context on claim OR on the post-dispatch `discard`, but a module-bound
+    /// push publishes and returns immediately, so a worker that dies before
+    /// claiming would strand its context here. `ttl` must be generously larger
+    /// than the worst-case dispatch→claim latency (a live worker claims within
+    /// milliseconds of receiving the job) so this never races a legitimate
+    /// claim. Zeroization still runs — the swept `SealContext`'s
+    /// `Zeroizing<Vec<u8>>` clears on drop.
+    pub fn sweep_older_than(&self, ttl: std::time::Duration) -> usize {
+        let mut swept = 0usize;
+        self.map.retain(|_, reg| {
+            let keep = reg.at.elapsed() < ttl;
+            if !keep {
+                swept += 1;
+            }
+            keep
+        });
+        // The claimant record of a fire-and-forget dispatch is never
+        // discarded; it goes with the same clock (not counted: it is not a
+        // context, and nothing secret is in it).
+        self.claimed.retain(|_, c| c.at.elapsed() < ttl);
+        swept
+    }
+
+    /// Number of in-flight (unclaimed) seal contexts. Bounded by concurrency and
+    /// the sweep, not by jobs-ever-seen (contexts are removed on claim, discard,
+    /// or sweep).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// Why a [`handle_secret_claim`] failed. All variants collapse to a generic
+/// `ClaimRejected` on the wire — the worker never learns which check failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimError {
+    /// No registered public key for the claiming `worker_id`.
+    UnknownWorker,
+    /// The claim signature or freshness check failed under every candidate key.
+    Unauthorized,
+    /// No in-flight seal context for this `exec_id` armed for the claim's
+    /// attempt — never dispatched by this replica, already claimed
+    /// (single-claim loser), expired, or a claim for another attempt.
+    UnknownExecution,
+    /// The ECDH/AEAD seal itself failed (e.g. a low-order ephemeral key).
+    SealFailed(String),
+}
+
+impl std::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownWorker => write!(f, "unknown worker"),
+            Self::Unauthorized => write!(f, "unauthorized claim"),
+            Self::UnknownExecution => write!(f, "unknown or already-claimed execution"),
+            Self::SealFailed(e) => write!(f, "seal failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ClaimError {}
+
+/// Handle a `SecretClaim`: authenticate it against the worker's registered
+/// Ed25519 key(s), atomically take the in-flight seal context (single-claim),
+/// seal the secrets to the worker's ephemeral key, and return a controller-
+/// signed [`SealedSecrets`]. Pure and synchronous — the NATS receive/reply and
+/// the reply publish are layered by the controller responder around this.
+///
+/// Verification uses the P2 registry (`worker_public_keys`) so key rotation
+/// (multiple registered keys) is handled by trying each candidate — identical
+/// to the ring-verify posture elsewhere.
+pub fn handle_secret_claim(
+    claim: &SecretClaim,
+    in_flight: &InFlightSeals,
+    controller_key: &DispatchSigningKey,
+    max_age_secs: u64,
+) -> Result<SealedSecrets, ClaimError> {
+    let candidates: Vec<DispatchVerifyingKey> = worker_public_keys(&claim.worker_id);
+    if candidates.is_empty() {
+        return Err(ClaimError::UnknownWorker);
+    }
+    let authenticated = candidates
+        .iter()
+        .any(|vk| claim.verify(vk, max_age_secs).is_ok());
+    if !authenticated {
+        return Err(ClaimError::Unauthorized);
+    }
+
+    // Single-claim: the first claim to reach here removes the context; any
+    // racing claim (NATS redelivery to a second worker) finds it gone and is
+    // rejected — so exactly one worker ever receives the sealed values.
+    let ctx = in_flight
+        .take(claim.exec_id, claim.dispatch_attempt)
+        .ok_or(ClaimError::UnknownExecution)?;
+
+    // Re-register on seal-crypto failure so the execution can re-claim.
+    // Pre-fix (2026-07-24), `take` above removed the context BEFORE the
+    // seal, so a `SealFailed` (e.g. an authenticated worker presenting a
+    // low-order / malformed ephemeral key, or a transient RNG/HKDF error)
+    // left the context permanently gone — the execution could never
+    // recover its secrets even on a legitimate retry. Restoring the
+    // (still-owned) context on failure keeps single-claim semantics
+    // intact: a concurrent claim during the brief failure window still
+    // finds it absent (take-first-wins is unchanged); this only re-opens
+    // the slot for a LATER retry after this claim demonstrably produced no
+    // sealed output. `register` overwrites, matching the dispatcher's M3
+    // re-arm closure.
+    let seal = match seal_secrets(&claim.epk_w, claim.exec_id, &claim.worker_id, ctx.bytes()) {
+        Ok(seal) => seal,
+        Err(e) => {
+            in_flight.register(
+                claim.exec_id,
+                claim.dispatch_attempt,
+                SealContext::from_bytes(ctx.bytes().to_vec()),
+            );
+            return Err(ClaimError::SealFailed(e));
+        }
+    };
+
+    // The secrets are now sealed to THIS worker and to nobody else; the
+    // dispatcher refuses the job's result from any other identity.
+    in_flight.record_claimant(claim.exec_id, claim.dispatch_attempt, &claim.worker_id);
+
+    Ok(SealedSecrets::new_signed(
+        claim.exec_id,
+        seal,
+        controller_key,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegix_workflow_job_protocol::{set_dynamic_worker_public_keys, WorkerEphemeral};
+
+    use super::REGISTRY_TEST_LOCK as REGISTRY_LOCK;
+
+    fn ctx_of(pairs: &[(&str, &str)]) -> SealContext {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        SealContext::new(&map).unwrap()
+    }
+
+    #[test]
+    fn mode_from_env_parsing() {
+        // Default (unset) is Off; parsing is case-insensitive.
+        assert!(!EnvelopeSealingMode::Off.seals_claim_based());
+        assert!(EnvelopeSealingMode::Audit.seals_claim_based());
+        assert!(EnvelopeSealingMode::Required.seals_claim_based());
+        assert!(EnvelopeSealingMode::Required.refuses_inline());
+        assert!(!EnvelopeSealingMode::Audit.refuses_inline());
+    }
+
+    #[test]
+    fn in_flight_take_is_single_claim() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+        assert_eq!(seals.len(), 1);
+        assert!(seals.take(exec, 0).is_some(), "first take wins");
+        assert!(seals.take(exec, 0).is_none(), "second take gets nothing");
+        assert!(seals.is_empty());
+    }
+
+    #[test]
+    fn sweep_evicts_only_entries_older_than_ttl() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+
+        // A generous TTL keeps a just-registered entry (the live-worker case:
+        // a claim always arrives well within the TTL, so the sweep never races
+        // a legitimate claim).
+        assert_eq!(
+            seals.sweep_older_than(std::time::Duration::from_secs(3600)),
+            0,
+            "fresh entry is not swept"
+        );
+        assert_eq!(seals.len(), 1);
+
+        // A zero TTL treats every entry as expired — the orphan case (worker
+        // died before claiming). Sweep evicts it and reports the count.
+        assert_eq!(
+            seals.sweep_older_than(std::time::Duration::from_secs(0)),
+            1,
+            "orphaned entry is swept"
+        );
+        assert!(seals.is_empty());
+        // And a claim arriving after the sweep gets nothing (fail-closed).
+        assert!(seals.take(exec, 0).is_none());
+    }
+
+    #[test]
+    fn full_claim_seal_open_roundtrip() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        // Register a worker key in the process registry.
+        let worker_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let worker_vk = worker_sk.verifying_key();
+        set_dynamic_worker_public_keys(vec![("worker-roundtrip".to_string(), worker_vk)]);
+
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let controller_vk = controller_sk.verifying_key();
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, 0, ctx_of(&[("anthropic/api_key", "sk-ant-secret")]));
+
+        // Worker side: generate ephemeral, build a signed claim.
+        let we = WorkerEphemeral::generate();
+        let claim =
+            SecretClaim::new_signed(exec, "worker-roundtrip".into(), we.public_key(), &worker_sk);
+
+        // Controller side: handle it.
+        let sealed =
+            handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("claim handled");
+        sealed
+            .verify(&controller_vk, 60)
+            .expect("worker verifies controller sig");
+
+        // Worker opens.
+        let plaintext = we
+            .open(
+                &sealed.epk_c,
+                exec,
+                "worker-roundtrip",
+                &sealed.ciphertext,
+                &sealed.nonce,
+            )
+            .expect("worker opens sealed secrets");
+        let recovered: HashMap<String, String> = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(recovered.get("anthropic/api_key").unwrap(), "sk-ant-secret");
+
+        // Second claim for the same exec is rejected (single-claim).
+        let we2 = WorkerEphemeral::generate();
+        let claim2 = SecretClaim::new_signed(
+            exec,
+            "worker-roundtrip".into(),
+            we2.public_key(),
+            &worker_sk,
+        );
+        assert_eq!(
+            handle_secret_claim(&claim2, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::UnknownExecution
+        );
+    }
+
+    /// A successful claim names its worker; a re-arm or a discard forgets it;
+    /// a claim that produced no seal names nobody. Mutation-proved: with
+    /// `record_claimant` removed from `handle_secret_claim`, the first
+    /// assertion fails.
+    #[test]
+    fn a_successful_claim_records_its_worker_until_rearm_or_discard() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![(
+            "worker-claimant".to_string(),
+            worker_sk.verifying_key(),
+        )]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        assert_eq!(seals.claimant(exec), None, "nothing handed out yet");
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+        assert_eq!(seals.claimant(exec), None, "registered, not yet claimed");
+
+        let we = WorkerEphemeral::generate();
+        let claim =
+            SecretClaim::new_signed(exec, "worker-claimant".into(), we.public_key(), &worker_sk);
+        handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("claim handled");
+        assert_eq!(seals.claimant(exec).as_deref(), Some("worker-claimant"));
+
+        // A retry re-arms: the next attempt may be claimed by anyone.
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+        assert_eq!(seals.claimant(exec), None, "re-arm forgets the claimant");
+        handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("re-claim handled");
+        assert_eq!(seals.claimant(exec).as_deref(), Some("worker-claimant"));
+
+        // The dispatcher's post-job discard forgets it too.
+        seals.discard(exec);
+        assert_eq!(seals.claimant(exec), None);
+
+        // A claim refused before the seal names nobody.
+        let other = Uuid::new_v4();
+        let refused =
+            SecretClaim::new_signed(other, "worker-claimant".into(), we.public_key(), &worker_sk);
+        assert_eq!(
+            handle_secret_claim(&refused, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::UnknownExecution
+        );
+        assert_eq!(seals.claimant(other), None);
+    }
+
+    /// Finding 8 (2026-11-06): a claim is answered only by the context armed
+    /// for the attempt it names. A slow worker still holding attempt 0 cannot
+    /// take the secrets re-armed for attempt 1, its refused claim leaves that
+    /// context in place for attempt 1's claimant, and the record names the
+    /// attempt claimed. Mutation-proved: with `take`'s predicate replaced by
+    /// `|_, _| true`, the attempt-0 claim seals and this test fails.
+    #[test]
+    fn a_claim_for_one_attempt_cannot_take_the_next_attempts_secrets() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![
+            ("slow-worker".to_string(), worker_sk.verifying_key()),
+            ("retry-worker".to_string(), worker_sk.verifying_key()),
+        ]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+
+        // The retry re-armed the job for attempt 1.
+        seals.register(exec, 1, ctx_of(&[("k", "attempt-1")]));
+        let we = WorkerEphemeral::generate();
+        let stale = SecretClaim::new_signed_for_attempt(
+            exec,
+            0,
+            "slow-worker".into(),
+            we.public_key(),
+            &worker_sk,
+        );
+        assert_eq!(
+            handle_secret_claim(&stale, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::UnknownExecution,
+            "a claim for attempt 0 is not answered by attempt 1's context"
+        );
+        assert_eq!(
+            seals.len(),
+            1,
+            "the refused claim left attempt 1's context armed"
+        );
+        assert_eq!(seals.claimant(exec), None);
+
+        let we = WorkerEphemeral::generate();
+        let live = SecretClaim::new_signed_for_attempt(
+            exec,
+            1,
+            "retry-worker".into(),
+            we.public_key(),
+            &worker_sk,
+        );
+        handle_secret_claim(&live, &seals, &controller_sk, 60).expect("attempt 1's claim seals");
+        assert_eq!(seals.claimant(exec).as_deref(), Some("retry-worker"));
+        assert_eq!(seals.claimed_attempt(exec), Some(1));
+        assert!(seals.is_empty());
+
+        // A later claim naming a FUTURE attempt is refused too.
+        seals.register(exec, 1, ctx_of(&[("k", "attempt-1")]));
+        let ahead = SecretClaim::new_signed_for_attempt(
+            exec,
+            2,
+            "retry-worker".into(),
+            WorkerEphemeral::generate().public_key(),
+            &worker_sk,
+        );
+        assert_eq!(
+            handle_secret_claim(&ahead, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::UnknownExecution
+        );
+    }
+
+    /// The claimant record is swept with the contexts, so a fire-and-forget
+    /// dispatch's record does not outlive its TTL.
+    #[test]
+    fn the_claimant_record_is_swept_by_age() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.record_claimant(exec, 0, "w");
+        assert_eq!(seals.claimant(exec).as_deref(), Some("w"));
+        assert_eq!(
+            seals.sweep_older_than(std::time::Duration::from_secs(3600)),
+            0
+        );
+        assert_eq!(seals.claimant(exec).as_deref(), Some("w"), "young: kept");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(
+            seals.sweep_older_than(std::time::Duration::ZERO),
+            0,
+            "a record is not a context"
+        );
+        assert_eq!(seals.claimant(exec), None, "old: swept");
+    }
+
+    #[test]
+    fn claim_from_unregistered_worker_rejected() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        // Deterministically ensure "ghost-worker" is not registered.
+        set_dynamic_worker_public_keys(vec![]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let stranger_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+        let we = WorkerEphemeral::generate();
+        // worker_id not present in the registry snapshot.
+        let claim =
+            SecretClaim::new_signed(exec, "ghost-worker".into(), we.public_key(), &stranger_sk);
+        assert_eq!(
+            handle_secret_claim(&claim, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::UnknownWorker
+        );
+        // The context must NOT have been consumed by a failed auth.
+        assert_eq!(seals.len(), 1, "rejected claim must not take the context");
+    }
+
+    /// Serializes tests that mutate `AEGIX_ENVELOPE_SEALING` — the env var is
+    /// process-global, so any future test reading it must hold this lock too.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `from_env` parsing: case-insensitive, whitespace-trimmed, and
+    /// fail-safe — unknown values and unset both resolve to `Off` (today's
+    /// inline-WSK behavior), never accidentally to an enforcing mode.
+    #[test]
+    fn mode_from_env_parses_variants_and_fails_safe_to_off() {
+        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let original = std::env::var("AEGIX_ENVELOPE_SEALING").ok();
+
+        let cases = [
+            ("off", EnvelopeSealingMode::Off),
+            ("audit", EnvelopeSealingMode::Audit),
+            ("required", EnvelopeSealingMode::Required),
+            // Case-insensitive.
+            ("AUDIT", EnvelopeSealingMode::Audit),
+            ("Required", EnvelopeSealingMode::Required),
+            // Whitespace-trimmed.
+            ("  required  ", EnvelopeSealingMode::Required),
+            // Unknown values fail SAFE to Off — a typo'd value must not
+            // silently flip the fleet into refuse-inline enforcement.
+            ("enforce", EnvelopeSealingMode::Off),
+            ("1", EnvelopeSealingMode::Off),
+            ("", EnvelopeSealingMode::Off),
+        ];
+        for (raw, expected) in cases {
+            std::env::set_var("AEGIX_ENVELOPE_SEALING", raw);
+            assert_eq!(
+                EnvelopeSealingMode::from_env(),
+                expected,
+                "AEGIX_ENVELOPE_SEALING={raw:?}"
+            );
+        }
+
+        std::env::remove_var("AEGIX_ENVELOPE_SEALING");
+        assert_eq!(
+            EnvelopeSealingMode::from_env(),
+            EnvelopeSealingMode::Off,
+            "unset must default to Off"
+        );
+
+        if let Some(v) = original {
+            std::env::set_var("AEGIX_ENVELOPE_SEALING", v);
+        }
+    }
+
+    /// Single-claim atomicity under real concurrency: many tasks race
+    /// `take()` for the same exec_id; exactly one must win, on every trial.
+    /// Mirrors the nonce-cache TOCTOU tests in `aegix-rpc-protocol/src/rpc_auth.rs`
+    /// — races are timing-dependent, so a single trial can hide a window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_takes_admit_exactly_one_winner() {
+        const TRIALS: usize = 150;
+        const RACERS: usize = 4;
+        for trial in 0..TRIALS {
+            let seals = std::sync::Arc::new(InFlightSeals::new());
+            let exec = Uuid::new_v4();
+            seals.register(exec, 0, ctx_of(&[("k", "v")]));
+
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+            let mut handles = Vec::with_capacity(RACERS);
+            for _ in 0..RACERS {
+                let s = seals.clone();
+                let b = barrier.clone();
+                handles.push(tokio::spawn(async move {
+                    b.wait().await;
+                    s.take(exec, 0).is_some()
+                }));
+            }
+            let mut winners = 0usize;
+            for h in handles {
+                if h.await.unwrap() {
+                    winners += 1;
+                }
+            }
+            assert_eq!(
+                winners, 1,
+                "trial {trial}: expected exactly one take() winner, got {winners} — \
+                 a >1 result means two workers could both receive sealed secrets"
+            );
+            assert!(seals.is_empty(), "trial {trial}: context must be consumed");
+        }
+    }
+
+    /// Re-registration (the M3 re-arm / re-dispatch path) OVERWRITES the
+    /// prior context: the map holds one entry per exec_id and a claim after
+    /// re-dispatch receives the NEW secrets, not the stale ones.
+    #[test]
+    fn re_registration_overwrites_prior_context() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, 0, ctx_of(&[("api_key", "stale-value")]));
+        seals.register(exec, 0, ctx_of(&[("api_key", "fresh-value")]));
+        assert_eq!(seals.len(), 1, "re-registration must not duplicate entries");
+
+        let ctx = seals
+            .take(exec, 0)
+            .expect("context takeable after re-register");
+        let recovered: HashMap<String, String> = serde_json::from_slice(ctx.bytes()).unwrap();
+        assert_eq!(
+            recovered.get("api_key").map(String::as_str),
+            Some("fresh-value"),
+            "a claim after re-dispatch must see the superseding context"
+        );
+        assert!(
+            seals.take(exec, 0).is_none(),
+            "still single-claim after re-arm"
+        );
+    }
+
+    /// `discard` after a successful `take` is a harmless no-op (the engine's
+    /// request/reply path always discards post-dispatch, even when the claim
+    /// already consumed the context), and discarding an unknown exec_id is
+    /// equally inert.
+    #[test]
+    fn discard_after_take_and_discard_unknown_are_noops() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+        assert!(seals.take(exec, 0).is_some());
+
+        seals.discard(exec); // already taken — must not panic or resurrect
+        assert!(seals.is_empty());
+        assert!(
+            seals.take(exec, 0).is_none(),
+            "discard must not re-arm the context"
+        );
+
+        seals.discard(Uuid::new_v4()); // never registered — inert
+        assert!(seals.is_empty());
+    }
+
+    /// `discard` on an UNCLAIMED context (job finished/cancelled before any
+    /// claim) removes it, and a late claim then finds nothing (fail-closed).
+    #[test]
+    fn discard_unclaimed_context_blocks_late_claim() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+        seals.discard(exec);
+        assert!(seals.is_empty());
+        assert!(
+            seals.take(exec, 0).is_none(),
+            "late claim after discard gets nothing"
+        );
+    }
+
+    /// Sweep evicts only entries older than the TTL, leaving younger
+    /// registrations claimable. Generous sleep/TTL margins (4×) keep this
+    /// deterministic on slow CI.
+    #[test]
+    fn sweep_is_selective_by_age() {
+        let seals = InFlightSeals::new();
+        let old_exec = Uuid::new_v4();
+        let new_exec = Uuid::new_v4();
+        seals.register(old_exec, 0, ctx_of(&[("k", "old")]));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        seals.register(new_exec, 0, ctx_of(&[("k", "new")]));
+
+        let swept = seals.sweep_older_than(std::time::Duration::from_millis(100));
+        assert_eq!(swept, 1, "only the aged-out entry is swept");
+        assert!(seals.take(old_exec, 0).is_none(), "orphan is gone");
+        assert!(
+            seals.take(new_exec, 0).is_some(),
+            "fresh entry survives the sweep"
+        );
+    }
+
+    /// `SealContext`'s Debug impl must redact the secret bytes (lint check
+    /// 37): the rendered string carries the `<redacted>` marker and NEVER the
+    /// plaintext, for both constructors.
+    #[test]
+    fn seal_context_debug_redacts_plaintext() {
+        let ctx = ctx_of(&[("anthropic/api_key", "sk-ant-DO-NOT-PRINT")]);
+        let rendered = format!("{ctx:?}");
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug must show the redaction marker"
+        );
+        assert!(
+            !rendered.contains("sk-ant-DO-NOT-PRINT"),
+            "Debug must not leak the secret value"
+        );
+        assert!(
+            !rendered.contains("anthropic/api_key"),
+            "Debug must not leak secret names either"
+        );
+
+        let ctx2 = SealContext::from_bytes(br#"{"k":"from-bytes-SECRET"}"#.to_vec());
+        let rendered2 = format!("{ctx2:?}");
+        assert!(rendered2.contains("<redacted>"));
+        assert!(!rendered2.contains("from-bytes-SECRET"));
+    }
+
+    /// An EMPTY secrets map round-trips through the full claim → seal → open
+    /// path (the no-secret-node case under `required` mode).
+    #[test]
+    fn empty_secrets_map_round_trips() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![(
+            "worker-empty".to_string(),
+            worker_sk.verifying_key(),
+        )]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(
+            exec,
+            0,
+            SealContext::new(&HashMap::<String, String>::new()).unwrap(),
+        );
+
+        let we = WorkerEphemeral::generate();
+        let claim =
+            SecretClaim::new_signed(exec, "worker-empty".into(), we.public_key(), &worker_sk);
+        let sealed = handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("sealed");
+        let plaintext = we
+            .open(
+                &sealed.epk_c,
+                exec,
+                "worker-empty",
+                &sealed.ciphertext,
+                &sealed.nonce,
+            )
+            .expect("opens");
+        let recovered: HashMap<String, String> = serde_json::from_slice(&plaintext).unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    /// Wrong-key failure on the full round-trip: the sealed payload only
+    /// opens under the EXACT ephemeral secret whose public half was in the
+    /// claim. An attacker holding a different ephemeral (or observing epk_w
+    /// on the bus) recovers nothing.
+    #[test]
+    fn sealed_secrets_do_not_open_under_wrong_ephemeral() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![("worker-wk".to_string(), worker_sk.verifying_key())]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, 0, ctx_of(&[("k", "super-secret")]));
+
+        let we = WorkerEphemeral::generate();
+        let claim = SecretClaim::new_signed(exec, "worker-wk".into(), we.public_key(), &worker_sk);
+        let sealed = handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("sealed");
+
+        // A DIFFERENT ephemeral (attacker's own keypair) must fail to open.
+        let attacker = WorkerEphemeral::generate();
+        assert!(
+            attacker
+                .open(
+                    &sealed.epk_c,
+                    exec,
+                    "worker-wk",
+                    &sealed.ciphertext,
+                    &sealed.nonce
+                )
+                .is_err(),
+            "wrong ephemeral secret must not open the seal"
+        );
+    }
+
+    /// Tamper rejection on the full round-trip: a flipped ciphertext byte
+    /// fails BOTH the controller signature check and the AEAD open; opening
+    /// under a different exec_id or worker_id fails the AAD binding.
+    #[test]
+    fn tampered_or_transposed_seal_is_rejected() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![("worker-tam".to_string(), worker_sk.verifying_key())]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let controller_vk = controller_sk.verifying_key();
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, 0, ctx_of(&[("k", "super-secret")]));
+
+        let we = WorkerEphemeral::generate();
+        let claim = SecretClaim::new_signed(exec, "worker-tam".into(), we.public_key(), &worker_sk);
+        let mut sealed = handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("sealed");
+
+        // On-bus ciphertext bit-flip: the Ed25519 signature covers the
+        // ciphertext, so verify() fails first...
+        sealed.ciphertext[0] ^= 0x01;
+        assert!(
+            sealed.verify(&controller_vk, 60).is_err(),
+            "tampered ciphertext must fail the controller signature"
+        );
+        // ...and even a worker that skipped verify() fails the GCM tag.
+        assert!(
+            we.open(
+                &sealed.epk_c,
+                exec,
+                "worker-tam",
+                &sealed.ciphertext,
+                &sealed.nonce
+            )
+            .is_err(),
+            "tampered ciphertext must fail AEAD open"
+        );
+
+        // AAD transposition: a clean seal for exec A does not open as exec B
+        // or as a different worker (fresh flow — the ephemeral above was consumed).
+        let exec2 = Uuid::new_v4();
+        seals.register(exec2, 0, ctx_of(&[("k", "super-secret")]));
+        let we2 = WorkerEphemeral::generate();
+        let claim2 =
+            SecretClaim::new_signed(exec2, "worker-tam".into(), we2.public_key(), &worker_sk);
+        let sealed2 = handle_secret_claim(&claim2, &seals, &controller_sk, 60).expect("sealed");
+        assert!(
+            we2.open(
+                &sealed2.epk_c,
+                Uuid::new_v4(), // wrong exec_id → AAD mismatch
+                "worker-tam",
+                &sealed2.ciphertext,
+                &sealed2.nonce
+            )
+            .is_err(),
+            "seal must be bound to its exec_id"
+        );
+    }
+
+    /// Key-rotation ring verify: with TWO keys registered for one worker_id
+    /// (old + new during rotation), a claim signed by EITHER authenticates.
+    #[test]
+    fn rotation_ring_accepts_either_registered_key() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let old_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let new_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![
+            ("worker-rot".to_string(), old_sk.verifying_key()),
+            ("worker-rot".to_string(), new_sk.verifying_key()),
+        ]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+
+        let seals = InFlightSeals::new();
+        for sk in [&old_sk, &new_sk] {
+            let exec = Uuid::new_v4();
+            seals.register(exec, 0, ctx_of(&[("k", "v")]));
+            let we = WorkerEphemeral::generate();
+            let claim = SecretClaim::new_signed(exec, "worker-rot".into(), we.public_key(), sk);
+            handle_secret_claim(&claim, &seals, &controller_sk, 60)
+                .expect("claim signed with a registered ring key must seal");
+        }
+        assert!(seals.is_empty());
+    }
+
+    /// A claim whose worker_id was swapped post-signature (to another
+    /// REGISTERED worker) must fail auth — the id is inside the signed bytes
+    /// — and must NOT consume the seal context.
+    #[test]
+    fn claim_with_transposed_worker_id_rejected_without_taking_context() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let sk_a = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let sk_b = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![
+            ("worker-ta".to_string(), sk_a.verifying_key()),
+            ("worker-tb".to_string(), sk_b.verifying_key()),
+        ]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+
+        let we = WorkerEphemeral::generate();
+        let mut claim = SecretClaim::new_signed(exec, "worker-ta".into(), we.public_key(), &sk_a);
+        claim.worker_id = "worker-tb".to_string(); // transpose to another real worker
+        assert_eq!(
+            handle_secret_claim(&claim, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::Unauthorized
+        );
+        assert_eq!(seals.len(), 1, "context must survive the rejected claim");
+    }
+
+    /// A validly-signed claim for an exec_id this replica never dispatched
+    /// (or already swept) is `UnknownExecution` — fail-closed, no seal.
+    #[test]
+    fn valid_claim_for_undispatched_execution_rejected() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![("worker-ud".to_string(), worker_sk.verifying_key())]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+
+        let seals = InFlightSeals::new(); // nothing registered
+        let we = WorkerEphemeral::generate();
+        let claim = SecretClaim::new_signed(
+            Uuid::new_v4(),
+            "worker-ud".into(),
+            we.public_key(),
+            &worker_sk,
+        );
+        assert_eq!(
+            handle_secret_claim(&claim, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::UnknownExecution
+        );
+    }
+
+    /// A low-order (all-zero) ephemeral key from an AUTHENTICATED worker
+    /// fails the seal with `SealFailed` (non-contributory ECDH is rejected).
+    /// The context is RE-REGISTERED on seal failure (2026-07-24 fix) so the
+    /// execution can re-claim — a transient seal error (or a self-inflicted
+    /// bad-key attempt) no longer permanently strands the job's secrets.
+    #[test]
+    fn low_order_ephemeral_key_fails_seal_but_context_is_recoverable() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![("worker-lo".to_string(), worker_sk.verifying_key())]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+
+        // [0u8; 32] is the identity/low-order point: X25519 output is all-zero
+        // → `was_contributory()` is false → derive_seal_key fails closed.
+        let bad_claim = SecretClaim::new_signed(exec, "worker-lo".into(), [0u8; 32], &worker_sk);
+        match handle_secret_claim(&bad_claim, &seals, &controller_sk, 60) {
+            Err(ClaimError::SealFailed(_)) => {}
+            other => panic!("expected SealFailed for low-order epk_w, got {other:?}"),
+        }
+        // NEW behavior: the context is restored, so a subsequent legitimate
+        // claim (real ephemeral key) succeeds — the seal failure did not
+        // strand the execution.
+        assert!(
+            !seals.is_empty(),
+            "context must be re-registered after a failed seal so the execution can retry"
+        );
+        let we = WorkerEphemeral::generate();
+        let good_claim =
+            SecretClaim::new_signed(exec, "worker-lo".into(), we.public_key(), &worker_sk);
+        let sealed = handle_secret_claim(&good_claim, &seals, &controller_sk, 60)
+            .expect("re-claim after re-registration must succeed");
+        // The recovered ephemeral secret can open the seal — proving the
+        // restored context carried the original secret bytes intact.
+        let opened = we
+            .open(
+                &sealed.epk_c,
+                exec,
+                "worker-lo",
+                &sealed.ciphertext,
+                &sealed.nonce,
+            )
+            .expect("open sealed secrets");
+        let recovered: HashMap<String, String> = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(recovered.get("k").map(String::as_str), Some("v"));
+        // And single-claim still holds: the successful claim consumed it.
+        assert!(seals.is_empty(), "successful re-claim consumes the context");
+    }
+
+    #[test]
+    fn claim_with_wrong_signature_rejected_without_taking_context() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        // Register worker-A's key, but sign the claim with worker-B's key under
+        // worker-A's id — authentication must fail and the context survive.
+        let real_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let forger_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        set_dynamic_worker_public_keys(vec![("worker-A".to_string(), real_sk.verifying_key())]);
+        let controller_sk = aegix_workflow_job_protocol::generate_dispatch_signing_key();
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, 0, ctx_of(&[("k", "v")]));
+        let we = WorkerEphemeral::generate();
+        let claim = SecretClaim::new_signed(exec, "worker-A".into(), we.public_key(), &forger_sk);
+        assert_eq!(
+            handle_secret_claim(&claim, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::Unauthorized
+        );
+        assert_eq!(
+            seals.len(),
+            1,
+            "unauthorized claim must not take the context"
+        );
+    }
+}

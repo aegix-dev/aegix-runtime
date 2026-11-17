@@ -1,0 +1,4229 @@
+//! Aegix Worker - WASM Execution Engine
+//!
+//! Production-grade worker with:
+//! - OpenTelemetry metrics (Prometheus)
+//! - Distributed tracing (Jaeger)
+//! - Health checks
+//! - Graceful shutdown
+//! - NATS-based job queue
+//! - HMAC-signed job verification
+//! - AES-256-GCM encrypted secrets in transit
+
+use aegix_workflow_job_protocol::{
+    load_worker_key_ring, JobRequest, JobResult, JobStatus, VerifyError, VerifyFailureKind,
+};
+use async_nats::Client;
+use async_nats::Subscriber;
+use futures_util::stream::StreamExt;
+use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
+use worker::error_sanitize::sanitize_error_message;
+use worker::job_span::JobSpan;
+use worker::module_fetcher::{
+    self, cosign_pin_under_profile, enforce_production_sigstore_policy_explicit,
+    parse_cosign_version, parse_semver_triple, resolve_and_hash_cosign_binary,
+    validate_sigstore_identity_regexp_for_policy, FetchedModule, SigstorePolicy,
+};
+use worker::runtime::{RetryPolicy, SecurityPolicy};
+use worker::secret_claim;
+use worker::worker_identity;
+use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
+
+use worker::runtime::AegixRuntime;
+
+mod dispatch_replay;
+#[cfg(test)]
+mod fuel_emission_pin;
+#[cfg(test)]
+mod inference_wait_pin;
+#[cfg(test)]
+mod outbound_tls_pin;
+#[cfg(test)]
+mod redis_acl_contract;
+#[cfg(test)]
+mod refused_dispatch_pin;
+#[cfg(test)]
+mod rehearsal_pin;
+mod rejected_jobs;
+#[cfg(test)]
+mod retry_policy_pin;
+#[cfg(test)]
+mod sealing_refusal_pin;
+
+/// Default maximum concurrent single-node job executions. Overridable via
+/// `AEGIX_MAX_CONCURRENT_JOBS`; see [`max_concurrent_jobs`].
+const DEFAULT_MAX_CONCURRENT_JOBS: usize = 100;
+/// Maximum concurrent single-node job executions (env `AEGIX_MAX_CONCURRENT_JOBS`).
+///
+/// Reuses the canonical `nonzero_env_or_default` footgun guard: a
+/// non-numeric or `<= 0` value would create a `Semaphore` that permits
+/// nothing (silent worker stall), so it is rejected with a WARN and the
+/// default is substituted (`>= 1` by construction). Same class as the
+/// documented `=0`/negative env-var footgun pattern.
+fn max_concurrent_jobs() -> usize {
+    worker::runtime::nonzero_env_or_default(
+        "AEGIX_MAX_CONCURRENT_JOBS",
+        DEFAULT_MAX_CONCURRENT_JOBS,
+    )
+}
+
+/// Ceiling on the per-job fuel THIS worker will honour from a dispatch's
+/// `max_fuel`.
+///
+/// Default [`aegix_workflow_job_protocol::MAX_JOB_FUEL`] (50 M, the
+/// controller's own per-node cap); `AEGIX_WORKER_MAX_JOB_FUEL` lowers or raises
+/// it per fleet. Defence in depth behind the signature: since 2026-09-10
+/// `JobRequest.max_fuel` is signature-bound, so an on-wire rewrite fails
+/// verification — this clamp is for the OTHER sender, a controller that
+/// mis-caps (or a future controller whose cap is raised without the fleet's
+/// consent). Cached: fixed for the process lifetime.
+fn worker_max_job_fuel() -> u64 {
+    static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        worker::runtime::nonzero_env_or_default(
+            "AEGIX_WORKER_MAX_JOB_FUEL",
+            aegix_workflow_job_protocol::MAX_JOB_FUEL,
+        )
+    })
+}
+
+/// Resolve the fuel override a dispatch asked for against this worker's
+/// ceiling. `0` means "use the runtime default" and stays `None`; anything
+/// else is `Some(min(requested, ceiling))`. Logs when it actually clamps, so
+/// a controller handing out more than the fleet allows is visible rather
+/// than silently honoured at the lower number. Pure apart from the log.
+fn clamp_job_fuel(job_id: uuid::Uuid, requested: u64, ceiling: u64) -> Option<u64> {
+    if requested == 0 {
+        return None;
+    }
+    if requested > ceiling {
+        ::tracing::warn!(
+            target: "talos_security",
+            job_id = %job_id,
+            requested_fuel = requested,
+            ceiling_fuel = ceiling,
+            event_kind = "job_fuel_clamped",
+            "dispatch asked for more fuel than this worker's ceiling — clamping"
+        );
+        return Some(ceiling);
+    }
+    Some(requested)
+}
+
+// ============================================================================
+// RELIABILITY: Result Publishing with Retry
+// ============================================================================
+
+/// Connection options every worker connect branch starts from.
+///
+/// Two things the broker-side permission model needs from the CLIENT:
+///
+/// 1. **The worker's own inbox prefix.** async-nats derives every
+///    request/reply inbox from one connection-level prefix (`_INBOX` by
+///    default — which the controller keeps). The worker's NATS credential
+///    is granted subscribe on `_WINBOX.>` and NOT on `_INBOX.>`
+///    (`aegix_workflow_job_protocol::nats_permissions`), so a worker whose
+///    requests still used `_INBOX` would never see a reply. Deploy note:
+///    a worker built with this prefix against a NATS with no permissions
+///    block works unchanged (the prefix is just a subject).
+/// 2. **An event callback.** A publish or subscribe the broker refuses is
+///    reported as an ASYNCHRONOUS `-ERR Permissions Violation …` on the
+///    connection — `publish()` still returns `Ok`, the subscription still
+///    exists locally and simply never delivers. Without a callback that is
+///    a silent drop; with one it is a WARN naming the subject, which is the
+///    only operator-visible signal that a credential and a code path have
+///    drifted apart.
+fn worker_connect_options() -> async_nats::ConnectOptions {
+    worker_connect_options_watched(None)
+}
+
+/// [`worker_connect_options`], with the `identity` connection's refusal watch
+/// (`worker::nats_identity::AuthRefusalWatch`): a worker whose reconnects are
+/// refused as unauthorized, after it had connected, exits (2026-11-06).
+fn worker_connect_options_watched(
+    watch: Option<Arc<worker::nats_identity::AuthRefusalWatch>>,
+) -> async_nats::ConnectOptions {
+    async_nats::ConnectOptions::new()
+        .custom_inbox_prefix(aegix_workflow_job_protocol::nats_permissions::WORKER_INBOX_PREFIX)
+        .event_callback(move |event| {
+            let watch = watch.clone();
+            async move {
+                if let Some(w) = &watch {
+                    if w.on_event(&event) == worker::nats_identity::AuthWatchVerdict::Exit {
+                        ::tracing::error!(
+                            target: "talos_security",
+                            worker_id = %worker_identity(),
+                            refusals = worker::nats_identity::AUTH_REFUSALS_BEFORE_EXIT,
+                            "the broker keeps refusing this worker's identity (deactivated, or no \
+                             controller answers the NATS auth callout): exiting so a restart gives \
+                             the worker a fresh identity"
+                        );
+                        std::process::exit(3);
+                    }
+                }
+                match &event {
+                    async_nats::Event::ServerError(err) => ::tracing::warn!(
+                        target: "talos_nats",
+                        error = %err,
+                        "NATS server error on the worker connection — a `Permissions Violation` \
+                         here means this credential is not granted that subject (see \
+                         aegix_workflow_job_protocol::nats_permissions); the operation was \
+                         dropped by the broker, not by the worker"
+                    ),
+                    async_nats::Event::ClientError(err) => ::tracing::warn!(
+                        target: "talos_nats",
+                        error = %err,
+                        "NATS client error on the worker connection"
+                    ),
+                    async_nats::Event::SlowConsumer(sid) => ::tracing::warn!(
+                        target: "talos_nats",
+                        subscription = sid,
+                        "NATS slow consumer on the worker connection"
+                    ),
+                    async_nats::Event::Connected => {
+                        ::tracing::info!(target: "talos_nats", "NATS connected")
+                    }
+                    async_nats::Event::Disconnected
+                    | async_nats::Event::LameDuckMode
+                    | async_nats::Event::Draining
+                    | async_nats::Event::Closed => ::tracing::warn!(
+                        target: "talos_nats",
+                        event = %event,
+                        "NATS connection state change on the worker connection"
+                    ),
+                }
+            }
+        })
+}
+
+/// Connect under `AEGIX_WORKER_NATS_AUTH=identity` (2026-11-06): the worker's
+/// Ed25519 identity as an nkey, its id as the connection name, its own inbox
+/// prefix, and for an ephemeral identity the registration credential
+/// (`worker::nats_identity`). The broker's auth callout is answered by the
+/// controller, which may not be up yet when the worker starts, so a refused
+/// connect is retried for up to two minutes before the worker gives up.
+async fn connect_nats_with_identity(
+    nats_url: &str,
+    nats_url_safe: &str,
+    mode: aegix_worker_runtime::worker_identity::IdentityMode,
+    registration: Option<String>,
+) -> anyhow::Result<Client> {
+    const ATTEMPTS: u32 = 40;
+    let key = worker_result_signing_key().ok_or_else(|| {
+        anyhow::anyhow!(
+            "AEGIX_WORKER_NATS_AUTH=identity needs an Ed25519 identity: set \
+             AEGIX_WORKER_SIGNING_KEY, or AEGIX_WORKER_IDENTITY=ephemeral"
+        )
+    })?;
+    let worker_id = worker_identity();
+    let registration = (mode == aegix_worker_runtime::worker_identity::IdentityMode::Ephemeral)
+        .then_some(registration)
+        .flatten();
+    let watch = Arc::new(worker::nats_identity::AuthRefusalWatch::default());
+    let mut last_err = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let opts = worker::nats_identity::identity_connect_options(
+            worker_connect_options_watched(Some(watch.clone())),
+            worker_id,
+            key,
+            registration.clone(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        match aegix_nats_tls::apply_nats_ca(opts).connect(nats_url).await {
+            Ok(c) => {
+                println!(
+                    "      Connected to NATS as worker identity {worker_id} (own inbox scope) at {nats_url_safe}"
+                );
+                return Ok(c);
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                ::tracing::warn!(
+                    target: "talos_nats",
+                    attempt,
+                    worker_id = %worker_id,
+                    error = %e,
+                    "NATS refused this worker's identity connect (is the controller up and \
+                     serving the auth callout?); retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+    anyhow::bail!(
+        "could not connect to NATS at {nats_url_safe} as worker {worker_id} after {ATTEMPTS} \
+         attempts: {last_err}"
+    )
+}
+
+/// Publish a serialized payload to a NATS topic with exponential backoff retry.
+async fn publish_bytes_with_retry(
+    nc: &async_nats::Client,
+    topic: String,
+    payload: bytes::Bytes,
+    max_attempts: u32,
+) -> Result<(), String> {
+    let mut backoff_ms = 100u64;
+    for attempt in 0..max_attempts {
+        // `publish()` only enqueues into the client's outbound buffer — it returns
+        // Ok before the server has seen the message. Every caller of this helper is
+        // delivering a signed JobResult / reply, and the controller's reply-inbox
+        // await has no independent timeout floor, so a message dropped between the
+        // local buffer and the broker (connection blip, buffer discard) is a SILENT
+        // loss that hangs the execution until the 30-min stale sweep. `flush()`
+        // drains the buffer to the server and awaits acceptance, turning that loss
+        // into a retriable error instead of a false success. Cost is one round-trip
+        // per job result (infrequent) — acceptable for delivery-critical results.
+        let sent = match nc.publish(topic.clone(), payload.clone()).await {
+            Ok(()) => nc.flush().await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match sent {
+            Ok(()) => {
+                if attempt > 0 {
+                    ::tracing::info!(topic, attempt, "Published (flushed) after retries");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if attempt < max_attempts - 1 {
+                    ::tracing::warn!(
+                        topic,
+                        attempt = attempt + 1,
+                        max_attempts,
+                        error = %e,
+                        "Failed to publish+flush, retrying"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(5_000);
+                } else {
+                    return Err(format!(
+                        "Failed to publish+flush to {} after {} attempts: {}",
+                        topic, max_attempts, e
+                    ));
+                }
+            }
+        }
+    }
+    Err("Unexpected retry loop exit".to_string())
+}
+
+/// Publish result to NATS with exponential backoff retry.
+///
+/// Single-publish architecture (post-r301): the result is published to
+/// EXACTLY ONE subject per call:
+///
+///  * `Some(reply)` (NATS request-reply): publish to the inbox the
+///    requester is awaiting on. The requester (engine dispatcher,
+///    webhook dispatcher, gmail/gcal handlers, etc.) verifies the
+///    result inline and writes durable state through its own path.
+///  * `None` (true fire-and-forget): publish to the global
+///    `talos.results.{job_id}` topic so the controller's
+///    `talos.results.*` audit subscriber can update `module_executions`
+///    durably. There is no inline requester to consume the reply.
+///
+/// Pre-r301 the worker dual-published to BOTH the reply inbox AND
+/// `talos.results.{job_id}` "for logging/audit". The controller had
+/// two verifiers consuming these (the dispatcher + the audit
+/// subscriber) and both ran `JobResult::verify()`, sharing the
+/// process-local `JOB_NONCE_CACHE`. Once `WORKER_SHARED_KEY` started
+/// loading reliably (post-r294 vault bootstrap fix), the second
+/// verifier always hit "result_nonce already seen" and EVERY workflow
+/// execution failed (r300 was the protocol-level mitigation;
+/// single-publish is the source-level architectural fix).
+///
+/// Today, every NATS-dispatched path uses request-reply (engine,
+/// webhooks, gmail, gcal); `run_sandbox` and `test_module` run WASM
+/// in-process and don't hit NATS at all. Audit subscriber-only paths
+/// don't currently exist, but the fire-and-forget code path is kept
+/// for future use (e.g. async work-queue dispatches that don't await
+/// the result inline).
+/// H-1: Reconcile the wire-format NATS `msg.reply` (untrusted —
+/// flows over an unsigned header an attacker can modify) with the
+/// HMAC-bound `JobRequest::reply_topic` (signed, trustworthy when
+/// present). Returns the subject the worker SHOULD publish the
+/// signed JobResult to, or `None` if no reply path is available.
+///
+/// Decision matrix:
+/// - (Some(signed), Some(wire)) where signed == wire → trust both;
+///   return Some(signed). Hot path.
+/// - (Some(signed), Some(wire)) where signed != wire → log a
+///   SECURITY-level warning AND publish to the SIGNED value. The
+///   wire value is attacker-controllable; the signed value is the
+///   one the controller committed to.
+/// - (Some(signed), None) → publish to the signed value. Indicates
+///   the wire header was stripped in transit (rare; treat the
+///   signed value as authoritative).
+/// - (None, Some(wire)) → IGNORE the wire value and return `None`
+///   (2026-09-10). Until then this arm trusted the unsigned header as a
+///   backward-compat path; the last controller dispatcher that relied
+///   on it (the live webhook path) now signs its inbox, so an unsigned
+///   header with no signed twin is treated exactly like no header.
+/// - (None, None) → no reply path; the worker publishes to the
+///   fire-and-forget `talos.results.{job_id}` topic.
+///
+/// Pure function so the policy is unit-testable without a NATS
+/// broker. The `job_id` parameter is for log correlation only.
+pub(crate) fn pick_trusted_reply_topic(
+    job_id: uuid::Uuid,
+    signed: Option<&str>,
+    wire: Option<&str>,
+) -> Option<String> {
+    match (signed, wire) {
+        (Some(s), Some(w)) if s == w => Some(s.to_string()),
+        (Some(s), Some(w)) => {
+            ::tracing::error!(
+                job_id = %job_id,
+                signed_reply = %s,
+                wire_reply = %w,
+                "SECURITY: H-1 reply_topic mismatch — wire msg.reply does not match \
+                 HMAC-bound JobRequest.reply_topic. Publishing to the SIGNED value; \
+                 wire value is likely attacker-tampered."
+            );
+            Some(s.to_string())
+        }
+        (Some(s), None) => {
+            ::tracing::warn!(
+                job_id = %job_id,
+                signed_reply = %s,
+                "H-1: msg.reply stripped in transit; publishing to HMAC-bound reply_topic"
+            );
+            Some(s.to_string())
+        }
+        (None, Some(w)) => {
+            // 2026-09-10 review: this arm used to return `Some(w)` — the one
+            // place the worker still honoured an UNSIGNED wire reply header.
+            // With the webhook dispatcher now signing its inbox (H-1 parity),
+            // no controller path in this workspace sends `reply_topic: None`
+            // AND awaits a wire reply; the remaining `None` senders
+            // (gmail/gcal/gcp push, DLQ replay) are fire-and-forget and read
+            // `talos.results.<job_id>`. A wire header with no signed twin is
+            // therefore either a stale controller or a bus participant
+            // steering a replayed job's output to itself — the result goes
+            // to the audit topic, never to the header.
+            ::tracing::debug!(
+                job_id = %job_id,
+                wire_reply_len = w.len(),
+                "reply_topic unsigned (None) but a wire msg.reply was present — \
+                 ignoring the wire header; result goes to talos.results.<job_id>"
+            );
+            None
+        }
+        (None, None) => {
+            // L-12 (2026-05-22): the result will be published to the
+            // global `talos.results.{job_id}` topic by the caller
+            // (publish_result_with_retry). That path is intended for the
+            // controller's audit subscriber — but if neither the
+            // signed `reply_topic` NOR the wire `msg.reply` is set AND
+            // the operator hasn't configured an audit subscriber, the
+            // result effectively disappears (broker delivers to zero
+            // subscribers, no error returned). Emit a structured event
+            // here so the condition is visible in dashboards and a
+            // misconfigured dispatch path doesn't degrade silently.
+            //
+            // `target: "talos_worker_metrics"` lets operators alert via
+            // a single filter; `event_kind` is the stable identifier.
+            ::tracing::warn!(
+                target: "talos_worker_metrics",
+                job_id = %job_id,
+                event_kind = "job_result_no_reply",
+                "neither signed reply_topic nor wire msg.reply set — result \
+                 will publish to the global audit topic only. If no audit \
+                 subscriber is configured this result is lost."
+            );
+            None
+        }
+    }
+}
+
+// L-11 (2026-05-22): The worker's self-reported identity, bound into
+// every signed `JobResult` via
+// `sign_with_worker_id`, is `worker::worker_identity` — the canonical
+// resolver lives in the library so both the binary AND library code
+// (e.g. `host_impl::build_signed_agent_envelope`) share the same
+// `OnceLock`-cached value. (The binary previously carried a thin
+// wrapper fn; now that the binary consumes the library crate directly
+// the wrapper is gone and call sites use the imported fn.)
+
+#[cfg(test)]
+mod worker_identity_tests {
+    use super::worker_identity;
+
+    #[test]
+    fn returns_validatable_id() {
+        let id = worker_identity();
+        // Whatever the resolution branch, the output must satisfy the
+        // protocol's validator — that's what the worker is going to
+        // pass to `sign_with_worker_id` in production.
+        aegix_workflow_job_protocol::validate_worker_id(id)
+            .expect("resolved worker_id must satisfy validate_worker_id");
+    }
+
+    #[test]
+    fn cached_across_calls() {
+        // OnceLock semantics: stable address means stable string.
+        let a: &'static str = worker_identity();
+        let b: &'static str = worker_identity();
+        assert_eq!(a.as_ptr(), b.as_ptr(), "worker_identity must be cached");
+    }
+}
+
+/// M-7: Hard ceiling on the serialized JobResult bytes the worker
+/// will attempt to publish to NATS. Without a pre-publish cap, an
+/// oversized `output_payload` (legitimately large or hostile) silently
+/// fails at the broker layer (default NATS `max_payload` is 1 MiB)
+/// and the controller times out waiting for a reply that will never
+/// arrive. The worker has already done the work; the failure is in
+/// the last-mile transport with no signal to either side.
+///
+/// 4 MiB matches the typical `max_payload` we configure on the NATS
+/// JetStream servers in production (it can be bumped via NATS config).
+/// `WORKER_MAX_JOB_RESULT_BYTES=0` falls back to the default; an
+/// explicit positive value overrides.
+const DEFAULT_MAX_JOB_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+fn max_job_result_bytes() -> usize {
+    std::env::var("WORKER_MAX_JOB_RESULT_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_JOB_RESULT_BYTES)
+}
+
+/// M-7: Replace an oversized `JobResult` with a small "output too
+/// large" error result that still signs and publishes successfully.
+/// Pure data transform so the policy is unit-testable.
+///
+/// Preserves `job_id`, `status` (downgraded to `Failed`), and
+/// `execution_time_ms` so callers can still correlate; drops the
+/// oversized `output_payload` and `logs` (replaces with a single
+/// diagnostic line). The new result MUST be re-signed by the caller
+/// before publishing — the signature carries `output_hash` so it
+/// would be invalid otherwise.
+fn truncate_oversized_job_result(
+    result: &JobResult,
+    serialized_len: usize,
+    cap: usize,
+) -> JobResult {
+    JobResult {
+        // B-9: the replacement answers the same dispatch the original did.
+        dispatch_attempt: result.dispatch_attempt,
+        workflow_execution_id: result.workflow_execution_id,
+        // Preserve the token accounting — the usage was real even though
+        // the oversized output is dropped, and the entry vec is small
+        // (capped at MAX_LLM_USAGE_ENTRIES) so it can't re-breach the cap.
+        llm_usage: result.llm_usage.clone(),
+        crypto_scheme: 0,
+        job_id: result.job_id,
+        status: JobStatus::Failed,
+        output_payload: serde_json::json!({
+            "error": "job_result_too_large",
+            "diag": {
+                "serialized_bytes": serialized_len,
+                "cap_bytes": cap,
+                "note": "Worker dropped the original output_payload to keep \
+                         under WORKER_MAX_JOB_RESULT_BYTES. Reduce module \
+                         output size or raise the cap if this is legitimate."
+            }
+        })
+        .into(),
+        logs: vec![format!(
+            "[host] dropped {serialized_len}-byte result (cap {cap})"
+        )],
+        execution_time_ms: result.execution_time_ms,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+        // Preserve the fuel for the same reason as the token accounting: the
+        // module ran and spent it, and dropping it here would hide exactly
+        // the runs large enough to breach the cap from the fuel budget.
+        fuel: result.fuel,
+    }
+}
+
+async fn publish_result_with_retry(
+    nc: &async_nats::Client,
+    result: &JobResult,
+    max_attempts: u32,
+    reply_topic: Option<String>,
+    shared_key: &aegix_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    // Serialize once so we can size-check before deciding how to
+    // publish. serde_json::to_vec on a JobResult is cheap (single
+    // pass) and we'd serialize anyway downstream.
+    let serialized = match serde_json::to_vec(&result) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!("Failed to serialize result: {}", e));
+        }
+    };
+
+    let cap = max_job_result_bytes();
+    let payload = if serialized.len() > cap {
+        // M-7: degrade to a "result too large" error message so the
+        // controller gets a signed Failed status instead of a silent
+        // broker rejection + timeout. Sign the replacement; bail with
+        // a Err only if signing itself fails (which would indicate the
+        // shared key is mis-configured and is already loud upstream).
+        ::tracing::error!(
+            job_id = %result.job_id,
+            serialized_bytes = serialized.len(),
+            cap_bytes = cap,
+            "JobResult exceeds NATS publish cap — substituting a small Failed result so the controller doesn't time out"
+        );
+        let mut replacement = truncate_oversized_job_result(result, serialized.len(), cap);
+        // L-11: bind the worker's identity into the signature so the
+        // controller's audit log records which pod emitted the
+        // truncated-replacement result. RFC 0010 P2: prefer the per-worker
+        // Ed25519 key when configured, else legacy HMAC. See `sign_job_result`.
+        if let Err(e) = sign_job_result(&mut replacement, shared_key) {
+            return Err(format!("Failed to sign oversized-result replacement: {e}"));
+        }
+        match serde_json::to_vec(&replacement) {
+            Ok(v) => bytes::Bytes::from(v),
+            Err(e) => return Err(format!("Failed to serialize replacement: {e}")),
+        }
+    } else {
+        bytes::Bytes::from(serialized)
+    };
+
+    if let Some(reply) = reply_topic {
+        publish_bytes_with_retry(nc, reply, payload, max_attempts).await
+    } else {
+        let result_topic = aegix_workflow_job_protocol::subjects::results_for(result.job_id);
+        publish_bytes_with_retry(nc, result_topic, payload, max_attempts).await
+    }
+}
+
+/// Build the uniform "failed" `JobResult` shape used by every
+/// pre-dispatch rejection path in [`execute_job`] (deadline, secret
+/// decryption, module acquisition, hash checks): `status: Failed`,
+/// `output_payload: {"error": msg}`, elapsed time from `start`, and
+/// empty logs/signature/nonce/worker-id (the publish path signs it).
+/// The world a job's signed `capability_world` hint names: `Ok(None)` for no
+/// hint, `Ok(Some(world))` for a world this worker knows, `Err` for a hint it
+/// does not (the parser maps any unknown string to `Unknown`, which the
+/// runtime would read as "no hint" — E2-3).
+fn job_world_hint(raw: Option<&str>) -> Result<Option<worker::wit_inspector::CapabilityWorld>, ()> {
+    use worker::wit_inspector::CapabilityWorld;
+    match raw {
+        None => Ok(None),
+        Some(s) => match s.parse::<CapabilityWorld>() {
+            Ok(CapabilityWorld::Unknown) | Err(_) => Err(()),
+            Ok(world) => Ok(Some(world)),
+        },
+    }
+}
+
+fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> JobResult {
+    JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
+        llm_usage: vec![],
+        crypto_scheme: 0,
+        job_id,
+        status: JobStatus::Failed,
+        output_payload: json!({ "error": msg }).into(),
+        logs: vec![],
+        execution_time_ms: start.elapsed().as_millis() as u64,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+        fuel: None,
+    }
+}
+
+/// Build the operator-facing message for the per-job execution timeout.
+///
+/// **Takes the same `Duration` that armed `tokio::time::timeout`**, so the
+/// reported number cannot disagree with the number that was enforced. That is
+/// the point of the function: until 2026-08-25 the timeout arm built the string
+/// `"execution timed out after 30 seconds"` as a HARDCODED literal while
+/// `job_timeout` was per-node and variable (`req.timeout_ms`, else
+/// `WASM_EXECUTION_TIMEOUT_SECS`, default **120**). No node on the reference
+/// deployment had ever been given 30 s: fourteen recorded timeouts ran with an
+/// enforced 110 s (×4) or 120 s (×10), so the message understated the real
+/// budget by ~4× in 14 of 14 cases and led an operator to propose raising a
+/// "30 s default" that does not exist.
+///
+/// `source` names WHERE the limit came from so the operator knows which knob to
+/// turn; it is one of two fixed strings, never a request field. The message
+/// carries no payload, secret, host or worker id — it reaches
+/// `workflow_executions.error_message`.
+///
+/// **The attribution is deliberately hedged, and that is not sloppiness.** The
+/// controller resolves `node_timeouts[node].unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS)`
+/// (`engine_dispatch_single.rs`) and sends only the RESULT, so a non-zero
+/// `req.timeout_ms` is indistinguishable here between "the node declared
+/// `timeout_secs`" and "the node declared nothing and the controller applied its
+/// own default". Asserting the former would be a fresh instance of the very
+/// defect this function exists to fix: right number, wrong attribution, operator
+/// sent to edit a field that is not set.
+///
+/// Keeps the substring `timed out`, which
+/// `aegix_retry_intelligence::classify_error` matches to produce the `timeout`
+/// class.
+fn timeout_error_message(job_timeout: std::time::Duration, request_supplied: bool) -> String {
+    let ms = job_timeout.as_millis();
+    let source = if request_supplied {
+        "enforced limit from job timeout_ms: node timeout_secs, else controller default"
+    } else {
+        "enforced limit from worker default WASM_EXECUTION_TIMEOUT_SECS"
+    };
+    if ms.is_multiple_of(1000) {
+        format!(
+            "execution timed out after {} seconds ({})",
+            ms / 1000,
+            source
+        )
+    } else {
+        format!("execution timed out after {ms} ms ({source})")
+    }
+}
+
+#[cfg(test)]
+mod timeout_message_tests {
+    use super::timeout_error_message;
+    use std::time::Duration;
+
+    /// The headline regression: a node with a NON-30s budget must report its
+    /// OWN number. 110 s is not a hypothetical — it is the live
+    /// budget of an extract node on the reference deployment, which produced
+    /// four of the fourteen recorded timeouts while the message said
+    /// "30 seconds".
+    #[test]
+    fn node_supplied_timeout_reports_its_own_value() {
+        let msg = timeout_error_message(Duration::from_secs(110), true);
+        assert!(
+            msg.contains("110 seconds"),
+            "must report the enforced 110s, got: {msg}"
+        );
+        assert!(
+            !msg.contains("30 seconds"),
+            "must not report the retired hardcoded literal, got: {msg}"
+        );
+        assert!(
+            msg.contains("job timeout_ms"),
+            "must name where the limit arrived from, got: {msg}"
+        );
+        // Hedged on purpose — see `timeout_error_message`. The worker cannot
+        // distinguish a node-declared `timeout_secs` from the controller's own
+        // default, so it must not claim either one.
+        assert!(
+            msg.contains("else controller default"),
+            "attribution must stay hedged, got: {msg}"
+        );
+    }
+
+    /// The worker fallback is 120 s (`WASM_EXECUTION_TIMEOUT_SECS`), which is
+    /// what ten of the fourteen recorded timeouts actually enforced.
+    #[test]
+    fn worker_fallback_timeout_reports_120_and_names_the_env_var() {
+        let msg = timeout_error_message(Duration::from_secs(120), false);
+        assert!(msg.contains("120 seconds"), "got: {msg}");
+        assert!(
+            msg.contains("WASM_EXECUTION_TIMEOUT_SECS"),
+            "must name the env var an operator would change, got: {msg}"
+        );
+        assert!(!msg.contains("job timeout_ms"), "got: {msg}");
+    }
+
+    /// A 30 s budget still says 30 — the fix is not "never print 30", it is
+    /// "print what was enforced". This is the case the old literal got right
+    /// by accident, and it must keep working.
+    #[test]
+    fn thirty_second_budget_still_reports_thirty() {
+        let msg = timeout_error_message(Duration::from_secs(30), true);
+        assert!(msg.contains("30 seconds"), "got: {msg}");
+    }
+
+    /// `req.timeout_ms` is milliseconds, so a sub-second-precision budget must
+    /// not be silently truncated to a wrong whole number of seconds (1 500 ms
+    /// reported as "1 seconds" would be a smaller instance of the same class).
+    #[test]
+    fn sub_second_precision_is_reported_in_ms_not_truncated() {
+        let msg = timeout_error_message(Duration::from_millis(1_500), true);
+        assert!(msg.contains("1500 ms"), "got: {msg}");
+        assert!(!msg.contains("1 seconds"), "got: {msg}");
+    }
+
+    /// Retry-classification coupling. `aegix_retry_intelligence::classify_error`
+    /// buckets this message by the substring `timed out` (it matches BOTH
+    /// "timed out" and "timeout"; see CLAUDE.md) and `timeout` is transient, so
+    /// a node with `retry_count > 0` retries. Rewording the message without
+    /// this substring would silently reclassify every node timeout as
+    /// `unknown` (non-transient) — the exact "classification derived from
+    /// prose" hazard `classify_verify_failure` was rewritten to escape.
+    /// Asserted here rather than in the classifier crate because `worker` does
+    /// not depend on `aegix-retry-intelligence`; this guards the token, not the
+    /// classifier's own behaviour.
+    #[test]
+    fn message_keeps_the_token_the_retry_classifier_matches() {
+        for (d, node) in [
+            (Duration::from_secs(110), true),
+            (Duration::from_secs(120), false),
+            (Duration::from_millis(1_500), true),
+        ] {
+            let msg = timeout_error_message(d, node);
+            assert!(
+                msg.to_lowercase().contains("timed out"),
+                "classifier token missing, got: {msg}"
+            );
+        }
+    }
+}
+
+/// Worker-side gate for the MCP-1212 signature-failure diagnostic (the
+/// enriched field dump built in `signature_failure_payload`). OFF by
+/// default. Same env var as the controller's dispatch-side diagnostic so one
+/// setting lights up both halves during an investigation. Read once at first
+/// use; changing the env after boot has no effect.
+///
+/// Since 2026-11-15 the dump for a dispatch that did not verify is written to
+/// this worker's own log (target `signature_diag`, the controller's) and sent
+/// nowhere: such a dispatch gets no result at all (`refused_dispatch_answer`).
+/// The one refusal that is still answered is of a dispatch the controller
+/// signed, and with the gate on its answer carries the dump as before.
+static WORKER_SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| aegix_config::bool_env_or_default("AEGIX_SIGNATURE_DIAG", false));
+
+/// Coarse, non-sensitive classification of a verify failure.
+///
+/// Thin alias for [`aegix_workflow_job_protocol::verify_failure_class`], which
+/// is where this mapping LIVES as of 2026-09-23. The tokens are unchanged; what
+/// moved is the home, because the controller's dispatcher is now a second
+/// reader of the token this worker stamps (it re-dispatches a rejection whose
+/// class is in `PRE_EXECUTION_REJECTION_CLASSES` instead of handing the prose
+/// to the node's module-error retry policy). A second copy here would let the
+/// receiver's idea of a class and the sender's retry decision drift apart
+/// silently — the same "one home" rule the tokens themselves were rewritten for
+/// in 2026-08-25, when this was a `contains()` scan over the verifier's error
+/// TEXT rather than a total match over its TYPED reason.
+///
+/// Kept as a named function rather than inlining the call so the worker's own
+/// `signature_failure_payload_tests` keep naming the concept they pin. They
+/// drive the SHARED body through it — there is one implementation.
+fn classify_verify_failure(kind: VerifyFailureKind) -> &'static str {
+    aegix_workflow_job_protocol::verify_failure_class(kind)
+}
+
+/// Build the `output_payload` for a signature-verification failure.
+///
+/// `diag_enabled == false` (production default): a generic error only —
+/// no request-derived bytes reach the signed result. `true`: the full
+/// MCP-1212 field dump for controller↔worker divergence debugging.
+/// Pure function so both shapes are unit-testable (see
+/// `signature_failure_payload_tests`).
+fn signature_failure_payload(
+    diag_enabled: bool,
+    req: &JobRequest,
+    verify_error: &VerifyError,
+) -> serde_json::Value {
+    // The headline is the operator's ONLY signal when the diagnostic is off, so
+    // it must not say "signature verification failed" for a message that was
+    // rejected on AGE before its signature was ever evaluated.
+    //
+    // `verify_failure_headline`, NOT `describe_verify_failure`: the gated-OFF
+    // arm must contain no byte derived from the UNAUTHENTICATED request, and
+    // the protocol detail can echo one (the `crypto_scheme` byte, the age the
+    // sender chose). The class token carries the actionable part; the full
+    // detail is in the worker's own log, which is never signed or republished.
+    let headline =
+        aegix_workflow_job_protocol::verify_failure_headline("Job dispatch", verify_error.kind());
+    if !diag_enabled {
+        // Always carry the coarse CLASS of failure. Pre-2026-07-27 this arm
+        // returned the bare string, which left a live incident with no signal
+        // at all: replay, an unconfigured key, a scheme mismatch and a genuine
+        // HMAC divergence are entirely different faults with entirely
+        // different fixes, and they were indistinguishable to the operator.
+        //
+        // The class is derived from OUR OWN verifier's error text, never from
+        // request fields — that distinction is the whole security rationale
+        // for gating the rich dump, since those fields are attacker-
+        // controllable on an UNVERIFIED request and get echoed into a result
+        // the worker then signs.
+        return json!({
+            "error": headline,
+            "reason_class": classify_verify_failure(verify_error.kind()),
+        });
+    }
+    let (worker_input_hash, worker_secrets_hash, worker_input_byte_len) = req.diag_hashes();
+    json!({
+        // Operator opted in: the detail and the observed age are useful here and
+        // the echo risk is explicitly accepted (see the gate's doc comment).
+        "error": aegix_workflow_job_protocol::describe_verify_failure("Job dispatch", verify_error),
+        "reason_class": classify_verify_failure(verify_error.kind()),
+        "age_secs": verify_error.age_secs(),
+        "diag": {
+            "verify_error": verify_error.to_string(),
+            "worker_input_hash": worker_input_hash,
+            "worker_secrets_hash": worker_secrets_hash,
+            "worker_input_byte_len": worker_input_byte_len,
+            "signature_byte_len": req.signature.len(),
+            "job_nonce": req.job_nonce,
+            "module_uri": req.module_uri,
+            "actor_id": req.actor_id.map(|u| u.to_string()),
+            "user_id": req.user_id.to_string(),
+            "allowed_hosts": req.allowed_hosts,
+            "allowed_methods": req.allowed_methods,
+            "allowed_secrets": req.allowed_secrets,
+            "allowed_sql_operations": req.allowed_sql_operations,
+            "allow_tier2_exposure": req.allow_tier2_exposure,
+            "integration_name": req.integration_name,
+            "expected_wasm_hash": req.expected_wasm_hash,
+            "timeout_ms": req.timeout_ms,
+            "note": "Compare these worker-computed values against the controller's `signature_diag` WARN log entry for the same job_id to identify which signed field diverged (enable it on the controller with AEGIX_SIGNATURE_DIAG=1)."
+        }
+    })
+}
+
+#[cfg(test)]
+mod signature_failure_payload_tests {
+    use super::*;
+    use aegix_workflow_job_protocol::{EncryptedSecrets, LlmTier};
+    use uuid::Uuid;
+
+    fn err(kind: VerifyFailureKind) -> VerifyError {
+        VerifyError::from_parts(kind, "hmac mismatch", None)
+    }
+
+    /// Each class implies a DIFFERENT operator action, so they must not
+    /// collapse: key_config is a deploy/env fault, scheme_mismatch is
+    /// controller/worker version skew, replay is a nonce-cache interaction,
+    /// stale_timestamp is a LIVENESS failure, and mismatch is a genuine
+    /// signing-payload divergence.
+    #[test]
+    fn verify_failures_classify_into_distinct_actionable_classes() {
+        assert_eq!(classify_verify_failure(VerifyFailureKind::Replay), "replay");
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::SchemeRefused),
+            "scheme_mismatch"
+        );
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::KeyError),
+            "key_config"
+        );
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::Stale),
+            "stale_timestamp"
+        );
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::ClockSkewAhead),
+            "stale_timestamp"
+        );
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::BadSignature),
+            "mismatch"
+        );
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::MalformedNonce),
+            "mismatch"
+        );
+    }
+
+    /// The token set and the headline must AGREE: anything the worker labels
+    /// `stale_timestamp` must also be reported as a liveness failure, and
+    /// nothing else may be. Guards against the two paths drifting apart — the
+    /// exact way this bug class returns.
+    #[test]
+    fn stale_timestamp_class_and_liveness_headline_never_disagree() {
+        for &kind in VerifyFailureKind::ALL {
+            let e = VerifyError::from_parts(kind, "x", None);
+            let headline = aegix_workflow_job_protocol::describe_verify_failure("Job dispatch", &e);
+            let says_signature_failed = headline.contains("signature verification failed");
+            assert_eq!(
+                classify_verify_failure(kind) == "stale_timestamp",
+                kind.is_liveness(),
+                "class/liveness disagreement for {kind:?}"
+            );
+            assert!(
+                !(kind.is_liveness() && says_signature_failed),
+                "a liveness failure must never be headlined as a signature failure: {headline}"
+            );
+        }
+    }
+
+    /// The gated-OFF payload must carry the class but NOTHING derived from the
+    /// unverified request — that echo is the security reason the rich dump is
+    /// gated in the first place.
+    #[test]
+    fn ungated_payload_carries_class_but_no_request_fields() {
+        let req = unauthenticated_req();
+        let v = signature_failure_payload(false, &req, &err(VerifyFailureKind::BadSignature));
+        assert_eq!(v["error"], "Job dispatch signature verification failed");
+        assert_eq!(v["reason_class"], "mismatch");
+        assert!(v.get("diag").is_none(), "no rich dump when gated off");
+        // The gated-OFF payload gets SIGNED and published in reply to an
+        // UNAUTHENTICATED request, so it must carry no byte derived from that
+        // request — not even the verifier's own detail string, which can echo
+        // the sender-chosen `crypto_scheme` byte or age.
+        assert!(
+            !v.to_string().contains("hmac mismatch"),
+            "protocol detail must not reach the signed ungated payload: {v}"
+        );
+        let rendered = v.to_string();
+        assert!(
+            !rendered.contains("worker_input_hash") && !rendered.contains("module_uri"),
+            "must not leak request-derived fields: {rendered}"
+        );
+    }
+
+    /// Security review 2026-10-14, B-9: a result the worker signs for a
+    /// request names that request's attempt and execution, and the binding is
+    /// under the signature — the dispatcher takes only an answer to the
+    /// attempt it is waiting on.
+    #[test]
+    fn a_signed_result_answers_the_request_it_was_signed_for() {
+        let mut req = unauthenticated_req();
+        req.dispatch_attempt = 2;
+        let ring = aegix_workflow_engine_core::WorkerKeyRing::single(
+            aegix_workflow_engine_core::WorkerSharedKey::new(vec![0x24; 32]),
+        );
+        let mut result = failed_result(req.job_id, &std::time::Instant::now(), "x");
+        sign_job_result_for(&mut result, &req, &ring).expect("sign");
+        assert_eq!(
+            result.answers(&req.dispatch_identity()),
+            aegix_workflow_job_protocol::ResultAnswer::ThisDispatch
+        );
+        result
+            .verify_no_replay_dispatch(&ring, &[], 300, true)
+            .expect("the bound result verifies");
+    }
+
+    pub(super) fn unauthenticated_req() -> JobRequest {
+        JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            module_uri: "wasm://attacker-chosen/v1".to_string(),
+            input_payload: serde_json::json!({"x": 1}).into(),
+            encrypted_secrets: EncryptedSecrets::empty(),
+            timeout_ms: 30000,
+            priority: 100,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            allowed_hosts: vec!["attacker-chosen-host".to_string()],
+            allowed_methods: vec![],
+            allowed_secrets: vec!["attacker-chosen-secret".to_string()],
+            allowed_sql_operations: vec![],
+            allow_tier2_exposure: false,
+            signature: vec![1, 2, 3],
+            max_llm_tier: LlmTier::default(),
+            max_write_ceiling: aegix_workflow_job_protocol::WriteCeiling::default(),
+            egress_scope: None,
+            http_verb_ceiling: None,
+            job_nonce: "attacker-chosen-nonce".to_string(),
+            actor_id: None,
+            wasm_bytes: None,
+            capability_world: None,
+            integration_name: None,
+            user_id: Uuid::nil(),
+            expected_wasm_hash: None,
+            max_fuel: 0,
+            dry_run: false,
+            read_only_posts: Vec::new(),
+            reply_topic: None,
+            idempotency_key: None,
+            dispatch_attempt: 0,
+        }
+    }
+
+    /// Default (diag OFF): no attacker-supplied byte may reach the payload
+    /// the worker will sign and publish. Asserted as a PROPERTY rather than
+    /// byte-equality — the payload gained a coarse `reason_class` (2026-07-27)
+    /// because the bare string left a live incident with no signal at all, and
+    /// pinning the exact object would fail on that improvement while proving
+    /// nothing extra about the leak this test actually guards.
+    #[test]
+    fn diag_disabled_emits_generic_error_only() {
+        let payload = signature_failure_payload(
+            false,
+            &unauthenticated_req(),
+            &err(VerifyFailureKind::BadSignature),
+        );
+        assert_eq!(
+            payload["error"],
+            "Job dispatch signature verification failed"
+        );
+        // The class is one of OUR tokens, never the verifier's raw text.
+        assert!(
+            [
+                "replay",
+                "scheme_mismatch",
+                "key_config",
+                "stale_timestamp",
+                "mismatch"
+            ]
+            .contains(&payload["reason_class"].as_str().unwrap_or_default()),
+            "reason_class must be a known token, got {:?}",
+            payload["reason_class"]
+        );
+        assert!(
+            payload.get("diag").is_none(),
+            "rich dump must stay gated when diag is off"
+        );
+        let raw = payload.to_string();
+        for tainted in ["attacker-chosen", "hmac mismatch"] {
+            assert!(
+                !raw.contains(tainted),
+                "unauthenticated request bytes leaked into signed result: {tainted}"
+            );
+        }
+    }
+
+    /// A dispatch that aged out must not tell the operator its signature failed
+    /// — the worker leg of the same 2026-08-20/24 misattribution.
+    #[test]
+    fn an_aged_out_dispatch_is_not_reported_as_a_signature_failure() {
+        for kind in [VerifyFailureKind::Stale, VerifyFailureKind::ClockSkewAhead] {
+            let v = signature_failure_payload(false, &unauthenticated_req(), &err(kind));
+            let msg = v["error"].as_str().expect("error is a string");
+            assert!(
+                !msg.contains("signature verification failed"),
+                "{kind:?} headlined as tampering: {msg}"
+            );
+            assert!(msg.contains(aegix_workflow_job_protocol::LIVENESS_REJECTION_MARKER));
+            assert_eq!(v["reason_class"], "stale_timestamp");
+        }
+    }
+
+    /// Diag ON (explicit operator opt-in): full MCP-1212 field dump.
+    #[test]
+    fn diag_enabled_carries_divergence_fields() {
+        let payload = signature_failure_payload(
+            true,
+            &unauthenticated_req(),
+            &err(VerifyFailureKind::BadSignature),
+        );
+        let diag = payload.get("diag").expect("diag block present");
+        assert_eq!(diag["verify_error"], "hmac mismatch");
+        assert_eq!(diag["module_uri"], "wasm://attacker-chosen/v1");
+        assert!(diag.get("worker_input_hash").is_some());
+    }
+}
+
+/// 2026-11-15: a dispatch that does not verify is answered with nothing a
+/// controller will take. Each test builds the dispatch a controller really
+/// made for a job (`live`), then the message a sender WITHOUT the controller's
+/// key puts on the jobs subject for it, drives the worker's own verifier and
+/// its one rule for the answer, signs whatever comes back exactly as the
+/// intake does, and asks the receiver's two questions of it
+/// (`JobResult::answers` for the live dispatch, the worker's signature).
+#[cfg(test)]
+mod refused_dispatch_tests {
+    use super::signature_failure_payload_tests::unauthenticated_req;
+    use super::*;
+    use aegix_workflow_job_protocol::ResultAnswer;
+
+    fn ring() -> aegix_workflow_engine_core::WorkerKeyRing {
+        aegix_workflow_engine_core::WorkerKeyRing::single(
+            aegix_workflow_engine_core::WorkerSharedKey::new(vec![0x24; 32]),
+        )
+    }
+
+    /// The worker's verify settings on a fleet-key bus: no controller public
+    /// key, legacy HMAC dispatches accepted.
+    fn fleet_key_dvc() -> DispatchVerifyConfig {
+        DispatchVerifyConfig {
+            ed_keys: Vec::new(),
+            accept_legacy_hmac: true,
+        }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs()
+    }
+
+    /// A dispatch the controller signed for a job that is now running: its
+    /// second attempt, with a reply inbox.
+    fn live_dispatch(ring: &aegix_workflow_engine_core::WorkerKeyRing) -> JobRequest {
+        let mut live = unauthenticated_req();
+        live.module_uri = "wasm://modules/send-report/v3".to_string();
+        live.reply_topic = Some("_INBOX.controller.live-job".to_string());
+        live.dispatch_attempt = 1;
+        live.sign(ring.signing_key().as_bytes())
+            .expect("the controller signs");
+        live
+    }
+
+    /// What a sender with no key can write: everything about the live
+    /// dispatch that is readable on the bus, under a signature it made up.
+    fn forged_for(live: &JobRequest, nonce_secs: u64) -> JobRequest {
+        let mut forged = live.clone();
+        forged.job_nonce = format!("{nonce_secs}:{}", hex::encode([0x5a_u8; 16]));
+        forged.signature = vec![0xaa; 32];
+        forged
+    }
+
+    /// What the intake does with the rule's answer, and what a controller
+    /// waiting on `live` makes of it: `None` when nothing is sent, otherwise
+    /// `(taken as the live job's result, read as a job that never ran)`.
+    fn what_a_controller_makes_of(
+        answer: Option<JobResult>,
+        sent: &JobRequest,
+        live: &JobRequest,
+        ring: &aegix_workflow_engine_core::WorkerKeyRing,
+    ) -> Option<(bool, bool)> {
+        answer.map(|mut result| {
+            sign_job_result_for(&mut result, sent, ring).expect("the worker signs");
+            let taken = result.answers(&live.dispatch_identity()) == ResultAnswer::ThisDispatch
+                && result
+                    .verify_no_replay_dispatch(ring, &[], 300, true)
+                    .is_ok();
+            (taken, result.is_pre_execution_rejection())
+        })
+    }
+
+    #[test]
+    fn a_forged_dispatch_for_a_running_job_is_answered_with_nothing() {
+        let ring = ring();
+        let dvc = fleet_key_dvc();
+        let live = live_dispatch(&ring);
+        let forged = forged_for(&live, now_secs());
+        assert_eq!(
+            pick_trusted_reply_topic(forged.job_id, forged.reply_topic.as_deref(), None).as_deref(),
+            live.reply_topic.as_deref(),
+            "vacuity guard: an answer would go to the live job's inbox"
+        );
+
+        let refusal = forged
+            .verify_dispatch(&ring, &dvc.ed_keys, 300, dvc.accept_legacy_hmac)
+            .expect_err("a made-up signature does not verify");
+        assert_eq!(refusal.kind(), VerifyFailureKind::BadSignature);
+
+        let answer = refused_dispatch_answer(&forged, &refusal, &ring, &dvc, false);
+        assert_eq!(
+            what_a_controller_makes_of(answer, &forged, &live, &ring),
+            None,
+            "a worker-signed failure for a forged dispatch is the running job's result \
+             to the controller waiting on it: (taken, read as never ran)"
+        );
+    }
+
+    /// Age is read before the signature, so a forged dispatch with an old
+    /// timestamp is refused as `Stale`, the class a dispatcher answers by
+    /// sending the job again. It gets nothing either.
+    #[test]
+    fn a_forged_dispatch_with_an_old_timestamp_is_answered_with_nothing() {
+        let ring = ring();
+        let dvc = fleet_key_dvc();
+        let live = live_dispatch(&ring);
+        for nonce_secs in [now_secs() - 900, now_secs() + 900] {
+            let forged = forged_for(&live, nonce_secs);
+            let refusal = forged
+                .verify_dispatch(&ring, &dvc.ed_keys, 300, dvc.accept_legacy_hmac)
+                .expect_err("refused on its time");
+            assert!(
+                refusal.is_liveness(),
+                "vacuity guard: refused before its signature was read ({:?})",
+                refusal.kind()
+            );
+            let answer = refused_dispatch_answer(&forged, &refusal, &ring, &dvc, false);
+            assert_eq!(
+                what_a_controller_makes_of(answer, &forged, &live, &ring),
+                None,
+                "a signed stale rejection for a forged dispatch has the dispatcher \
+                 re-send a job that is still running: (taken, read as never ran)"
+            );
+        }
+    }
+
+    /// The controller's own bytes, sent a second time: refused by the nonce
+    /// record, and not answered (the reply subject is the first sending's).
+    #[test]
+    fn a_replayed_dispatch_is_answered_with_nothing() {
+        let ring = ring();
+        let dvc = fleet_key_dvc();
+        let live = live_dispatch(&ring);
+        live.verify_dispatch(&ring, &dvc.ed_keys, 300, dvc.accept_legacy_hmac)
+            .expect("the first sending verifies and runs");
+        let refusal = live
+            .verify_dispatch(&ring, &dvc.ed_keys, 300, dvc.accept_legacy_hmac)
+            .expect_err("the second sending is a replay");
+        assert_eq!(refusal.kind(), VerifyFailureKind::Replay);
+        let answer = refused_dispatch_answer(&live, &refusal, &ring, &dvc, false);
+        assert_eq!(
+            what_a_controller_makes_of(answer, &live, &live, &ring),
+            None
+        );
+    }
+
+    /// The honest case that is kept: a dispatch the controller signed, refused
+    /// for the time it arrived at, is told so, and the dispatcher reads the
+    /// answer as a job that never ran. (The refusal is built here; that the
+    /// signature check holds on bytes genuinely signed in the past is
+    /// `the_signature_alone_tells_an_aged_dispatch_from_a_forged_one` in the
+    /// protocol crate, which can back-date a signature.)
+    #[test]
+    fn the_controllers_own_dispatch_refused_on_its_time_is_still_told_so() {
+        let ring = ring();
+        let dvc = fleet_key_dvc();
+        let live = live_dispatch(&ring);
+        for kind in [VerifyFailureKind::Stale, VerifyFailureKind::ClockSkewAhead] {
+            let refusal = VerifyError::from_parts(kind, "job_nonce is too old", Some(900));
+            let answer = refused_dispatch_answer(&live, &refusal, &ring, &dvc, false);
+            let payload = answer
+                .as_ref()
+                .expect("answered")
+                .output_payload
+                .value()
+                .clone();
+            assert_eq!(payload["reason_class"], "stale_timestamp");
+            assert_eq!(
+                what_a_controller_makes_of(answer, &live, &live, &ring),
+                Some((true, true)),
+                "{kind:?}: taken, and read as a job that never ran"
+            );
+        }
+    }
+
+    /// The whole table: only a refusal on TIME is ever answered, and only for
+    /// a dispatch whose signature this worker can vouch for under its own
+    /// scheme rules.
+    #[test]
+    fn only_a_refusal_on_time_of_a_dispatch_the_controller_signed_is_answered() {
+        let ring = ring();
+        let dvc = fleet_key_dvc();
+        let live = live_dispatch(&ring);
+        let forged = forged_for(&live, now_secs());
+        // Signed, but under a key this worker does not hold.
+        let other_ring = aegix_workflow_engine_core::WorkerKeyRing::single(
+            aegix_workflow_engine_core::WorkerSharedKey::new(vec![0x99; 32]),
+        );
+        let other_key = live_dispatch(&other_ring);
+        // Ed25519 is required here, so a fleet-key signature vouches for nothing.
+        let ed_only = DispatchVerifyConfig {
+            ed_keys: Vec::new(),
+            accept_legacy_hmac: false,
+        };
+        for &kind in VerifyFailureKind::ALL {
+            let refusal = VerifyError::from_parts(kind, "x", None);
+            let answered = |req: &JobRequest, dvc: &DispatchVerifyConfig| {
+                refused_dispatch_answer(req, &refusal, &ring, dvc, false).is_some()
+            };
+            assert_eq!(
+                answered(&live, &dvc),
+                kind.is_liveness(),
+                "{kind:?}, signed"
+            );
+            assert!(!answered(&forged, &dvc), "{kind:?}, forged");
+            assert!(!answered(&other_key, &dvc), "{kind:?}, another key");
+            assert!(
+                !answered(&live, &ed_only),
+                "{kind:?}, a scheme this worker refuses"
+            );
+            // The field dump an operator can switch on changes nothing here.
+            assert!(
+                refused_dispatch_answer(&forged, &refusal, &ring, &dvc, true).is_none(),
+                "{kind:?}, forged, diagnostic on"
+            );
+        }
+    }
+}
+
+/// RFC 0010 P1: worker-side dispatch-verify configuration, resolved once from
+/// env. The worker holds only the controller's *public* key(s), so it can verify
+/// an Ed25519-signed dispatch but cannot forge one — the asymmetric half of the
+/// worker-trust boundary.
+struct DispatchVerifyConfig {
+    /// Controller Ed25519 public key(s). Index 0 is current;
+    /// `AEGIX_CONTROLLER_PUBLIC_KEY_PREVIOUS` (comma-separated) adds rotated-out
+    /// keys for an overlap window. Empty ⇒ Ed25519 dispatches cannot be verified.
+    ed_keys: Vec<aegix_workflow_job_protocol::DispatchVerifyingKey>,
+    /// Whether legacy HMAC (scheme 0) dispatches are still accepted. `true` (the
+    /// default) is the rollout posture; `AEGIX_DISPATCH_REQUIRE_ED25519=1` flips
+    /// it to `false` — the RFC 0010 P4 enforcement flip that refuses HMAC once
+    /// the fleet is fully on Ed25519.
+    accept_legacy_hmac: bool,
+}
+
+/// Whether WASM loaded from unattested storage with no expected hash is
+/// refused (2026-10-29). Fail-closed by default; `AEGIX_ALLOW_UNATTESTED_WASM`
+/// admits it under `development` and, logged at ERROR on every boot, under
+/// `transitional`; `hardened` never admits it (and refuses the override at
+/// boot). Until this date the belt-and-braces predicate was `is_production()`,
+/// which left a staging worker to the override alone.
+fn unattested_wasm_blocked(
+    profile: aegix_config::security_profile::SecurityProfile,
+    allow_unattested: bool,
+) -> bool {
+    !(allow_unattested && (profile.honours_acknowledgements() || !profile.enforces()))
+}
+
+/// RFC 0010 P3 (D3b): whether `AEGIX_ENVELOPE_SEALING=required` — the worker
+/// downgrade-guard flag. Under `required` the worker refuses a `sealing == 0`
+/// (inline WSK) dispatch. `off`/`audit`/unset → `false` (both schemes handled).
+/// Cached; the flag is fixed for the process lifetime.
+fn worker_sealing_required() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("AEGIX_ENVELOPE_SEALING")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("required")
+        )
+    })
+}
+
+/// Whether a worker under `AEGIX_ENVELOPE_SEALING=required` may boot: only
+/// with a usable signing key, the identity it claims each job's secrets
+/// with. Pure, so the refusal is tested without an environment.
+fn sealing_requires_a_signing_key(
+    sealing_required: bool,
+    signing_key_usable: bool,
+) -> Result<(), &'static str> {
+    if sealing_required && !signing_key_usable {
+        return Err(
+            "AEGIX_ENVELOPE_SEALING=required but this worker has no usable \
+             AEGIX_WORKER_SIGNING_KEY (unset or invalid): it could claim no sealed \
+             secrets, so every job that carries secrets would fail after dispatch. Set \
+             the worker's Ed25519 seed (docs/worker-identity.md) or lower the mode.",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod unattested_wasm_tests {
+    use super::unattested_wasm_blocked;
+    use aegix_config::security_profile::SecurityProfile::{Development, Hardened, Transitional};
+
+    /// 2026-10-29: fail-closed without the override everywhere; the override
+    /// is honoured under development and transitional, never under hardened.
+    #[test]
+    fn the_override_is_honoured_everywhere_but_hardened() {
+        for p in [Hardened, Transitional, Development] {
+            assert!(
+                unattested_wasm_blocked(p, false),
+                "{p:?} without the override"
+            );
+        }
+        assert!(unattested_wasm_blocked(Hardened, true));
+        assert!(!unattested_wasm_blocked(Transitional, true));
+        assert!(!unattested_wasm_blocked(Development, true));
+    }
+}
+
+#[cfg(test)]
+mod sealing_boot_gate_tests {
+    use super::sealing_requires_a_signing_key as gate;
+
+    #[test]
+    fn required_without_a_key_refuses_and_names_both_settings() {
+        let err = gate(true, false).unwrap_err();
+        assert!(err.contains("AEGIX_ENVELOPE_SEALING=required"), "{err}");
+        assert!(err.contains("AEGIX_WORKER_SIGNING_KEY"), "{err}");
+    }
+
+    #[test]
+    fn every_other_combination_boots() {
+        assert_eq!(gate(true, true), Ok(()));
+        assert_eq!(gate(false, false), Ok(()));
+        assert_eq!(gate(false, true), Ok(()));
+    }
+}
+
+/// Load [`DispatchVerifyConfig`] once. Malformed public keys are skipped with a
+/// loud warning (so one bad key can't strand the worker), and enabling
+/// enforcement without a usable key is logged as an error — the worker then
+/// fails closed per-request (rejecting is safe; admitting a forgery is not).
+fn dispatch_verify_config() -> &'static DispatchVerifyConfig {
+    static CFG: std::sync::OnceLock<DispatchVerifyConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let mut ed_keys = Vec::new();
+        if let Ok(cur) = std::env::var("AEGIX_CONTROLLER_PUBLIC_KEY") {
+            match aegix_workflow_job_protocol::parse_ed25519_verifying_key_hex(&cur) {
+                Ok(k) => ed_keys.push(k),
+                Err(e) => ::tracing::error!(error = %e, "AEGIX_CONTROLLER_PUBLIC_KEY is invalid — Ed25519 dispatch verification disabled"),
+            }
+        }
+        if let Ok(prev) = std::env::var("AEGIX_CONTROLLER_PUBLIC_KEY_PREVIOUS") {
+            for (i, part) in prev.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+                match aegix_workflow_job_protocol::parse_ed25519_verifying_key_hex(part) {
+                    Ok(k) => ed_keys.push(k),
+                    Err(e) => ::tracing::warn!(index = i, error = %e, "skipping invalid AEGIX_CONTROLLER_PUBLIC_KEY_PREVIOUS entry"),
+                }
+            }
+        }
+        let require_ed25519 =
+            aegix_config::bool_env_or_default("AEGIX_DISPATCH_REQUIRE_ED25519", false);
+        if require_ed25519 && ed_keys.is_empty() {
+            ::tracing::error!(
+                target: "talos_security",
+                "AEGIX_DISPATCH_REQUIRE_ED25519 is on but no valid AEGIX_CONTROLLER_PUBLIC_KEY \
+                 is configured — the worker will reject ALL dispatches (fail-closed)"
+            );
+        }
+        DispatchVerifyConfig { ed_keys, accept_legacy_hmac: !require_ed25519 }
+    })
+}
+
+/// Fleet-wide operator-cancel listener.
+///
+/// # Why a PLAIN subscribe and never a queue subscribe
+///
+/// Every other worker subscription in this file is a `queue_subscribe`, because
+/// a job should be executed once by one member. A cancel is the opposite: the
+/// controller does not know which worker holds the execution's in-flight job,
+/// so the command has to reach EVERY worker. A queue group would deliver it to
+/// one arbitrary member and drop it for the rest — the cancel would appear to
+/// work and would silently miss most of the time. Workers that do not hold the
+/// execution treat it as a no-op.
+///
+/// # Verify-once
+///
+/// This is the SINGLE primary verifier for `CancelCommand` in a worker
+/// process. A second `verify_dispatch` against the same command would fail
+/// with `"cancel_nonce already seen"` — both would insert into the shared
+/// `JOB_NONCE_CACHE` (r300/r301). Observers use `verify_no_replay_dispatch`.
+///
+/// # Security
+///
+/// An unsigned or forged command is refused before the registry is touched, so
+/// NATS-publish access alone is not a denial-of-service primitive. Nothing
+/// secret is logged: the execution id is tenant data and is emitted only at
+/// DEBUG on the accepted path, never on the rejected one (an attacker must not
+/// be able to write chosen values into the log by publishing garbage).
+async fn run_cancel_listener(
+    nc: async_nats::Client,
+    runtime: Arc<AegixRuntime>,
+    shared_key: aegix_workflow_engine_core::WorkerKeyRing,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let subject = aegix_workflow_job_protocol::subjects::WORKERS_CMD_CANCEL;
+    let mut sub = match nc.subscribe(subject).await {
+        Ok(s) => s,
+        Err(e) => {
+            ::tracing::error!(
+                error = %e,
+                subject,
+                "failed to subscribe to the cancel command subject — operator \
+                 cancellation will not reach this worker"
+            );
+            return;
+        }
+    };
+    ::tracing::info!(
+        subject,
+        "Subscribed to operator-cancel commands (plain, fleet-wide)"
+    );
+
+    // A cancel is a 100-byte JSON object. Anything larger is not one, and
+    // deserialising it would be work an unauthenticated publisher chose for us.
+    const MAX_CANCEL_PAYLOAD_BYTES: usize = 4 * 1024;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            msg_opt = sub.next() => {
+                let Some(msg) = msg_opt else { break };
+                if msg.payload.len() > MAX_CANCEL_PAYLOAD_BYTES {
+                    ::tracing::warn!(
+                        payload_bytes = msg.payload.len(),
+                        "rejecting oversized cancel command"
+                    );
+                    continue;
+                }
+                let cmd: aegix_workflow_job_protocol::CancelCommand =
+                    match serde_json::from_slice(&msg.payload) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            // No error detail and no payload echo: the sender is
+                            // unauthenticated at this point.
+                            ::tracing::warn!("failed to decode cancel command");
+                            continue;
+                        }
+                    };
+
+                let dvc = dispatch_verify_config();
+                if let Err(e) = cmd.verify_dispatch(
+                    &shared_key,
+                    &dvc.ed_keys,
+                    aegix_workflow_job_protocol::EXECUTION_CANCEL_MAX_AGE_SECS,
+                    dvc.accept_legacy_hmac,
+                ) {
+                    ::tracing::warn!(
+                        target: "talos_security",
+                        detail = %aegix_workflow_job_protocol::describe_verify_failure(
+                            "cancel command", &e
+                        ),
+                        "refusing unverified cancel command"
+                    );
+                    continue;
+                }
+
+                let flagged = runtime.cancel_execution(cmd.workflow_execution_id);
+                if flagged > 0 {
+                    ::tracing::info!(
+                        execution_id = %cmd.workflow_execution_id,
+                        flagged,
+                        "operator cancel applied to in-flight job(s)"
+                    );
+                } else {
+                    // The COMMON case across the fleet — every worker that does
+                    // not hold this execution lands here. Not an error.
+                    ::tracing::debug!(
+                        execution_id = %cmd.workflow_execution_id,
+                        "cancel command for an execution not in flight here (no-op)"
+                    );
+                }
+            }
+        }
+    }
+    ::tracing::info!("cancel listener stopped");
+}
+
+/// RFC 0010 P2: the worker's per-instance Ed25519 **result-signing** key,
+/// resolved once from `AEGIX_WORKER_SIGNING_KEY` (a 32-byte hex seed sourced
+/// from a Secret / KMS — never a committed plaintext). `None` (the default) ⇒
+/// results keep the legacy `WORKER_SHARED_KEY` HMAC path (scheme 0). `Some` ⇒
+/// every `JobResult` is signed Ed25519 (scheme 1) under
+/// this key; the controller verifies against the matching public key registered
+/// for this worker's id in `AEGIX_WORKER_PUBLIC_KEYS`. Because the controller
+/// holds only the public half, a compromised worker can forge results as itself
+/// but never as another worker — the asymmetric result-path boundary.
+///
+/// A present-but-malformed seed fails closed to HMAC (loud error) rather than
+/// stranding the worker with no way to sign a result at all.
+fn worker_result_signing_key() -> Option<&'static aegix_workflow_job_protocol::DispatchSigningKey> {
+    static CFG: std::sync::OnceLock<Option<aegix_workflow_job_protocol::DispatchSigningKey>> =
+        std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        // An ephemeral identity's key is minted in memory, once per process
+        // (2026-11-06, worker::nats_identity); a configured one is read below.
+        if aegix_worker_runtime::worker_identity::identity_mode()
+            == aegix_worker_runtime::worker_identity::IdentityMode::Ephemeral
+        {
+            if std::env::var("AEGIX_WORKER_SIGNING_KEY").is_ok_and(|v| !v.trim().is_empty()) {
+                ::tracing::warn!(
+                    target: "talos_security",
+                    "AEGIX_WORKER_SIGNING_KEY is ignored under AEGIX_WORKER_IDENTITY=ephemeral"
+                );
+            }
+            ::tracing::info!(
+                target: "talos_security",
+                worker_id = %worker_identity(),
+                "minted an ephemeral Ed25519 worker identity (in memory only)"
+            );
+            return Some(worker::nats_identity::ephemeral_signing_key().clone());
+        }
+        // Inline, or as a file (AEGIX_WORKER_SIGNING_KEY_FILE, 2026-11-06: the
+        // compose production stack hands each replica its key as a compose
+        // secret, which `docker inspect` does not show).
+        let raw = match worker::nats_identity::value_or_file(
+            "AEGIX_WORKER_SIGNING_KEY",
+            std::env::var("AEGIX_WORKER_SIGNING_KEY").ok().as_deref(),
+            std::env::var("AEGIX_WORKER_SIGNING_KEY_FILE").ok().as_deref(),
+            |p| std::fs::read_to_string(p),
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => {
+                ::tracing::error!(target: "talos_security", error = %e,
+                    "the worker signing key could not be read — no Ed25519 identity");
+                return None;
+            }
+        };
+        match aegix_workflow_job_protocol::parse_ed25519_signing_key_hex(&raw) {
+            Ok(sk) => {
+                ::tracing::info!(
+                    target: "talos_security",
+                    "AEGIX_WORKER_SIGNING_KEY loaded — signing job results with per-worker Ed25519 (RFC 0010 P2)"
+                );
+                Some(sk)
+            }
+            Err(e) => {
+                ::tracing::error!(
+                    target: "talos_security",
+                    error = %e,
+                    "AEGIX_WORKER_SIGNING_KEY is invalid — falling back to legacy HMAC result signing"
+                );
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// B-5 (2026-10-14): register the fleet-wide dispatch replay guard, under the
+/// controller's own switch (`AEGIX_DISTRIBUTED_REPLAY`) and fail policy
+/// (`AEGIX_REPLAY_FAIL_CLOSED`). With the switch off the process-local nonce
+/// cache is the whole defence, as before.
+///
+/// Whether the Redis user this worker logged in as is the shared one
+/// (security review 2026-10-15, E2-6): `default` is the controller's, and with
+/// it a compromised worker writes any key the controller reads — a module's
+/// cached bytes, the controller's replay nonces, its idempotency records. The
+/// worker's own user is `talos-worker` with deploy/redis/worker.acl-rules.
+fn redis_user_is_shared(user: &str) -> bool {
+    user.trim() == "default"
+}
+
+/// Said once at boot, loudly where the deployment faces users. Not a refusal:
+/// a managed Redis without ACL users (or a chart install that has not given
+/// the worker `WORKER_REDIS_URL`) keeps working, and says so.
+async fn report_redis_identity(conn: &mut redis::aio::MultiplexedConnection) {
+    let who: redis::RedisResult<String> = redis::cmd("ACL").arg("WHOAMI").query_async(conn).await;
+    match who {
+        Ok(user) if redis_user_is_shared(&user) => {
+            if aegix_auth_types::browser_hardening_required() {
+                ::tracing::warn!(
+                    target: "talos_security",
+                    event_kind = "worker_redis_shared_credential",
+                    "the worker connects to Redis as `default`, the controller's user: a \
+                     compromised worker can write keys the controller reads. Give it the \
+                     `talos-worker` user (deploy/redis/worker.acl-rules, docs/redis-worker-user.md)"
+                );
+            }
+        }
+        Ok(user) => ::tracing::info!(target: "talos_security", redis_user = %user, "Redis user"),
+        Err(e) => {
+            ::tracing::debug!(error = %e, "ACL WHOAMI not answered (Redis without ACL users)")
+        }
+    }
+}
+
+#[cfg(test)]
+mod redis_identity_tests {
+    #[test]
+    fn only_the_default_user_is_the_shared_one() {
+        assert!(super::redis_user_is_shared("default"));
+        assert!(super::redis_user_is_shared(" default\n"));
+        assert!(!super::redis_user_is_shared("talos-worker"));
+    }
+}
+
+/// B2-2 (2026-10-15): with the switch on, the guard is registered whether or
+/// not Redis answers at boot. Until Redis answers, every dispatch is
+/// `store_unavailable` — refused when failing closed, the production default —
+/// where until then a worker that booted during a Redis outage ran every
+/// dispatch unchecked for its lifetime. A worker with no Redis configured at
+/// all has no guard, which the same policy refuses when failing closed.
+async fn register_dispatch_replay_guard(client: &redis::Client) {
+    if !aegix_replay_guard::distributed_replay_from_env() {
+        ::tracing::warn!(
+            target: "talos_security",
+            "AEGIX_DISTRIBUTED_REPLAY is off — a replayed dispatch is refused only by the \
+             worker that saw it first"
+        );
+        return;
+    }
+    let (guard, connected) = aegix_replay_guard::RedisReplayGuard::registering(client).await;
+    let guard = guard.with_prefix(dispatch_replay::KEY_PREFIX);
+    let fail_closed = aegix_replay_guard::fail_closed_from_env();
+    if let Err(e) = aegix_replay_guard::register_shared_replay_guard(Arc::new(guard)) {
+        ::tracing::error!(target: "talos_security", error = %e, "dispatch replay guard not registered");
+        return;
+    }
+    match connected {
+        Ok(()) => ::tracing::info!(
+            target: "talos_security",
+            fail_closed,
+            "dispatch replay guard registered (Redis) — a dispatch runs once per fleet"
+        ),
+        Err(e) => ::tracing::error!(
+            target: "talos_security",
+            error = %e,
+            fail_closed,
+            "AEGIX_DISTRIBUTED_REPLAY is on but Redis did not answer at boot — the replay \
+             guard is registered and connects when Redis does; until then every dispatch \
+             is refused when failing closed, admitted on this worker's cache otherwise"
+        ),
+    }
+}
+
+/// What the worker may sign in answer to a dispatch that failed
+/// `verify_dispatch`: nothing, with one exception (2026-11-15).
+///
+/// Nothing in a dispatch that did not verify is authenticated. Its job id,
+/// attempt, execution and reply subject are whatever its sender wrote, and for
+/// a job that is running all four are readable on the bus. Until this date
+/// the worker answered every such dispatch with a `Failed` result, signed with
+/// its own key, sent where the dispatch said. That is a genuine worker result
+/// for a job its sender chose: it names the attempt and execution the
+/// dispatcher is waiting on (`JobResult::answers`) and its signature is this
+/// worker's, so a controller took it as the running job's answer. A sender
+/// with no key could have any running job recorded as failed, retried while
+/// its first attempt still ran, or (with an old timestamp, which is refused
+/// before the signature is read) re-dispatched as a job that never started.
+/// The oversized and undecodable drops above the decode had already been
+/// reasoned this way (`rejected_jobs`); this is the same rule for the third
+/// kind of message the worker cannot vouch for.
+///
+/// The exception is a dispatch refused for the TIME it arrived at
+/// (`VerifyError::is_liveness`) whose signature IS the controller's
+/// (`verify_signature_only_dispatch`). Its job id, attempt, execution and
+/// reply subject are then the controller's own, and the answer is the
+/// `stale_timestamp` rejection the dispatcher re-sends on
+/// (`PRE_EXECUTION_REJECTION_CLASSES`): the honest case of a job that waited
+/// in a busy worker's queue, or crossed a suspended host, for longer than the
+/// window. Every other refusal is answered with nothing: a signature that
+/// does not hold, a nonce this process has already seen (a replay is never
+/// answered; `dispatch_replay`), a scheme or key this worker cannot check.
+/// The dispatcher's own wait ends such an attempt.
+///
+/// Stated limit: bytes the controller really signed, captured and sent again
+/// after the window while that same attempt is still running, are answered,
+/// and the dispatcher re-sends a job that is in flight. That needs a reader of
+/// the bus and an attempt longer than the window; the worker cannot tell it
+/// from the honest case, and the package record says what would.
+fn refused_dispatch_answer(
+    req: &JobRequest,
+    refusal: &VerifyError,
+    shared_key: &aegix_workflow_engine_core::WorkerKeyRing,
+    dvc: &DispatchVerifyConfig,
+    diag_enabled: bool,
+) -> Option<JobResult> {
+    if !refusal.is_liveness() {
+        return None;
+    }
+    if req
+        .verify_signature_only_dispatch(shared_key, &dvc.ed_keys, dvc.accept_legacy_hmac)
+        .is_err()
+    {
+        return None;
+    }
+    Some(JobResult {
+        dispatch_attempt: 0,
+        workflow_execution_id: None,
+        llm_usage: vec![],
+        crypto_scheme: 0,
+        job_id: req.job_id,
+        status: JobStatus::Failed,
+        output_payload: signature_failure_payload(diag_enabled, req, refusal).into(),
+        logs: vec![],
+        execution_time_ms: 0,
+        signature: vec![],
+        result_nonce: String::new(),
+        worker_id: String::new(),
+        fuel: None,
+    })
+}
+
+/// Sign a `JobResult`, preferring the per-worker Ed25519 key when configured
+/// (RFC 0010 P2) and falling back to the legacy `WORKER_SHARED_KEY` HMAC. Binds
+/// the worker's identity into the signature either way (L-11). Single source of
+/// truth for every `JobResult` sign site so the scheme can't diverge between the
+/// happy path and the oversized-result replacement path.
+fn sign_job_result(
+    result: &mut JobResult,
+    shared_key: &aegix_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    match worker_result_signing_key() {
+        Some(sk) => result.sign_ed25519_with_worker_id(sk, worker_identity()),
+        None => result.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity()),
+    }
+}
+
+/// Sign `result` as the answer to `req`: stamp the attempt and execution it
+/// answers (security review 2026-10-14, B-9), then [`sign_job_result`]. Every
+/// result the worker publishes for a request goes through here; the dispatcher
+/// takes only an answer to the attempt it is waiting on.
+fn sign_job_result_for(
+    result: &mut JobResult,
+    req: &aegix_workflow_job_protocol::JobRequest,
+    shared_key: &aegix_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    result.bind_to_request(req);
+    sign_job_result(result, shared_key)
+}
+
+/// Ed25519 verifying keys that may vouch for a CACHED result signed by
+/// `worker_id` (the idempotency cache's Redis tier re-verifies before it
+/// re-publishes). The fleet's registered keys (`AEGIX_WORKER_PUBLIC_KEYS`, a
+/// controller-side setting that is usually absent on a worker) plus THIS
+/// worker's own key when the result is its own — so a same-identity restart or
+/// a same-worker Redis hit re-admits its own Ed25519 result. A sibling's
+/// Ed25519 result with no registered key fails re-verification and falls
+/// through to re-execution: the safe direction, and no worse than the HMAC-only
+/// verifier this replaced, which could re-admit NO Ed25519 result at all.
+fn cached_result_verify_keys(
+    worker_id: &str,
+) -> Vec<aegix_workflow_job_protocol::DispatchVerifyingKey> {
+    let mut keys = aegix_workflow_job_protocol::worker_public_keys(worker_id);
+    if worker_id == worker_identity() {
+        if let Some(sk) = worker_result_signing_key() {
+            keys.push(sk.verifying_key());
+        }
+    }
+    keys
+}
+
+/// RFC 0014 P2: sign a `JobProgress` exactly as a `JobResult` is signed — the
+/// worker's Ed25519 key when configured, the fleet HMAC otherwise — so the
+/// dispatcher verifies both with the same key material.
+fn sign_job_progress(
+    progress: &mut aegix_workflow_job_protocol::JobProgress,
+    shared_key: &aegix_workflow_engine_core::WorkerKeyRing,
+) -> Result<(), String> {
+    match worker_result_signing_key() {
+        Some(sk) => progress.sign_ed25519_with_worker_id(sk, worker_identity()),
+        None => {
+            progress.sign_with_worker_id(shared_key.signing_key().as_bytes(), worker_identity())
+        }
+    }
+}
+
+/// RFC 0014 P2: tells the dispatcher a job is waiting for (then has) the
+/// local-inference slot, so its attempt window stands still while it queues.
+///
+/// Publishes a signed `JobProgress` to `<reply_inbox>.progress`, derived from
+/// the job's SIGNED `reply_topic` — the same controller the result will reach.
+/// A controller that predates P2 does not subscribe there and the message is
+/// dropped by the broker, so no rollout order is required. A failed publish is
+/// logged and otherwise ignored: the worker's own deadlines move regardless,
+/// and a controller that never hears about the wait gives up on the attempt
+/// exactly as it did before P2.
+struct NatsProgressNotifier {
+    nc: async_nats::Client,
+    subject: String,
+    job_id: uuid::Uuid,
+    dispatch_attempt: u32,
+    shared_key: aegix_workflow_engine_core::WorkerKeyRing,
+}
+
+impl worker::inference_wait::WaitNotifier for NatsProgressNotifier {
+    fn notify(
+        &self,
+        state: aegix_workflow_job_protocol::JobProgressState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let mut progress = aegix_workflow_job_protocol::JobProgress::new(
+                self.job_id,
+                self.dispatch_attempt,
+                state,
+            );
+            if let Err(e) = sign_job_progress(&mut progress, &self.shared_key) {
+                ::tracing::warn!(job_id = %self.job_id, error = %e, "job progress not signed; not sent");
+                return;
+            }
+            let bytes = match serde_json::to_vec(&progress) {
+                Ok(b) => b,
+                Err(e) => {
+                    ::tracing::warn!(job_id = %self.job_id, error = %e, "job progress not serialized; not sent");
+                    return;
+                }
+            };
+            if let Err(e) = self.nc.publish(self.subject.clone(), bytes.into()).await {
+                ::tracing::warn!(job_id = %self.job_id, error = %e, "job progress publish failed");
+                return;
+            }
+            ::tracing::info!(
+                job_id = %self.job_id,
+                dispatch_attempt = self.dispatch_attempt,
+                state = state.as_str(),
+                "reported local-inference wait to the dispatcher"
+            );
+        })
+    }
+}
+
+/// Verify a dispatch and, when it verifies, execute its Wasm module with
+/// observability.
+///
+/// * Verifies the dispatch signature (Ed25519 or legacy HMAC) before executing.
+///   A dispatch that does not verify is `Err`: NO result exists for it, and
+///   whether anything at all is sent in answer is [`refused_dispatch_answer`]'s
+///   to decide, not this function's.
+/// * Decrypts secrets from `req.encrypted_secrets` using the shared key.
+/// * Passes decrypted secrets to the runtime so WASM modules can access them
+///   via the `secrets::get-secret` host function.
+#[::tracing::instrument(name = "job-execution", skip_all)]
+async fn execute_job(
+    cx: &opentelemetry::Context,
+    req: JobRequest,
+    runtime: Arc<AegixRuntime>,
+    shared_key: aegix_workflow_engine_core::WorkerKeyRing,
+    // RFC 0010 P3 (D3b): NATS client for the secret-claim round-trip when a
+    // dispatch arrives with `sealing == SEALING_CLAIM_ECIES`.
+    nc: &async_nats::Client,
+) -> Result<JobResult, VerifyError> {
+    let start = std::time::Instant::now();
+
+    // The `#[instrument]` span above is THE job span; wrap it and link it to the
+    // propagated controller trace context. All `_span.*` calls below set
+    // attributes / events / status on it, exported via the otel bridge layer.
+    let mut _span = JobSpan::current_with_parent(cx);
+    _span.set_attribute("job_id", &req.job_id.to_string());
+    _span.set_attribute("module_uri", &req.module_uri);
+
+    // SECURITY: verify the dispatch signature + nonce freshness (300 s window).
+    // RFC 0010 P1: `verify_dispatch` routes on the request's `crypto_scheme` —
+    // Ed25519 against the controller public key(s), or legacy HMAC against the
+    // WORKER_SHARED_KEY ring (accepted while `accept_legacy_hmac`, refused once
+    // AEGIX_DISPATCH_REQUIRE_ED25519 flips it off). Ring-aware on the HMAC side
+    // so a rolling WORKER_SHARED_KEY rotation doesn't reject controller-signed
+    // jobs.
+    let dvc = dispatch_verify_config();
+    if let Err(e) = req.verify_dispatch(&shared_key, &dvc.ed_keys, 300, dvc.accept_legacy_hmac) {
+        // The stall is symmetric: the SAME host suspend that ages out a result
+        // on the controller ages out a dispatch here. Report which it was.
+        let headline = aegix_workflow_job_protocol::describe_verify_failure("Job dispatch", &e);
+        if e.is_liveness() {
+            ::tracing::warn!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                failure_kind = e.kind().label(),
+                age_secs = e.age_secs(),
+                "{headline}"
+            );
+        } else {
+            ::tracing::error!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                failure_kind = e.kind().label(),
+                "{headline}"
+            );
+        }
+        _span.set_attribute("error", e.kind().label());
+        _span.end_error(&headline);
+        return Err(e);
+    }
+
+    Ok(run_verified_job(_span, start, req, runtime, shared_key, nc).await)
+}
+
+/// The rest of [`execute_job`]: everything that happens to a dispatch AFTER
+/// it verified. Called from there and nowhere else.
+async fn run_verified_job(
+    mut _span: JobSpan,
+    start: std::time::Instant,
+    req: JobRequest,
+    runtime: Arc<AegixRuntime>,
+    shared_key: aegix_workflow_engine_core::WorkerKeyRing,
+    nc: &async_nats::Client,
+) -> JobResult {
+    let dvc = dispatch_verify_config();
+
+    // DEADLINE CHECK: Reject jobs whose deadline has already passed.
+    if req.deadline_unix_secs > 0 {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now_secs > req.deadline_unix_secs {
+            _span.set_attribute("error", "deadline_expired");
+            _span.end_error("Job deadline expired before execution started");
+            return failed_result(req.job_id, &start, "job deadline expired");
+        }
+    }
+
+    // RFC 0010 P3 (D3b): downgrade guard. Under `AEGIX_ENVELOPE_SEALING=required`
+    // the worker refuses a legacy inline dispatch that would DECRYPT a WSK
+    // envelope — the enforcement point that stops an on-wire downgrade from
+    // forcing the fleet-wide key back into use. A `sealing == 0` dispatch with an
+    // EMPTY `encrypted_secrets` decrypts nothing (a no-secret node), so it is
+    // allowed even under `required` — otherwise every secretless node (transforms,
+    // routers, …) would break. Only a non-empty WSK ciphertext under `required` is
+    // a refused downgrade. Under `off`/`audit` both schemes are handled.
+    if worker::secret_claim::inline_envelope_refused(worker_sealing_required(), &req) {
+        ::tracing::error!(
+            target: "talos_security",
+            job_id = %req.job_id,
+            "AEGIX_ENVELOPE_SEALING=required but dispatch carries a sealing=0 WSK envelope — refusing"
+        );
+        _span.end_error("envelope sealing required; inline dispatch refused");
+        return failed_result(
+            req.job_id,
+            &start,
+            "envelope sealing required; inline dispatch refused",
+        );
+    }
+
+    // SECURITY: obtain the job's secrets.
+    // - `sealing == 1` (P3): claim them via a signed `SecretClaim` to the
+    //   controller's `claim_inbox`; the controller seals to this worker's fresh
+    //   ephemeral key and the reply opens under it (forward secrecy). Fail-closed
+    //   on any claim/verify/open error — never run secretless.
+    // - `sealing == 0` (legacy): decrypt the inline WSK envelope. L-1
+    //   (2026-05-22): AAD = workflow_execution_id binds the AES-GCM tag to this
+    //   execution (already HMAC-bound in the signing payload), so a transposed
+    //   ciphertext fails the tag check here.
+    let secrets: aegix_workflow_job_protocol::SecretMap = if req.sealing
+        == aegix_workflow_job_protocol::SEALING_CLAIM_ECIES
+    {
+        let Some(signing_key) = worker_result_signing_key() else {
+            ::tracing::error!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                "sealing=1 dispatch requires AEGIX_WORKER_SIGNING_KEY to sign the claim"
+            );
+            _span.end_error("sealing=1 requires a worker signing key");
+            return failed_result(
+                req.job_id,
+                &start,
+                "sealing=1 dispatch requires a worker signing key",
+            );
+        };
+        match secret_claim::claim_secrets(
+            nc,
+            req.job_id,
+            req.dispatch_attempt,
+            req.claim_inbox.as_deref(),
+            worker_identity(),
+            signing_key,
+            &dvc.ed_keys,
+        )
+        .await
+        {
+            Ok(map) => map,
+            Err(e) => {
+                ::tracing::error!(
+                    target: "talos_security",
+                    job_id = %req.job_id,
+                    error = %e,
+                    "RFC 0010 P3 secret claim failed"
+                );
+                _span.end_error("secret claim failed");
+                return failed_result(req.job_id, &start, "failed to obtain sealed secrets");
+            }
+        }
+    } else if req.encrypted_secrets.is_empty() {
+        HashMap::new()
+    } else {
+        match req
+            .encrypted_secrets
+            .decrypt_with_ring(&shared_key, req.workflow_execution_id.as_bytes())
+        {
+            Ok(s) => s,
+            Err(e) => {
+                ::tracing::error!(job_id = %req.job_id, error = %e, "Failed to decrypt job secrets");
+                _span.end_error("Secret decryption failed");
+
+                return failed_result(req.job_id, &start, "failed to decrypt job secrets");
+            }
+        }
+    };
+
+    // Load the Wasm module bytes — acquisition (inline bytes / OCI pull
+    // with Sigstore + layer-digest verification / Redis cache /
+    // filesystem fallback) lives in `worker::module_fetcher::fetch`,
+    // which also documents the attestation model. On failure the
+    // FetchError message is byte-for-byte the string the inline code
+    // previously placed in the failed result and the span status.
+    let FetchedModule {
+        bytes: wasm_bytes,
+        attested_in_this_run: bytes_attested_in_this_run,
+    } = match module_fetcher::fetch(&req, &runtime, &mut _span).await {
+        Ok(fetched) => fetched,
+        Err(e) => {
+            _span.end_error(&e.message);
+            return failed_result(req.job_id, &start, &e.message);
+        }
+    };
+
+    // SECURITY: Verify WASM content hash when inline bytes were not provided.
+    // `req.expected_wasm_hash` is set by the controller from `wasm_modules.content_hash`
+    // (the SHA-256 recorded at compile time) and covered by the HMAC signing payload,
+    // so an attacker who compromises the storage layer (Redis, OCI, filesystem) cannot
+    // substitute malicious bytes without the mismatch being detected here.
+    //
+    // When `wasm_bytes` was provided inline the HMAC already covers sha256(bytes) — no
+    // additional check needed.  We only verify when the worker loaded bytes from a URI.
+    if req.wasm_bytes.is_none() {
+        if let Some(ref expected) = req.expected_wasm_hash {
+            use sha2::{Digest, Sha256};
+            let actual = hex::encode(Sha256::digest(&wasm_bytes));
+            if actual != *expected {
+                ::tracing::error!(
+                    job_id = %req.job_id,
+                    module_uri = %req.module_uri,
+                    expected_hash = %expected,
+                    actual_hash = %actual,
+                    "SECURITY: WASM content hash mismatch — possible storage tampering, refusing execution"
+                );
+                _span.end_error("wasm_hash_mismatch");
+                return failed_result(
+                    req.job_id,
+                    &start,
+                    "WASM integrity check failed: content hash mismatch",
+                );
+            }
+            ::tracing::debug!(
+                job_id = %req.job_id,
+                module_uri = %req.module_uri,
+                hash = %actual,
+                "WASM content hash verified"
+            );
+        } else if !bytes_attested_in_this_run {
+            // No hash commitment from the controller AND the bytes did not
+            // pass Sigstore + layer-digest checks in this run — i.e. they
+            // came from an OCI cache fallback, `redis:wasm:` fetch, or
+            // filesystem load with nothing cryptographically tying them
+            // to the controller's recorded `wasm_modules.content_hash`.
+            //
+            // A Redis-write attacker (compromised pod, shared infra) could
+            // substitute arbitrary WASM into the cache — without
+            // `expected_wasm_hash` we have no evidence to detect it.
+            //
+            // M-5: gate this fallback on a POSITIVE opt-in
+            // (`AEGIX_ALLOW_UNATTESTED_WASM=1`) instead of "if not
+            // production". Pre-fix a dev image accidentally promoted to
+            // production, or a container with `RUST_ENV` unset, would
+            // silently accept arbitrary cache bytes. The new policy is
+            // fail-closed by default: misconfiguration refuses to run.
+            // Operators who need the dev shortcut must set the env var
+            // explicitly. The profile gate stays as belt-and-braces
+            // (2026-10-29: `hardened` never accepts unattested bytes
+            // regardless of the override, and refuses the override at boot).
+            let allow_unattested =
+                aegix_config::bool_env_or_default("AEGIX_ALLOW_UNATTESTED_WASM", false);
+            let block_unattested = unattested_wasm_blocked(
+                aegix_config::security_profile::profile(),
+                allow_unattested,
+            );
+            if block_unattested {
+                ::tracing::error!(
+                    job_id = %req.job_id,
+                    module_uri = %req.module_uri,
+                    "SECURITY: refusing to execute WASM loaded from unverified storage \
+                     (cache/redis/filesystem) without expected_wasm_hash. Either supply \
+                     a hash or load from a path that Sigstore-verifies in this run"
+                );
+                _span.end_error("unattested_wasm_no_hash");
+                return failed_result(
+                    req.job_id,
+                    &start,
+                    "WASM integrity check failed: no hash and no in-run attestation",
+                );
+            }
+            ::tracing::warn!(
+                job_id = %req.job_id,
+                module_uri = %req.module_uri,
+                "WASM loaded from unattested storage without expected_wasm_hash \
+                 (AEGIX_ALLOW_UNATTESTED_WASM=1 set — would fail closed without this override). \
+                 Always supply expected_wasm_hash or attest in-run via Sigstore in production."
+            );
+        } else {
+            // Bytes were attested in this run via Sigstore + digest checks.
+            // No expected_wasm_hash supplied is OK — the in-run attestation
+            // is the trust root.
+            ::tracing::debug!(
+                job_id = %req.job_id,
+                module_uri = %req.module_uri,
+                "WASM attested via in-run Sigstore + layer-digest verification"
+            );
+        }
+    }
+
+    // Build execution context for automatic logging to database
+    _span.add_event("executing_wasm");
+    let execution_context = Some((
+        req.workflow_execution_id.to_string(), // workflow_id
+        req.job_id.to_string(),                // execution_id (for NATS logging)
+        req.module_uri.clone(),                // module_id
+    ));
+
+    // Build per-module security policy from the job request.
+    let security_policy = SecurityPolicy {
+        allowed_secrets: req.allowed_secrets.clone(),
+        allowed_sql_operations: req.allowed_sql_operations.clone(),
+        allow_tier2_exposure: req.allow_tier2_exposure,
+        integration_name: req.integration_name.clone(),
+        // Opt-in idempotency (Task 3): HMAC-bound on the JobRequest; the HTTP
+        // host emits it as an `Idempotency-Key` header on mutating sends.
+        idempotency_key: req.idempotency_key.clone(),
+        // Signed with the job, and consulted only under `req.dry_run`.
+        read_only_posts: req.read_only_posts.clone(),
+        // Recorded HTTP answers are a controller-side rehearsal feature
+        // (`test_module`). A dispatched job always makes its real requests;
+        // nothing on the wire can ask otherwise. Pinned by `rehearsal_pin.rs`.
+        http_replay: None,
+        http_capture: None,
+        fuel_profile: None,
+        // A dispatched job's memory calls are the run's own: never a
+        // rehearsal (`memory_rehearsal` is set only by `test_module`).
+        memory_rehearsal: None,
+    };
+
+    // Parse the capability world hint from the controller.  When present and non-Unknown,
+    // the runtime uses it instead of re-inspecting the WASM binary.  This is critical for
+    // sandbox modules whose Wizer-snapshotted binary may have lost embedded WIT world-name
+    // strings that inspect_component relies on.
+    //
+    // A signed hint naming no world this worker knows is a REFUSAL, not "no
+    // hint" (security review 2026-10-15, E2-3): until then it fell back to
+    // the binary's inspected world — the pre-G-1 behaviour, wider than the
+    // world the controller checked whenever the inspection is wider.
+    let capability_world_hint = match job_world_hint(req.capability_world.as_deref()) {
+        Ok(hint) => hint,
+        Err(()) => {
+            ::tracing::warn!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                "capability-world-unrecognised: the job's signed world hint names no world \
+                 this worker knows; refused before instantiation"
+            );
+            return failed_result(
+                req.job_id,
+                &start,
+                "capability-world-unrecognised: the job names a capability world this worker \
+                 does not know",
+            );
+        }
+    };
+
+    // Honor the controller-supplied `timeout_ms` from the job request. The
+    // controller has already sourced it from the node's `timeout_secs` (or the
+    // per-env `WASM_EXECUTION_TIMEOUT_SECS` default). Fallback: use the same
+    // `WASM_EXECUTION_TIMEOUT_SECS` env var (120s default) when the request
+    // didn't specify. That figure read "60s default" until 2026-08-25, while
+    // the lockstep note four lines below this one said 120 and the code says
+    // 120 — one comment block contradicting itself. Same
+    // stale-literal-beside-a-variable shape as the hardcoded "30 seconds"
+    // message that `timeout_error_message` exists to fix, which is why it was
+    // corrected in the same change rather than left as a sibling instance.
+    // Previously both timeouts were hardcoded 30s, which
+    // silently capped agent-node modules calling `llm::complete` even when
+    // the author set `timeout_secs: 120` on the node.
+    // MCP-642 (2026-05-13): if WASM_EXECUTION_TIMEOUT_SECS=0 AND the
+    // caller didn't specify req.timeout_ms, the job timeout below
+    // becomes 0ms → every job times out instantly. Same MCP-639 class.
+    // 120s default kept in lockstep with DEFAULT_NODE_TIMEOUT_SECS
+    // (aegix-workflow-engine) and get_wasm_config so the worker's fallback job
+    // timeout matches the controller's reply-wait and the operator-reported value.
+    let worker_fallback_secs: u64 =
+        worker::runtime::nonzero_env_or_default("WASM_EXECUTION_TIMEOUT_SECS", 120);
+    let job_timeout_ms: u64 = if req.timeout_ms > 0 {
+        req.timeout_ms
+    } else {
+        worker_fallback_secs.saturating_mul(1000)
+    };
+    let job_timeout = std::time::Duration::from_millis(job_timeout_ms);
+    // R2 token ledger: worker-owned accumulator shared with the job's
+    // AegixContext; drained into the signed JobResult on EVERY branch below
+    // (success, failure, timeout) — tokens spent before a trap are spent.
+    let llm_usage_acc = worker::context::LlmUsageAcc::default();
+    // Out-of-band fuel: the runtime adds every attempt's measured fuel here,
+    // success or failure; drained into the signed JobResult below so the
+    // controller's hourly fuel budget sees failed, fuel-exhausted and
+    // non-object attempts too. A result-cache hit ran nothing and reports none.
+    let fuel_acc: worker::context::FuelAcc = std::sync::Arc::new(std::sync::Mutex::new(None));
+    // RFC 0014 P2: this job's waiting-for-the-local-inference-slot account.
+    // Every deadline below — this outer one, the runtime's inner one and the
+    // epoch wall-clock bound — stands still while the job queues for the slot,
+    // and the notifier tells the dispatcher so its attempt window does too.
+    // Only a job with a SIGNED reply inbox has a dispatcher waiting on it; a
+    // fire-and-forget dispatch gets the ledger without a notifier.
+    let inference_wait = std::sync::Arc::new(worker::inference_wait::InferenceWaitLedger::new(
+        req.reply_topic.as_deref().map(|inbox| {
+            std::sync::Arc::new(NatsProgressNotifier {
+                nc: nc.clone(),
+                subject: aegix_workflow_job_protocol::subjects::job_progress_for(inbox),
+                job_id: req.job_id,
+                dispatch_attempt: req.dispatch_attempt,
+                shared_key: shared_key.clone(),
+            }) as std::sync::Arc<dyn worker::inference_wait::WaitNotifier>
+        }),
+    ));
+    match worker::inference_wait::with_pausable_deadline(
+        job_timeout,
+        Some(&inference_wait),
+        runtime.execute_job_with_full_features(
+            &wasm_bytes,
+            req.allowed_hosts.clone(),
+            req.allowed_methods.clone(),
+            128,
+            // The guest sees the PARSED payload; the signature (already
+            // verified above) covers the raw wire text, which stays with the
+            // `SignedJson` on `req`.
+            req.input_payload.value().clone(),
+            None, // No custom file sandbox
+            execution_context,
+            secrets,
+            None,        // token_sender
+            job_timeout, // per-job timeout — matches the outer tokio::time::timeout
+            // NO in-process retry. The controller that dispatched this job owns
+            // its retries and decides them method-aware (resolved `max_retries`,
+            // transient classifier, `retry_condition`), re-dispatching with a
+            // bumped signed `dispatch_attempt`. A retry here re-ran the WHOLE
+            // module on guest-influenced "timeout"/"503" text, blind to
+            // `allowed_methods` — a POST node the controller allowed zero
+            // retries still ran up to four times. Pinned by
+            // `retry_policy_pin.rs`.
+            RetryPolicy::controller_dispatched(),
+            None, // No result caching for NATS jobs — each execution must be fresh
+            security_policy,
+            capability_world_hint,
+            // Signature-bound (2026-09-10) AND clamped to this worker's own
+            // ceiling — see `clamp_job_fuel` for why both.
+            clamp_job_fuel(req.job_id, req.max_fuel, worker_max_job_fuel()),
+            req.dry_run,
+            req.actor_id,
+            req.user_id,
+            req.max_llm_tier,
+            req.max_write_ceiling,
+            // The signed override, carried from the wire onto the context.
+            // Without this the field arrives and is dropped — which is
+            // exactly what #941 shipped, making the whole axis a no-op.
+            req.http_verb_ceiling,
+            req.egress_scope,
+            Some(llm_usage_acc.clone()),
+            // host_diag_out: the worker has a real execution id, so host
+            // diagnostics take the NATS route to the log tables. The
+            // in-process sink exists only for the id-less MCP surfaces.
+            None,
+            // Which controller DISPATCH of this job we are running. Read from
+            // the HMAC-bound `JobRequest` field verified above, never inferred:
+            // this process is credential-free and cannot look at what a
+            // previous dispatch of the same `job_id` wrote, so it is told.
+            // It reaches exactly one thing — the audit ledger's partition key —
+            // so a re-dispatch's fresh chain is legible as a second attempt
+            // rather than as a duplicated sequence in the first.
+            req.dispatch_attempt,
+            Some(inference_wait.clone()),
+            Some(fuel_acc.clone()),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            _span.set_attribute_int("duration_ms", duration_ms as i64);
+            _span.end_success();
+
+            JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
+                llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
+                crypto_scheme: 0,
+                job_id: req.job_id,
+                status: JobStatus::Success,
+                // Send-side construction: fixes the result's wire text once,
+                // and `sign()` below hashes exactly those bytes.
+                output_payload: output.into(),
+                logs: vec![],
+                execution_time_ms: duration_ms,
+                signature: vec![],
+                result_nonce: String::new(),
+                worker_id: String::new(),
+                fuel: worker::context::take_fuel(&fuel_acc),
+            }
+        }
+        Ok(Err(e)) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let error_msg = format!("execution failure: {}", e);
+            let sanitized_error = sanitize_error_message(&error_msg);
+            _span.set_attribute("error", &sanitized_error);
+            _span.set_attribute_int("duration_ms", duration_ms as i64);
+            _span.end_error(&sanitized_error);
+
+            JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
+                llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
+                crypto_scheme: 0,
+                job_id: req.job_id,
+                status: JobStatus::Failed,
+                output_payload: json!({"error": sanitized_error}).into(),
+                logs: vec![],
+                execution_time_ms: duration_ms,
+                signature: vec![],
+                result_nonce: String::new(),
+                worker_id: String::new(),
+                fuel: worker::context::take_fuel(&fuel_acc),
+            }
+        }
+        Err(_) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            // Report the timeout that was ACTUALLY enforced. `job_timeout` is
+            // the exact binding passed to `tokio::time::timeout` above, so the
+            // message cannot drift from the enforcement.
+            let error_msg = timeout_error_message(job_timeout, req.timeout_ms > 0);
+            _span.set_attribute("error", &error_msg);
+            _span.set_attribute_int("duration_ms", duration_ms as i64);
+            _span.end_error(&error_msg);
+
+            JobResult {
+                dispatch_attempt: 0,
+                workflow_execution_id: None,
+                // Timeout drops the execution future, but usage folded
+                // before the deadline is preserved via the shared Arc.
+                // A detached in-flight stream reader could in principle
+                // fold shortly after this drain — those late tokens are
+                // deliberately dropped rather than racing the signature.
+                llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
+                crypto_scheme: 0,
+                job_id: req.job_id,
+                status: JobStatus::Failed,
+                output_payload: json!({"error": error_msg}).into(),
+                logs: vec![],
+                execution_time_ms: duration_ms,
+                signature: vec![],
+                result_nonce: String::new(),
+                worker_id: String::new(),
+                fuel: worker::context::take_fuel(&fuel_acc),
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // rustls 0.23 requires an explicit CryptoProvider when the dep graph
+    // contains more than one. We pull rustls in via redis (tls-rustls) and
+    // reqwest. install_default is idempotent — Err means another caller
+    // already installed one, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Before the fleet key or any job's secrets are in memory: no core dump,
+    // no same-UID ptrace, root-owned /proc entries. Logged once tracing is up.
+    let non_dumpable = aegix_config::process_posture::make_process_non_dumpable();
+
+    // Before the first setting is read: a variable left under the former
+    // prefix would be ignored and its default used, silently.
+    aegix_config::legacy_env::refuse_legacy_names().map_err(anyhow::Error::msg)?;
+
+    println!("=== Aegix Worker Starting ===\n");
+
+    // ========================================================================
+    // SECURITY: Load and validate the shared key at startup.
+    // Fail-fast if the key is absent or malformed — never start with no auth.
+    // ========================================================================
+
+    // Load the full verify/decrypt-ring (current + WORKER_SHARED_KEY_PREVIOUS).
+    // The worker SIGNS results + RPC with the current key only; it VERIFIES
+    // controller-signed jobs and DECRYPTS secrets against the whole ring, so a
+    // rolling WORKER_SHARED_KEY rotation doesn't break either side mid-roll.
+    let shared_key =
+        load_worker_key_ring().map_err(|e| anyhow::anyhow!("WORKER_SHARED_KEY error: {}", e))?;
+    // M-3 (partial): log a SHA-256 fingerprint of the shared key at
+    // startup so config drift between controller and worker is visible
+    // without exposing the key material. Operators can grep both
+    // process logs for `worker_shared_key_fp=` and confirm they match
+    // — if they don't, all signed RPCs will fail verification and the
+    // error surfaces here instead of as opaque "signature verification
+    // failed" later. We log only the first 8 hex chars (32 bits) which
+    // is enough to detect mismatch with negligible info leak.
+    {
+        let fp_short = aegix_workflow_job_protocol::worker_key_fingerprint(
+            shared_key.signing_key().as_bytes(),
+        );
+        let verify_count = shared_key.verify_keys().len();
+        println!(
+            "[0/5] Loaded WORKER_SHARED_KEY (32 bytes, fp={fp_short}, verify_keys={verify_count})"
+        );
+        ::tracing::info!(
+            worker_shared_key_fp = %fp_short,
+            verify_key_count = verify_count,
+            "WORKER_SHARED_KEY loaded; compare this fingerprint against the controller's log line for drift detection"
+        );
+        for prev in shared_key.verify_keys().iter().skip(1) {
+            ::tracing::info!(
+                previous_worker_shared_key_fp =
+                    %aegix_workflow_job_protocol::worker_key_fingerprint(prev.as_bytes()),
+                "WORKER_SHARED_KEY_PREVIOUS accepted for verify/decrypt (rotation in progress)"
+            );
+        }
+    }
+
+    // The security profile (2026-10-29, AEGIX_SECURITY_PROFILE), resolved
+    // FIRST: an unrecognised spelling refuses the boot in every environment,
+    // `hardened` (the default wherever the deployment faces users) refuses
+    // every acknowledgement the gates below would otherwise read
+    // (AEGIX_ALLOW_LEGACY_FLEET_HMAC, AEGIX_WORKER_ALLOW_ENV_PROVIDER_KEYS,
+    // AEGIX_ALLOW_UNATTESTED_WASM, an explicit AEGIX_WRITE_CEILING_ENFORCED=
+    // false), and `transitional` logs each one at ERROR. Every gate below
+    // asks the profile where it used to ask `is_production()` or
+    // `browser_hardening_required()`.
+    let security_profile = aegix_config::security_profile::enforce_at_boot(
+        aegix_config::security_profile::Process::Worker,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?
+    .profile;
+    let security_enforces = security_profile.enforces();
+
+    // Wasm-security review 2026-05-22 (MEDIUM-4): production gate. Where the
+    // profile enforces we refuse to boot unless the operator has made an
+    // explicit Sigstore choice (required / audit / disabled; `audit` only
+    // under `transitional`). Pre-fix,
+    // `from_env` silently fell through to `Disabled` when the env var
+    // was unset — the operator's monitoring saw a clean startup and
+    // had no signal that signature verification was off. Mirrors the
+    // `AEGIX_AOT_HMAC_KEY` boot discipline so production failures are
+    // loud and immediate. Dev/test hosts (`is_production() == false`)
+    // continue to see the silent default. An UNRECOGNISED value is refused
+    // here in every environment (E-7, 2026-10-14), so the two startup checks
+    // below read the policy this gate resolved.
+    let sigstore_policy_at_boot = enforce_production_sigstore_policy_explicit()?;
+
+    // Operator decision D2-B (2026-10-15): a worker in a deployment that faces
+    // users (production, and staging as `docker-compose.prod.yml` runs it)
+    // does not boot without the distributed replay guard, so a dispatch runs
+    // once per fleet. No acknowledgement waives it.
+    aegix_replay_guard::boot_requirement_from_env(security_enforces)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Security review 2026-10-14 (B-2): where the profile enforces, a worker
+    // does not accept a dispatch signed with the fleet-shared
+    // WORKER_SHARED_KEY unless AEGIX_ALLOW_LEGACY_FLEET_HMAC names `dispatch`
+    // (read only under `transitional`). The controller gates results and RPC
+    // at its own boot.
+    aegix_config::fleet_identity::enforce_production_fleet_identity(
+        security_enforces,
+        &[
+            aegix_config::fleet_identity::SurfaceSwitch {
+                surface: aegix_config::fleet_identity::LegacyFleetSurface::Dispatch,
+                switch: "AEGIX_DISPATCH_REQUIRE_ED25519",
+                required: aegix_config::bool_env_or_default(
+                    "AEGIX_DISPATCH_REQUIRE_ED25519",
+                    false,
+                ),
+            },
+            // The envelope (2026-10-29): under `off`/`audit` this worker
+            // still OPENS an inline envelope sealed under the fleet key, so
+            // a dispatch meant for a sibling is readable here too.
+            aegix_config::fleet_identity::SurfaceSwitch {
+                surface: aegix_config::fleet_identity::LegacyFleetSurface::Envelope,
+                switch: "AEGIX_ENVELOPE_SEALING",
+                required: worker_sealing_required(),
+            },
+        ],
+        security_profile
+            .honours_acknowledgements()
+            .then(|| std::env::var("AEGIX_ALLOW_LEGACY_FLEET_HMAC").ok())
+            .flatten()
+            .as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    // A worker that requires sealing claims every secret-carrying job with
+    // its Ed25519 identity; with no usable AEGIX_WORKER_SIGNING_KEY it could
+    // claim nothing, and would fail every such job one at a time after the
+    // controller had already handed the job to it. Refused at boot instead,
+    // in every environment: there is no fallback to fall to.
+    sealing_requires_a_signing_key(
+        worker_sealing_required(),
+        worker_result_signing_key().is_some(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    // L-4: Sigstore startup sanity — verify `cosign` is actually
+    // executable when policy is non-Disabled. Pre-fix the missing
+    // binary surfaced as a per-pull "cosign_unavailable" error;
+    // production deploys that THOUGHT verification was running
+    // discovered the gap only when an unsigned artifact slipped
+    // through (or, in Required mode, when every pull failed).
+    // Failing at boot in Required mode is loud, immediate, and
+    // points at the right config knob.
+    {
+        let sigstore_policy = sigstore_policy_at_boot;
+        if sigstore_policy != SigstorePolicy::Disabled {
+            match tokio::process::Command::new("cosign")
+                .arg("version")
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let version_line = stdout.lines().next().unwrap_or("(unknown)").to_string();
+
+                    // M5 (2026-05-22): version-pin cosign so a swapped-in
+                    // older binary (predating critical CVE fixes) or a
+                    // replaced binary doesn't silently pass through.
+                    // `AEGIX_COSIGN_MIN_VERSION` is the minimum
+                    // semver-ish version accepted; default `2.0.0`
+                    // matches the cosign 2.x line which is the
+                    // long-supported branch with hardened defaults.
+                    //
+                    // Parse rule: pull the first dotted `X.Y.Z` token
+                    // out of stdout (cosign output format has shifted
+                    // across versions; the version triple is the only
+                    // stable shape). Fail-closed in Required mode if
+                    // we can't parse anything; warn-and-continue under
+                    // Audit. This is operator-tunable via the env so
+                    // a future cosign 3.x bump doesn't require code
+                    // changes.
+                    let min_version = std::env::var("AEGIX_COSIGN_MIN_VERSION")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "2.0.0".to_string());
+                    match parse_cosign_version(&stdout) {
+                        Some((maj, min, patch)) => {
+                            let parsed_observed = (maj, min, patch);
+                            let parsed_min = parse_semver_triple(&min_version).unwrap_or((2, 0, 0));
+                            if parsed_observed < parsed_min {
+                                let msg = format!(
+                                    "cosign version {}.{}.{} is below required minimum {} \
+                                     (set AEGIX_COSIGN_MIN_VERSION to override)",
+                                    parsed_observed.0,
+                                    parsed_observed.1,
+                                    parsed_observed.2,
+                                    min_version,
+                                );
+                                if sigstore_policy == SigstorePolicy::Required {
+                                    return Err(anyhow::anyhow!(
+                                        "Sigstore startup sanity check failed: {msg}"
+                                    ));
+                                }
+                                ::tracing::warn!(
+                                    cosign_version = %version_line,
+                                    min_version = %min_version,
+                                    "{msg} (Audit mode: continuing)"
+                                );
+                            }
+                        }
+                        None => {
+                            if sigstore_policy == SigstorePolicy::Required {
+                                return Err(anyhow::anyhow!(
+                                    "Could not parse cosign version from stdout: {version_line:?}. \
+                                     Required policy refuses to boot without a verified version pin."
+                                ));
+                            }
+                            ::tracing::warn!(
+                                stdout = %stdout,
+                                "Could not parse cosign version — version-pin check skipped (Audit mode)"
+                            );
+                        }
+                    }
+
+                    // M5 part B: optional SHA-256 pin of the cosign
+                    // binary itself. When set, the worker hashes the
+                    // resolved cosign executable and refuses to boot
+                    // if the hash doesn't match. This closes the
+                    // "swap cosign with a wrapper that always exits 0"
+                    // attack path. Most operators won't set this;
+                    // sigstore-enforcement clusters that want defense
+                    // in depth absolutely should.
+                    //
+                    // L-3 (2026-05-22): under Required policy, advise
+                    // operators who run WITHOUT a hash pin that an
+                    // attacker with worker-pod write access (sidecar
+                    // exploit, init-container compromise) can swap the
+                    // cosign binary for a wrapper that always exits 0 —
+                    // bypassing every other Sigstore gate. Loud WARN at
+                    // startup so the gap is visible in production logs;
+                    // not fail-closed because Required-without-pin is a
+                    // legitimate (if weaker) deployment posture and the
+                    // pin requires per-image hash bookkeeping operators
+                    // may roll out separately from this code change.
+                    //
+                    // 2026-11-04: the bookkeeping is gone — the worker
+                    // image bakes the pin (worker/Dockerfile, the sum its
+                    // cosign download was verified against), so every
+                    // deployment of the image is pinned and this WARN no
+                    // longer fires there. A `required` worker with NO pin
+                    // is now running outside the image, and under
+                    // AEGIX_SECURITY_PROFILE=hardened that refuses the boot
+                    // (`cosign_pin_under_profile`, the shape of the `audit`
+                    // refusal); `transitional` and `development` keep the
+                    // WARN below.
+                    // docs/engineering-log/packages/2026-11-04-worker-cosign-pin-baked-in.md
+                    let cosign_pin = std::env::var("AEGIX_COSIGN_SHA256")
+                        .ok()
+                        .filter(|v| !v.is_empty());
+                    cosign_pin_under_profile(
+                        security_profile,
+                        sigstore_policy,
+                        cosign_pin.is_some(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                    if cosign_pin.is_none() && sigstore_policy == SigstorePolicy::Required {
+                        ::tracing::warn!(
+                            policy = ?sigstore_policy,
+                            "AEGIX_COSIGN_SHA256 not set under Required Sigstore policy — \
+                             cosign binary will not be hash-verified at startup. Set \
+                             AEGIX_COSIGN_SHA256 to the sha256 of the bundled cosign \
+                             binary for defense-in-depth against binary-swap attacks."
+                        );
+                    }
+                    if let Some(expected_sha256) = cosign_pin {
+                        match resolve_and_hash_cosign_binary().await {
+                            Ok(actual) => {
+                                use subtle::ConstantTimeEq as _;
+                                let actual_lower = actual.to_lowercase();
+                                let expected_lower = expected_sha256.trim().to_lowercase();
+                                let eq: bool = actual_lower
+                                    .as_bytes()
+                                    .ct_eq(expected_lower.as_bytes())
+                                    .into();
+                                if !eq {
+                                    if sigstore_policy == SigstorePolicy::Required {
+                                        return Err(anyhow::anyhow!(
+                                            "cosign binary sha256 mismatch: expected {expected_lower}, \
+                                             got {actual_lower}. Required policy refuses to boot."
+                                        ));
+                                    }
+                                    ::tracing::warn!(
+                                        expected = %expected_lower,
+                                        actual = %actual_lower,
+                                        "cosign binary sha256 mismatch (Audit mode: continuing)"
+                                    );
+                                } else {
+                                    ::tracing::info!(
+                                        sha256 = %actual_lower,
+                                        "cosign binary sha256 pin verified"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if sigstore_policy == SigstorePolicy::Required {
+                                    return Err(anyhow::anyhow!(
+                                        "Could not hash cosign binary for SHA-256 pin: {e}. \
+                                         Required policy refuses to boot."
+                                    ));
+                                }
+                                ::tracing::warn!(
+                                    error = %e,
+                                    "Could not hash cosign binary — sha256 pin check skipped (Audit mode)"
+                                );
+                            }
+                        }
+                    }
+
+                    ::tracing::info!(
+                        cosign_version = %version_line,
+                        policy = ?sigstore_policy,
+                        "Sigstore startup sanity check: cosign binary OK"
+                    );
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    if sigstore_policy == SigstorePolicy::Required {
+                        return Err(anyhow::anyhow!(
+                            "cosign binary present but `cosign version` exited non-zero (stderr: {stderr}). \
+                             Required policy refuses to boot."
+                        ));
+                    }
+                    ::tracing::warn!(
+                        stderr = %stderr,
+                        "Sigstore startup sanity check: cosign returned non-zero — verifications will fail"
+                    );
+                }
+                Err(e) => {
+                    if sigstore_policy == SigstorePolicy::Required {
+                        return Err(anyhow::anyhow!(
+                            "cosign binary not executable ({e}) and Sigstore policy is Required. \
+                             Install cosign in the worker image or set AEGIX_SIGSTORE_REQUIRED=audit \
+                             during migration."
+                        ));
+                    }
+                    ::tracing::warn!(
+                        error = %e,
+                        "Sigstore startup sanity check: cosign not executable — Audit mode will warn-and-continue on every pull"
+                    );
+                }
+            }
+        }
+    }
+
+    // M-1: validate Sigstore identity regexp at startup so an operator
+    // who set `AEGIX_SIGSTORE_REQUIRED=true` with a permissive pattern
+    // discovers the policy is broken HERE — not silently per-pull when
+    // every malicious-signature artifact passes verification. In
+    // `Required` mode any rejection is fatal; in `Audit` mode we WARN
+    // and continue (audit is the migration window). `Disabled` mode
+    // skips this entirely.
+    {
+        let sigstore_policy_at_startup = sigstore_policy_at_boot;
+        if sigstore_policy_at_startup != SigstorePolicy::Disabled {
+            let regexp = std::env::var("AEGIX_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
+            // The policy-aware validator also refuses, under Required, a
+            // workflow pin that does not pin the git ref (`…\.yml@` alone
+            // admits a signature from any branch); Audit gets the warning.
+            match validate_sigstore_identity_regexp_for_policy(&regexp, sigstore_policy_at_startup)
+            {
+                Ok(None) => {
+                    ::tracing::info!(
+                        policy = ?sigstore_policy_at_startup,
+                        "Sigstore identity regexp validated at startup"
+                    );
+                }
+                Ok(Some(warning)) => {
+                    ::tracing::warn!(
+                        policy = ?sigstore_policy_at_startup,
+                        rejection = ?warning,
+                        reason = %warning.human_reason(),
+                        "AEGIX_SIGSTORE_IDENTITY_REGEXP accepted with a warning — \
+                         would fail closed under Required"
+                    );
+                }
+                Err(rejection) => match sigstore_policy_at_startup {
+                    SigstorePolicy::Required => {
+                        return Err(anyhow::anyhow!(
+                            "AEGIX_SIGSTORE_IDENTITY_REGEXP rejected at startup ({:?}): {}. \
+                             Fix the env var and restart — \
+                             refusing to run under Required policy with broken config.",
+                            rejection,
+                            rejection.human_reason()
+                        ));
+                    }
+                    SigstorePolicy::Audit => {
+                        ::tracing::warn!(
+                            rejection = ?rejection,
+                            reason = %rejection.human_reason(),
+                            "AEGIX_SIGSTORE_IDENTITY_REGEXP rejected under Audit policy — \
+                             would fail closed under Required"
+                        );
+                    }
+                    SigstorePolicy::Disabled => unreachable!(),
+                },
+            }
+        }
+    }
+
+    // Install the same key into aegix-memory's RPC auth slot so the
+    // WIT `agent_memory::*` and `graph_memory::*` host functions can
+    // sign their NATS requests. The controller registers the same
+    // key on its side for verification (see controller/src/main.rs).
+    // Worker only SIGNS its outbound RPC (controller verifies), so the
+    // current/signing key is all rpc_auth needs here.
+    aegix_rpc_protocol::rpc_auth::register_hmac_key(Arc::new(
+        shared_key.signing_key().as_bytes().to_vec(),
+    ));
+
+    // RFC 0010 P2 inc.3: when a per-worker Ed25519 key is provisioned
+    // (AEGIX_WORKER_SIGNING_KEY — the SAME key used to sign job results),
+    // also register it as the RPC signing identity so memory/graph/database/
+    // state/integration-state requests are signed Ed25519 under this worker's
+    // id. The controller resolves the matching public key by worker_id and
+    // verifies asymmetrically; the HMAC key above stays registered so the
+    // controller's dual-verify accepts either scheme during rollout. Absent
+    // the key, RPC signing stays on the legacy HMAC path unchanged.
+    if let Some(rpc_signing_key) = worker_result_signing_key() {
+        aegix_rpc_protocol::rpc_auth::register_ed25519_signing_key(
+            worker_identity().to_string(),
+            Arc::new(rpc_signing_key.clone()),
+        );
+        ::tracing::info!(
+            target: "talos_security",
+            worker_id = %worker_identity(),
+            "Registered per-worker Ed25519 RPC signing identity (RFC 0010 P2 inc.3)"
+        );
+
+        // RFC 0010 P2 inc.4d: self-register this worker's public key with the
+        // controller (if AEGIX_CONTROLLER_URL + AEGIX_WORKER_REGISTRATION_TOKEN
+        // are set). Best-effort and detached so it never blocks boot or job
+        // processing; the signing key is `&'static` (OnceLock), so it moves into
+        // the task cleanly.
+        tokio::spawn(worker::self_register::register_worker_identity_at_boot(
+            rpc_signing_key,
+        ));
+
+        // Periodic liveness ping. Registration alone told the controller this
+        // key EXISTS; nothing told it the process was still running, so a
+        // departed worker's public key stayed in the trusted verify ring
+        // forever. This is the refresh that lets the controller bound that.
+        // Detached and best-effort like the registration above — a failed ping
+        // never touches job processing, and the controller's window is many
+        // multiples of the interval so only sustained silence reaps a key.
+        tokio::spawn(worker::liveness::run_liveness_pinger(rpc_signing_key));
+    }
+
+    // M-3 (2026-05-22): log the SQL empty-allowlist policy at startup
+    // so operators can confirm the mode they're running. Default is
+    // `DenyMutations` (least-privilege); `AllowAllNonDdl` is the
+    // legacy permissive mode reachable via
+    // `AEGIX_SQL_PERMISSIVE_EMPTY_ALLOWLIST=1`. Logged at INFO so it
+    // appears once at boot without spamming normal traffic.
+    {
+        let sql_policy = sql_validator::EmptyAllowlistPolicy::from_env();
+        match sql_policy {
+            sql_validator::EmptyAllowlistPolicy::DenyMutations => {
+                ::tracing::info!(
+                    policy = "DenyMutations",
+                    "SQL validator: empty allowlist permits SELECT/EXPLAIN only (default)"
+                );
+            }
+            sql_validator::EmptyAllowlistPolicy::AllowAllNonDdl => {
+                ::tracing::warn!(
+                    policy = "AllowAllNonDdl",
+                    "SQL validator: legacy permissive mode is enabled via \
+                     AEGIX_SQL_PERMISSIVE_EMPTY_ALLOWLIST — JobRequests with empty \
+                     allowed_sql_operations admit every non-DDL non-AlwaysBlocked \
+                     statement type. Prefer setting allowed_sql_operations explicitly."
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // OBSERVABILITY INITIALIZATION
+    // ========================================================================
+
+    println!("[1/5] Initializing observability...");
+
+    if let Err(e) = metrics::init_telemetry() {
+        eprintln!("Warning: Failed to initialize metrics: {}", e);
+        eprintln!("    Continuing without metrics...");
+    } else {
+        println!("      Metrics initialized");
+    }
+
+    // Initialise OTel tracing FIRST — `init_tracing` installs the SDK provider
+    // (+ the W3C propagator used by `extract_trace_context`). The otel bridge
+    // layer in the subscriber below pulls a tracer from that provider, so the
+    // provider must exist before the subscriber is built.
+    //
+    // UNCONFIGURED MUST MEAN DISABLED — the controller carried the byte-identical
+    // defect and both are fixed together; repairing one of two sites is how a
+    // uniform bug becomes a per-binary one that survives far longer. This used to
+    // be `env::var("JAEGER_ENDPOINT").ok().or_else(|| Some("http://localhost:4317"))`,
+    // whose `or_else` made `init_tracing`'s `None` ⇒ disabled path unreachable, so
+    // an unconfigured worker exported spans to itself and logged an export ERROR
+    // per flush forever. `endpoint_from_env` is the shared chokepoint.
+    let trace_endpoint = worker::tracing::endpoint_from_env();
+
+    // Called UNCONDITIONALLY, including with `None`, so "tracing is off" is
+    // stated in the log rather than being indistinguishable from silence.
+    match worker::tracing::init_tracing("talos-worker", trace_endpoint.as_deref()) {
+        Ok(()) => match trace_endpoint.as_deref() {
+            Some(endpoint) => println!(
+                "      Tracing enabled (endpoint: {})",
+                worker::tracing::redact_endpoint(endpoint)
+            ),
+            None => println!(
+                "      Tracing DISABLED (no endpoint configured; set one of {})",
+                worker::tracing::TRACE_ENDPOINT_ENV_VARS.join(", ")
+            ),
+        },
+        Err(e) => {
+            eprintln!("Warning: Failed to initialize tracing: {}", e);
+            eprintln!("    Continuing without tracing...");
+        }
+    }
+    aegix_config::process_posture::log_non_dumpable_outcome(&non_dumpable);
+
+    // Install the tracing subscriber. The fmt layer keeps host_impl.rs
+    // `tracing::warn!`/`info!` (security checks, vault allowlist, SSRF blocks,
+    // rate limits) in `docker logs` (RUST_LOG, default: worker=info,warn). The
+    // optional OTel bridge layer — present only when `init_tracing` installed a
+    // provider above (OTLP endpoint configured) — exports the worker's `tracing`
+    // spans to OTLP so each `job-execution` span (and the host-function spans
+    // nested under it) appears in the trace backend, linked to the controller's
+    // `workflow` span via the propagated context.
+    //
+    // PERF: the worker is the hot WASM-execution path. Span volume is bounded by
+    // the global EnvFilter (info/warn) AND the otel sampler: the SDK default is
+    // ParentBased(AlwaysOn), so jobs that carry a sampled controller context
+    // inherit its decision; root jobs (e.g. module-bound gmail/gcal dispatch with
+    // no controller span) sample at AlwaysOn. High-throughput deployments should
+    // configure a ratio sampler on the controller (the parent) to bound export.
+    {
+        use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("worker=info,warn"));
+        // SECURITY CHOKEPOINT — `otel_bridge_layer` is the ONE constructor for
+        // this layer in the workspace; the controller builds its own from the
+        // same function. Built inline, `tracing_opentelemetry::layer()`
+        // promotes every in-span `tracing` EVENT into an exported span event
+        // named with the formatted message — which in this binary includes
+        // un-redacted guest WASM log lines (`[WASM] {msg}`) plus ~418 other
+        // event callsites that interpolate upstream error text. The shared
+        // constructor filters promoted events out; deliberate span writes
+        // (`JobSpan`, `ExecutionSpan`) are unaffected and stay redacted. See
+        // `aegix_trace::otel_bridge_layer_with_tracer`.
+        let otel_layer = worker::tracing::otel_bridge_layer("talos-worker");
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_target(true).with_thread_ids(false))
+            .with(otel_layer)
+            .init();
+    }
+
+    // Process-wide panic hook, installed immediately after the subscriber
+    // (its whole output is one structured `tracing` line) and before the
+    // job loop can spawn anything. Its collectors go into
+    // `prometheus::default_registry()`, which is the registry
+    // `metrics::get_prometheus_metrics()` gathers for `/metrics` — the
+    // same one `seed_circuit_breaker_series` seeds into — so
+    // `aegix_task_panics_total{process="worker"}` is exported by a worker
+    // even when the OTEL exporter build failed. Only THIS process's label
+    // value is seeded: a `{process="controller"}` series on a worker's
+    // `/metrics` would imply a signal nothing here can increment.
+    aegix_task_supervision::install_panic_hook("worker");
+    // The worker supervises NO `BackgroundTask`, so it seeds NO
+    // `aegix_background_task_exits_total` series. Until 2026-09-08 it
+    // passed the whole table implicitly and its `/metrics` carried all
+    // 126 controller-only `(task, outcome)` pairs at 0 — measured live —
+    // i.e. seeded combinations nothing in this process can ever
+    // increment, which is check 58's own rule and the very claim the
+    // comment above makes about the `process` label. If a worker loop is
+    // ever supervised, name it here.
+    if let Err(e) = aegix_task_supervision::register_metrics(prometheus::default_registry(), &[]) {
+        eprintln!("Warning: failed to register panic metrics: {e}");
+    }
+    rejected_jobs::seed();
+    dispatch_replay::seed();
+
+    // MCP-580: spawn the circuit-breaker periodic cleanup task so the
+    // per-host `records` DashMap doesn't grow monotonically with
+    // distinct hosts seen across the worker's lifetime. Idempotent at
+    // the breaker level (only Closed stale entries get evicted; Open /
+    // HalfOpen are preserved). Pre-fix the cleanup() method existed
+    // but had zero callers.
+    circuit_breaker::spawn_periodic_cleanup();
+
+    // FU-2 (R2-5): periodically sweep the job-idempotency cache so expired
+    // completed-result entries don't linger on a worker that goes idle.
+    // Read-path eviction handles active job_ids; this is the companion sweep
+    // (CLAUDE.md cache rule: TTL cache = read-path eviction + periodic sweep).
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+            worker::job_idempotency::SWEEP_INTERVAL_SECS,
+        ));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            worker::job_idempotency::JOB_RESULT_CACHE.sweep();
+        }
+    });
+
+    // ========================================================================
+    // NATS CONNECTION
+    // ========================================================================
+
+    println!("\n[2/5] Connecting to NATS...");
+    // MCP-631: empty-env hardening — `NATS_URL=""` (Helm placeholder)
+    // would otherwise produce an empty URL and NATS connect fails with
+    // a confusing parse error rather than using the default.
+    let nats_url = std::env::var("NATS_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "nats://127.0.0.1:4222".to_string());
+
+    // Sanitize the URL for logging — strip embedded credentials (nats://user:pass@host).
+    let nats_url_safe = {
+        let mut u = nats_url.clone();
+        if let Some(at) = u.find('@') {
+            let scheme_end = u.find("://").map(|i| i + 3).unwrap_or(0);
+            u.replace_range(scheme_end..at + 1, "[credentials]@");
+        }
+        u
+    };
+
+    // SECURITY: Use authenticated connection when NATS_USER + NATS_PASSWORD are set.
+    // MCP-631: empty-env hardening — pre-fix, `NATS_USER=""` +
+    // `NATS_PASSWORD=""` (Helm placeholder) produced
+    // `(Some(""), Some(""))` which matched the authenticated branch
+    // BELOW, BYPASSING the production-mode auth gate. The worker
+    // would then attempt to authenticate with empty credentials; if
+    // the NATS server happened to allow anonymous connections (no
+    // auth file), the worker would silently connect anonymously
+    // despite the operator's intent. Treating empty as unset routes
+    // the request through the unauthenticated branch where the
+    // production gate refuses it. Sibling to MCP-590/591/592 family.
+    let nats_user = std::env::var("NATS_USER").ok().filter(|v| !v.is_empty());
+    let nats_password = std::env::var("NATS_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty());
+    // MCP-668 (2026-05-13): route through `aegix_config::is_production()` so
+    // a helm-rendered empty `RUST_ENV=""` doesn't bypass this gate. Raw
+    // `unwrap_or_default()` produced `""` which !== `"production"`, allowing
+    // the worker to fall through to unauthenticated NATS even in prod.
+    // Same empty-env-var family as MCP-590/591/592/630/631 and the
+    // MCP-653 RUST_ENV long-tail closure.
+    let is_production = aegix_config::is_production();
+
+    // SECURITY (2026-07-19, L5): in production, REFUSE to start on a plaintext
+    // NATS URL — same fail-closed posture the controller enforces
+    // (tls-prod-gate-nats). The worker sends HMAC-signed job RESULTS and
+    // receives decrypted secrets over this bus; cleartext on the wire is a
+    // transmission-security violation (HIPAA §164.312(e) / SOC2 CC6.7). Before
+    // this gate the worker only required NATS *auth* in prod and relied on
+    // NATS_CA_FILE being set to force TLS — an operator with a plaintext
+    // `nats://` URL and no CA file transmitted credentials + payloads in the
+    // clear where the controller would have refused to boot.
+    // tls-prod-gate-nats
+    if is_production && !nats_url.starts_with("tls://") && !nats_url.starts_with("nats+tls://") {
+        return Err(anyhow::anyhow!(
+            "NATS_URL must use TLS (tls:// or nats+tls://) in production — refusing to \
+             start. Got scheme: '{}'.",
+            nats_url.split("://").next().unwrap_or("<unknown>")
+        ));
+    }
+
+    // How the worker authenticates (2026-11-06, worker::nats_identity). Both
+    // settings are checked before anything connects: a wrong spelling, or an
+    // ephemeral identity with no way to register, refuses boot.
+    let nats_auth = worker::nats_identity::parse_nats_auth(
+        std::env::var("AEGIX_WORKER_NATS_AUTH").ok().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let identity_mode = aegix_worker_runtime::worker_identity::parse_identity_mode(
+        std::env::var("AEGIX_WORKER_IDENTITY").ok().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let registration_token = worker::nats_identity::registration_credential(
+        std::env::var("AEGIX_WORKER_REGISTRATION_TOKEN")
+            .ok()
+            .as_deref(),
+        std::env::var("AEGIX_WORKER_REGISTRATION_TOKEN_FILE")
+            .ok()
+            .as_deref(),
+        |p| std::fs::read_to_string(p),
+    )
+    .map_err(anyhow::Error::msg)?;
+    worker::nats_identity::check_identity_settings(
+        nats_auth,
+        identity_mode,
+        registration_token.is_some(),
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    let nc: Client = match (nats_auth, nats_user, nats_password) {
+        (worker::nats_identity::NatsAuth::Identity, _, _) => {
+            connect_nats_with_identity(&nats_url, &nats_url_safe, identity_mode, registration_token)
+                .await?
+        }
+        (_, Some(user), Some(pass)) => {
+            // apply_nats_ca adds the in-cluster NATS CA + requires TLS when
+            // NATS_CA_FILE is set (tls:// URL); no-op otherwise.
+            let opts = worker_connect_options().user_and_password(user, pass);
+            match aegix_nats_tls::apply_nats_ca(opts).connect(&nats_url).await {
+                Ok(c) => {
+                    println!(
+                        "      Connected to NATS (authenticated) at {}",
+                        nats_url_safe
+                    );
+                    c
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to NATS at {}: {}", nats_url_safe, e);
+                    eprintln!("   Check NATS_USER/NATS_PASSWORD credentials.");
+                    return Err(anyhow::anyhow!(e));
+                }
+            }
+        }
+        _ => {
+            // SECURITY: In production, require NATS authentication to prevent
+            // unauthorized job submission and message interception.
+            if is_production {
+                eprintln!("CRITICAL SECURITY ERROR: NATS_USER and NATS_PASSWORD must be set in production.");
+                eprintln!(
+                    "   Unauthenticated NATS connections are not allowed in production mode."
+                );
+                return Err(anyhow::anyhow!(
+                    "NATS authentication required in production (set NATS_USER and NATS_PASSWORD)"
+                ));
+            }
+            ::tracing::warn!(
+                "NATS_USER/NATS_PASSWORD not set — connecting without authentication. \
+                 This is acceptable for development but MUST NOT be used in production."
+            );
+            let opts = aegix_nats_tls::apply_nats_ca(worker_connect_options());
+            match opts.connect(&nats_url).await {
+                Ok(c) => {
+                    println!(
+                        "      Connected to NATS (unauthenticated) at {}",
+                        nats_url_safe
+                    );
+                    c
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to NATS at {}: {}", nats_url_safe, e);
+                    eprintln!("   Make sure a NATS server is running.");
+                    return Err(anyhow::anyhow!(e));
+                }
+            }
+        }
+    };
+
+    // Retrieve configurable NATS queue topics or use defaults.
+    // This enables per-customer VPC "Edge Node" routing.
+    // MCP-631: empty-env hardening — empty NATS topic would silently
+    // subscribe to "" which behaves as an unsubscribed topic and the
+    // worker would receive no jobs without a loud error.
+    let single_job_topic = std::env::var("NATS_JOB_TOPIC")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| aegix_workflow_job_protocol::subjects::JOBS.to_string());
+    // Use the topic names as the queue groups so multiple edge nodes on the same topic load-balance
+    let queue_group = single_job_topic.clone();
+
+    let mut sub: Subscriber = nc
+        .queue_subscribe(single_job_topic.clone(), queue_group.clone())
+        .await?;
+    println!(
+        "      Subscribed to '{}' queue (group: {})",
+        single_job_topic, queue_group
+    );
+
+    // ---------- Fleet heartbeat ----------
+    // Publish a signed heartbeat on `talos.workers.heartbeat.<worker_id>` so
+    // the controller has a live view of which worker PROCESSES are running.
+    //
+    // TWO THINGS THIS IS NOT, both easy to over-read. It is not the liveness
+    // ping spawned above: that is an Ed25519 proof of possession of THIS
+    // worker's own registered key, and it is the only thing that may keep a
+    // signing key trusted. This heartbeat is an HMAC under the FLEET-SHARED
+    // `WORKER_SHARED_KEY`, so any process holding that key can mint one naming
+    // any worker_id — observability, never trust. And it is not a dispatch
+    // input: nothing routes jobs on the fleet view.
+    //
+    // Detached and best-effort like the two registrations above; ceasing to
+    // heartbeat costs visibility only, never trust.
+    tokio::spawn(worker::heartbeat::run_heartbeat_publisher(
+        nc.clone(),
+        shared_key.signing_key().as_bytes().to_vec(),
+    ));
+
+    // ========================================================================
+    // RUNTIME INITIALIZATION (with NATS client for logging)
+    // ========================================================================
+
+    // ========================================================================
+    // REDIS CONNECTION (Phase 1: Decoupled Read Path)
+    // ========================================================================
+
+    println!("\n[2.5/5] Connecting to Redis...");
+    let redis_client = if let Ok(redis_url) = std::env::var("REDIS_URL") {
+        // SECURITY: Require TLS (rediss://) in production to prevent credential
+        // and data interception on the network.
+        if is_production && !redis_url.starts_with("rediss://") {
+            eprintln!("FATAL: REDIS_URL must use rediss:// (TLS) in production");
+            std::process::exit(1);
+        }
+        match aegix_redis::client(redis_url.as_str()) {
+            Ok(client) => {
+                // Test connection
+                match aegix_redis::multiplexed(&client).await {
+                    Ok(mut conn) => {
+                        println!(
+                            "      Connected to Redis at {}",
+                            redis_url.split('@').next_back().unwrap_or("redis")
+                        );
+                        report_redis_identity(&mut conn).await;
+                        Some(Arc::new(client))
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to connect to Redis: {}. WASM cache interface will be unavailable.", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to create Redis client: {}. WASM cache interface will be unavailable.", e);
+                None
+            }
+        }
+    } else {
+        println!("      REDIS_URL not configured. WASM cache interface will be unavailable.");
+        None
+    };
+
+    // Fleet-wide job idempotency tier (2026-07-01): jobs arrive via a NATS
+    // queue group, so a controller transport-retry can land on a DIFFERENT
+    // worker whose in-process result cache is cold — re-executing side
+    // effects. Backing the cache with the same Redis makes dedup fleet-wide;
+    // absent/unreachable Redis degrades to same-worker-only (the old
+    // behavior), never an error.
+    // RFC 0014 P4a: count local LLM timeouts by which deadline fired.
+    worker::local_llm_fleet::install_timeout_series();
+    if let Some(ref client) = redis_client {
+        worker::job_idempotency::init_redis(client.as_ref().clone()).await;
+        register_dispatch_replay_guard(client.as_ref()).await;
+        // RFC 0014 P3b: queue local LLM calls with the controller and the
+        // other workers, not only within this process. Never fatal.
+        worker::local_llm_fleet::install(client.as_ref().clone()).await;
+    } else if aegix_replay_guard::distributed_replay_from_env() {
+        // B2-2: the switch asks for a shared guard and there is no Redis to
+        // hold one; the replay policy refuses every dispatch when failing
+        // closed. Said once, loudly, at boot.
+        ::tracing::error!(
+            target: "talos_security",
+            fail_closed = aegix_replay_guard::fail_closed_from_env(),
+            "AEGIX_DISTRIBUTED_REPLAY is on but REDIS_URL is unset — no replay guard; every \
+             dispatch is refused when failing closed"
+        );
+    }
+
+    // PostgreSQL connection block removed Phase 2.10. Worker is now
+    // credential-free: the WIT `database::execute_query` host
+    // function dispatches via signed NATS-RPC to the controller
+    // (Phase 2.3). DATABASE_URL is intentionally not read here.
+
+    println!("\n[3/5] Creating WASM runtime...");
+    // The Redis tier of the module result cache is sealed under a key derived
+    // from WORKER_SHARED_KEY (E-4, 2026-10-14): every worker of the fleet
+    // opens what another sealed, and a value written by anyone without the
+    // key is a miss. See aegix_worker_runtime::result_cache_seal.
+    let runtime = Arc::new(
+        AegixRuntime::with_resources(
+            redis_client.clone(),       // Redis client for WASM fetching and caching
+            Some(Arc::new(nc.clone())), // NATS client for WASM log publishing
+            None,                       // No file system sandbox for now
+        )?
+        .with_result_cache_seal_key(
+            worker::result_cache_seal::ResultCacheSealKey::derive(
+                shared_key.signing_key().as_bytes(),
+            ),
+        ),
+    );
+    println!("      Runtime created with NATS logging enabled (worker is credential-free; database access via NATS-RPC)");
+
+    // The epoch-interruption ticker (the third kill switch alongside fuel +
+    // wall-clock timeout) is started by `AegixRuntime::with_resources`
+    // itself since 2026-09-25 — on a dedicated OS thread, so compute-bound
+    // guests cannot starve it — and must NOT be started again here: a second
+    // ticker would advance the epoch twice per interval and halve every
+    // job's wall-clock budget.
+    println!("      Epoch-interruption ticker started by the runtime (third kill switch alongside fuel + wall-clock timeout)");
+
+    // ========================================================================
+    // METRICS SERVER
+    // ========================================================================
+
+    println!("\n[4/5] Starting metrics server...");
+    let metrics_port = std::env::var("METRICS_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(9090);
+
+    let _metrics_handle = metrics_server::start_metrics_server(runtime.clone(), metrics_port)
+        .expect("Failed to start metrics server — ensure METRICS_AUTH_TOKENS is set");
+
+    println!("      Metrics server running on port {}", metrics_port);
+    println!(
+        "         - Metrics: http://localhost:{}/metrics",
+        metrics_port
+    );
+    println!(
+        "         - Health:  http://localhost:{}/health",
+        metrics_port
+    );
+
+    // ========================================================================
+    // JOB PROCESSING LOOP
+    // ========================================================================
+
+    println!("\n[5/5] Starting job processing...");
+    println!("\n=== Worker Ready ===");
+    println!(
+        "Listening for jobs on {} (queue: {})",
+        nats_url, single_job_topic
+    );
+
+    // Resolve concurrency caps ONCE and bind to locals — the shutdown
+    // drain loop below compares `available_permits()` against these same
+    // values, so they must not be re-read from env (an operator changing
+    // the env mid-process can't happen, but re-reading would also re-emit
+    // the WARN and risk drift).
+    let max_concurrent_jobs = max_concurrent_jobs();
+
+    // Capacity sanity gate: the single-job semaphore must never hand out
+    // more permits than the pooling allocator can instantiate. If
+    // `max_concurrent_jobs > TOTAL_COMPONENT_INSTANCES`, a job could
+    // acquire a permit, then fail to get a pooling slot at instantiation
+    // — turning clean semaphore back-pressure into instantiation errors
+    // under saturation. WARN rather
+    // than panic so an operator who deliberately raised the allocator's
+    // total isn't blocked, but the misconfiguration is loud.
+    let total_component_instances = worker::runtime::TOTAL_COMPONENT_INSTANCES as usize;
+    if max_concurrent_jobs > total_component_instances {
+        ::tracing::warn!(
+            max_concurrent_jobs,
+            total_component_instances,
+            "AEGIX_MAX_CONCURRENT_JOBS exceeds the pooling allocator's total_component_instances — jobs may acquire a concurrency permit but fail to instantiate under saturation; lower the concurrency cap or raise total_component_instances in runtime.rs"
+        );
+    } else {
+        ::tracing::info!(
+            max_concurrent_jobs,
+            total_component_instances,
+            "Job concurrency caps within pooling-allocator capacity"
+        );
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_jobs));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // ── Operator-cancel listener ──────────────────────────────────────────
+    // Not semaphore-gated: handling a cancel is a signature check plus a scan
+    // of a map bounded by the job concurrency cap, and it must not queue behind
+    // the very jobs it is trying to stop.
+    //
+    // DELIBERATELY NOT joined in the shutdown `select!` below. That select
+    // treats any completed arm as "the worker is finished" — correct for the
+    // two job loops, whose exit means the bus is gone. This task can also end
+    // for a reason that must NOT stop the worker: a failed subscribe. Adding
+    // it as an arm would turn a degraded-cancellation condition (logged at
+    // ERROR, jobs unaffected) into an immediate shutdown of a worker with jobs
+    // in flight. It observes `shutdown_rx` itself, and dropping a tokio
+    // `JoinHandle` does not abort the task.
+    let _cancel_handle = tokio::spawn(run_cancel_listener(
+        nc.clone(),
+        runtime.clone(),
+        shared_key.clone(),
+        shutdown_rx.clone(),
+    ));
+
+    // ── Single-node jobs task ─────────────────────────────────────────────
+    let single_nc = nc.clone();
+    let single_runtime = runtime.clone();
+    let single_key = shared_key.clone();
+    let single_sem = semaphore.clone();
+    let mut single_shutdown = shutdown_rx.clone();
+
+    let single_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = single_shutdown.changed() => break,
+                permit_res = single_sem.clone().acquire_owned() => {
+                    let permit = match permit_res {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+
+                    tokio::select! {
+                        _ = single_shutdown.changed() => break,
+                        msg_opt = sub.next() => {
+                            let msg = match msg_opt {
+                                Some(m) => m,
+                                None => break,
+                            };
+
+                            let cx = if let Some(ref headers) = msg.headers {
+                                worker::trace_nats::extract_trace_context(headers)
+                            } else {
+                                opentelemetry::Context::new()
+                            };
+
+                            // SECURITY: cap payload size before deserialization to prevent
+                            // memory exhaustion from oversized NATS messages.
+                            const MAX_JOB_PAYLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MB
+                            // Dropped WITHOUT a reply — see `rejected_jobs` for why
+                            // no fail-fast result can be sent safely.
+                            if msg.payload.len() > MAX_JOB_PAYLOAD_BYTES {
+                                rejected_jobs::record(
+                                    rejected_jobs::JobKind::Single,
+                                    rejected_jobs::RejectReason::Oversized,
+                                    msg.payload.len(),
+                                );
+                                continue;
+                            }
+                            let req: JobRequest = match serde_json::from_slice(&msg.payload) {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    rejected_jobs::record(
+                                        rejected_jobs::JobKind::Single,
+                                        rejected_jobs::RejectReason::Undecodable,
+                                        msg.payload.len(),
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            ::tracing::info!(job_id = %req.job_id, module_uri = %req.module_uri, "Received job");
+                            let payload_bytes = msg.payload.len();
+
+                            let nc_clone = single_nc.clone();
+                            let runtime_clone = single_runtime.clone();
+                            let key_clone = single_key.clone();
+                            let wire_reply = msg.reply.map(|r: async_nats::Subject| r.to_string());
+                            // H-1: prefer the HMAC-bound `req.reply_topic`
+                            // over the unsigned wire `msg.reply`. See
+                            // `pick_trusted_reply_topic` for the matrix.
+                            let reply_to = pick_trusted_reply_topic(
+                                req.job_id,
+                                req.reply_topic.as_deref(),
+                                wire_reply.as_deref(),
+                            );
+
+                            tokio::task::spawn(async move {
+                                // FU-2 (R2-5) idempotency: a controller transport-retry re-sends
+                                // the same job_id (with a fresh nonce) AFTER the original
+                                // executed. Re-publish the cached signed result instead of
+                                // re-running the module (which would repeat side effects). The
+                                // cached result is still within the 300s JobResult freshness
+                                // window, so it's re-published as-is. dry_run jobs are never
+                                // cached (no side effects, cheap to re-run).
+                                //
+                                // SECURITY (self-review fix): the cache must ONLY be consulted
+                                // for an AUTHENTICATED request. `execute_job` verifies the
+                                // request HMAC, but it runs AFTER this cache check — so without
+                                // gating here, an on-NATS attacker could send an unsigned
+                                // JobRequest with a known (non-secret) job_id and exfiltrate the
+                                // cached signed result to an attacker-chosen reply inbox,
+                                // bypassing the "no result leaves the worker without a valid
+                                // HMAC" invariant. We pre-verify with the NO-REPLAY variant
+                                // (HMAC + freshness, but NOT the nonce cache) so the cache-miss
+                                // path's `execute_job` → `verify_dispatch` still records the
+                                // nonce exactly once. A forged request fails this pre-check and
+                                // falls through to `execute_job`, which refuses it without
+                                // running the module; `refused_dispatch_answer` then decides
+                                // what is sent in answer (for a forged request, nothing).
+                                //
+                                // SCHEME-ROUTING (2026-09-10): this pre-check used the HMAC-only
+                                // `verify_no_replay_with_ring`, so under an Ed25519 dispatch
+                                // (`crypto_scheme = 1`, the dev fleet's posture) it was ALWAYS
+                                // false and the idempotency layer was dead. Route on the
+                                // scheme exactly as the primary verifier below does.
+                                let dvc = dispatch_verify_config();
+                                let request_authentic = req
+                                    .verify_no_replay_dispatch(
+                                        &key_clone,
+                                        &dvc.ed_keys,
+                                        300,
+                                        dvc.accept_legacy_hmac,
+                                    )
+                                    .is_ok();
+                                // B-5 (2026-10-14): once per fleet, not per worker.
+                                // B2-2/B2-3 (2026-10-15): the one replay policy decides,
+                                // a refusal is counted, and one for want of the store is
+                                // answered (a replay never is).
+                                if request_authentic {
+                                    let verdict = dispatch_replay::fleet_verdict(
+                                        aegix_replay_guard::shared_replay_guard().as_deref(),
+                                        &dispatch_replay::dispatch_key("job", req.job_id, &req.job_nonce),
+                                        aegix_replay_guard::ReplayPolicy::from_env(),
+                                    )
+                                    .await;
+                                    if verdict != aegix_replay_guard::ReplayVerdict::Admit {
+                                        dispatch_replay::record_refusal(verdict);
+                                        if verdict == aegix_replay_guard::ReplayVerdict::StoreUnavailable {
+                                            ::tracing::warn!(
+                                                target: "talos_security",
+                                                job_id = %req.job_id,
+                                                "dispatch refused: the shared replay store could not vouch \
+                                                 for its nonce (fail closed); answered Failed, transient"
+                                            );
+                                            let mut refused = failed_result(
+                                                req.job_id,
+                                                &std::time::Instant::now(),
+                                                dispatch_replay::STORE_UNAVAILABLE_ERROR,
+                                            );
+                                            if let Err(e) = sign_job_result_for(&mut refused, &req, &key_clone) {
+                                                ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to sign a refusal");
+                                            }
+                                            if let Err(e) = publish_result_with_retry(
+                                                &nc_clone, &refused, 3, reply_to, &key_clone,
+                                            )
+                                            .await
+                                            {
+                                                ::tracing::error!(job_id = %req.job_id, error = %e, "Failed to publish a refusal");
+                                            }
+                                        } else {
+                                            ::tracing::warn!(
+                                                target: "talos_security",
+                                                job_id = %req.job_id,
+                                                "dispatch refused: its nonce was already used on this fleet; \
+                                                 not run, no reply"
+                                            );
+                                        }
+                                        drop(permit);
+                                        return;
+                                    }
+                                }
+                                if request_authentic && !req.dry_run {
+                                    // Tier 1: in-process (same-worker retry, free).
+                                    // Tier 2: Redis (a retry that reached another
+                                    // process of THIS worker identity, or this worker
+                                    // after a restart). Redis-sourced bytes are NOT
+                                    // trusted blindly: an entry is served only when this
+                                    // worker can vouch for it (below), so neither a Redis
+                                    // compromise nor a sibling worker can inject a result
+                                    // or cross-wire jobs; a refusal falls through to
+                                    // normal re-execution.
+                                    let cached = match worker::job_idempotency::JOB_RESULT_CACHE
+                                        .get(req.job_id)
+                                    {
+                                        Some(c) => Some(c),
+                                        None => worker::job_idempotency::shared_get(
+                                            worker::job_idempotency::REDIS_JOB_PREFIX,
+                                            req.job_id,
+                                        )
+                                        .await
+                                        .and_then(|bytes| {
+                                            // Finding 10 (2026-11-06): only an entry THIS
+                                            // worker can vouch for — its own id, verified
+                                            // under its own key(s) (never the registry's
+                                            // keys for whatever id the entry names), for
+                                            // this job and execution at this or an earlier
+                                            // attempt. One rule, `vouched_shared_entry`.
+                                            let own = worker_identity();
+                                            match worker::job_idempotency::vouched_shared_entry(
+                                                &bytes,
+                                                &req.dispatch_identity(),
+                                                own,
+                                                |r| {
+                                                    r.verify_no_replay_dispatch(
+                                                        &key_clone,
+                                                        &cached_result_verify_keys(own),
+                                                        300,
+                                                        aegix_workflow_job_protocol::result_accept_legacy_hmac(),
+                                                    )
+                                                    .is_ok()
+                                                },
+                                            ) {
+                                                Ok(r) => Some(r),
+                                                Err(refusal) => {
+                                                    ::tracing::warn!(
+                                                        job_id = %req.job_id,
+                                                        refusal = ?refusal,
+                                                        "idempotency: shared Redis entry is not one \
+                                                         this worker can vouch for — ignoring, \
+                                                         re-executing"
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        }),
+                                    };
+                                    // A RE-DISPATCH (`dispatch_attempt > 0`) of a job whose
+                                    // cached result is NOT a terminal success is the
+                                    // controller's application-failure retry asking for a
+                                    // fresh run — serving the cached failure would spend the
+                                    // whole retry budget re-reading one transient error. The
+                                    // put-site below no longer caches such results at all;
+                                    // this guard covers an entry a pre-fix worker wrote to
+                                    // Redis during a rolling upgrade.
+                                    let cached = cached.filter(|c| {
+                                        let stale_failure =
+                                            req.dispatch_attempt > 0 && !c.is_terminal_success();
+                                        if stale_failure {
+                                            ::tracing::debug!(
+                                                job_id = %req.job_id,
+                                                dispatch_attempt = req.dispatch_attempt,
+                                                "idempotency: cached result is not a terminal \
+                                                 success and this is a re-dispatch — re-executing"
+                                            );
+                                        }
+                                        !stale_failure
+                                    });
+                                    if let Some(mut cached) = cached {
+                                        ::tracing::info!(
+                                            job_id = %req.job_id,
+                                            "idempotency: re-publishing cached result for re-seen \
+                                             job_id (transport retry); skipping re-execution"
+                                        );
+                                        // B-9 (2026-10-14): the cached result names the
+                                        // attempt that produced it; the dispatcher takes
+                                        // only an answer to the attempt it is waiting on.
+                                        // Re-bind to THIS request and re-sign (a fresh
+                                        // nonce). The output and its fuel are the cached
+                                        // run's: that run is what this answers with.
+                                        if let Err(e) = sign_job_result_for(&mut cached, &req, &key_clone) {
+                                            ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to re-sign cached job result");
+                                        }
+                                        if let Err(e) = publish_result_with_retry(
+                                            &nc_clone, &cached, 3, reply_to, &key_clone,
+                                        )
+                                        .await
+                                        {
+                                            ::tracing::error!(job_id = %req.job_id, error = %e, "CRITICAL: Failed to publish cached job result");
+                                        }
+                                        drop(permit);
+                                        return;
+                                    }
+                                }
+
+                                let mut result = match execute_job(&cx, req.clone(), runtime_clone, key_clone.clone(), &nc_clone).await {
+                                    Ok(result) => result,
+                                    // The dispatch did not verify. One rule says
+                                    // what, if anything, is signed in answer.
+                                    Err(refusal) => match refused_dispatch_answer(
+                                        &req,
+                                        &refusal,
+                                        &key_clone,
+                                        dispatch_verify_config(),
+                                        *WORKER_SIGNATURE_DIAG_ENABLED,
+                                    ) {
+                                        Some(answer) => answer,
+                                        None => {
+                                            rejected_jobs::record(
+                                                rejected_jobs::JobKind::Single,
+                                                rejected_jobs::RejectReason::unverified(refusal.kind()),
+                                                payload_bytes,
+                                            );
+                                            if *WORKER_SIGNATURE_DIAG_ENABLED {
+                                                // The field dump an operator asked
+                                                // for, in this worker's own log: it
+                                                // is no longer sent anywhere.
+                                                ::tracing::warn!(
+                                                    target: "signature_diag",
+                                                    job_id = %req.job_id,
+                                                    diag = %signature_failure_payload(true, &req, &refusal),
+                                                    "signature_diag: a dispatch that did not verify (AEGIX_SIGNATURE_DIAG)"
+                                                );
+                                            }
+                                            drop(permit);
+                                            return;
+                                        }
+                                    },
+                                };
+
+                                // B-9 (2026-10-14): name the dispatch this answers.
+                                // L-11: bind worker identity for audit attribution.
+                                // RFC 0010 P2: Ed25519 when configured, else HMAC.
+                                if let Err(e) = sign_job_result_for(&mut result, &req, &key_clone) {
+                                    ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to sign job result");
+                                }
+
+                                // FU-2: cache the SIGNED terminal result BEFORE publishing, so a
+                                // retry that arrives because the *reply* (not the execution)
+                                // failed still finds it. Keyed on job_id; bounded by TTL + size +
+                                // count (see `job_idempotency`). Written to BOTH tiers: the
+                                // in-process map (same-worker retry) and Redis (retry landing on
+                                // a sibling queue-group worker).
+                                //
+                                // ONLY a result the controller would NOT retry is cached
+                                // (`JobResult::is_terminal_success`, the dispatcher's own
+                                // predicate, one home). The dispatcher retries `Failed` and
+                                // `success:false` results under the SAME job_id, so caching
+                                // those made every engine retry a no-op replay of the first
+                                // failure (2026-09-10).
+                                if !req.dry_run && !result.is_terminal_success() {
+                                    ::tracing::debug!(
+                                        job_id = %result.job_id,
+                                        status = ?result.status,
+                                        "idempotency: not caching a non-success result — the \
+                                         controller's retry must re-execute, not replay it"
+                                    );
+                                }
+                                if !req.dry_run && result.is_terminal_success() {
+                                    match serde_json::to_vec(&result) {
+                                        Ok(bytes) => {
+                                            worker::job_idempotency::JOB_RESULT_CACHE.put(
+                                                result.job_id,
+                                                result.clone(),
+                                                bytes.len(),
+                                            );
+                                            worker::job_idempotency::shared_put(
+                                                worker::job_idempotency::REDIS_JOB_PREFIX,
+                                                result.job_id,
+                                                &bytes,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => ::tracing::warn!(
+                                            job_id = %result.job_id, error = %e,
+                                            "idempotency: could not serialize result for cache sizing; not caching"
+                                        ),
+                                    }
+                                }
+
+                                match result.status {
+                                    JobStatus::Success => {
+                                        ::tracing::info!(job_id = %result.job_id, duration_ms = result.execution_time_ms, "Job completed");
+                                    }
+                                    JobStatus::Failed => {
+                                        ::tracing::warn!(job_id = %result.job_id, duration_ms = result.execution_time_ms, "Job failed");
+                                    }
+                                    _ => {}
+                                }
+
+                                if let Err(e) = publish_result_with_retry(
+                                    &nc_clone,
+                                    &result,
+                                    3,
+                                    reply_to,
+                                    &key_clone,
+                                )
+                                .await
+                                {
+                                    ::tracing::error!(job_id = %result.job_id, error = %e, "CRITICAL: Failed to publish job result");
+                                }
+
+                                drop(permit);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    tokio::select! {
+        // MCP-667 (2026-05-13): listen for BOTH SIGTERM and SIGINT via
+        // the shared `aegix_shutdown::wait_for_shutdown` helper. Pre-fix
+        // the worker only handled SIGINT (Ctrl+C); under K8s pod
+        // termination the kubelet sends SIGTERM, which was unobserved —
+        // in-flight WASM executions, NATS publishes, and result-
+        // collector flushes were aborted at SIGKILL after the grace
+        // period elapsed instead of draining cleanly. Sibling fix to
+        // the controller-side change at `with_graceful_shutdown` —
+        // both binaries now route through the same shutdown surface
+        // that carries the MCP-501 install-failure handling.
+        _ = aegix_shutdown::wait_for_shutdown() => {
+            ::tracing::info!("Shutdown signal received, draining in-flight jobs...");
+            let _ = shutdown_tx.send(true);
+        }
+        _ = single_handle => {},
+    }
+
+    // ========================================================================
+    // GRACEFUL SHUTDOWN
+    // ========================================================================
+
+    println!("\n=== Shutting Down ===");
+
+    println!("[1/3] Waiting for in-flight jobs to complete...");
+    let shutdown_timeout = tokio::time::Duration::from_secs(30);
+    let drain_start = std::time::Instant::now();
+
+    while (semaphore.available_permits() < max_concurrent_jobs || runtime.active_executions() > 0)
+        && drain_start.elapsed() < shutdown_timeout
+    {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    if runtime.active_executions() > 0 {
+        ::tracing::warn!(
+            remaining = runtime.active_executions(),
+            "Forcing shutdown with jobs still running"
+        );
+    } else {
+        ::tracing::info!("All in-flight jobs drained successfully");
+    }
+    println!("      All jobs completed");
+
+    println!("[2/3] Flushing traces...");
+    worker::tracing::shutdown_tracing();
+    println!("      Traces flushed");
+
+    println!("[3/3] Closing connections...");
+    drop(nc);
+    println!("      Connections closed");
+
+    println!("\nWorker shutdown complete");
+    Ok(())
+}
+#[cfg(test)]
+mod result_publish_tests {
+    /// E2-3 (2026-10-15): a hint this worker does not know is refused, never
+    /// read as "no hint"; a known one in either spelling is that world.
+    #[test]
+    fn an_unrecognised_world_hint_is_refused_not_dropped() {
+        use worker::wit_inspector::CapabilityWorld;
+        assert_eq!(super::job_world_hint(None), Ok(None));
+        assert_eq!(
+            super::job_world_hint(Some("http-node")),
+            Ok(Some(CapabilityWorld::Http))
+        );
+        assert_eq!(
+            super::job_world_hint(Some("automation-node")),
+            Ok(Some(CapabilityWorld::Trusted))
+        );
+        for unknown in ["automation-node-v2", "", "llm-node", "unknown"] {
+            assert_eq!(super::job_world_hint(Some(unknown)), Err(()), "{unknown:?}");
+        }
+    }
+
+    use super::*;
+
+    // Serial guard for env-mutating tests in this module. Without it,
+    // cargo's parallel test runner can race on the global env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ─── M-7: JobResult publish-size cap ──────────────────────────────────
+
+    /// B-9: the replacement answers the dispatch the original answered.
+    #[test]
+    fn truncate_oversized_keeps_the_dispatch_the_result_answers() {
+        let mut original = failed_result(uuid::Uuid::new_v4(), &std::time::Instant::now(), "x");
+        original.dispatch_attempt = 3;
+        original.workflow_execution_id = Some(uuid::Uuid::new_v4());
+        let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
+        assert_eq!(replacement.dispatch_attempt, 3);
+        assert_eq!(
+            replacement.workflow_execution_id,
+            original.workflow_execution_id
+        );
+    }
+
+    #[test]
+    fn truncate_oversized_replaces_payload_and_marks_failed() {
+        let original = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id: uuid::Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"huge": "x".repeat(10_000)}).into(),
+            logs: vec!["a".to_string(); 1000],
+            execution_time_ms: 42,
+            signature: vec![0; 32],
+            result_nonce: "1700000000:abc".to_string(),
+            worker_id: String::new(),
+            fuel: Some(aegix_workflow_job_protocol::FuelMeasure {
+                consumed: 3_000_000,
+                limit: 4_000_000,
+            }),
+        };
+        let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
+        // The module ran and spent its fuel; dropping the output must not drop
+        // the spend from the actor's fuel budget.
+        assert_eq!(replacement.fuel, original.fuel);
+        // Identity bound: same job_id so the controller can correlate.
+        assert_eq!(replacement.job_id, original.job_id);
+        // Status downgraded to Failed — the original Success is no
+        // longer accurate because the result didn't reach the
+        // controller.
+        assert_eq!(replacement.status, JobStatus::Failed);
+        // Payload replaced with a small diagnostic blob.
+        assert!(replacement.output_payload.value().get("error").is_some());
+        assert!(replacement.output_payload.value().get("diag").is_some());
+        // Logs and execution time preserved for correlation.
+        assert!(!replacement.logs.is_empty());
+        assert_eq!(replacement.execution_time_ms, 42);
+        // Signature MUST be cleared so the caller can't accidentally
+        // publish an unsigned replacement (the caller is expected to
+        // re-sign before publishing).
+        assert!(replacement.signature.is_empty());
+        assert!(replacement.result_nonce.is_empty());
+    }
+
+    #[test]
+    fn truncate_oversized_replacement_serializes_under_cap() {
+        // The replacement itself must fit comfortably under any
+        // reasonable cap, otherwise we'd loop forever.
+        let original = JobResult {
+            dispatch_attempt: 0,
+            workflow_execution_id: None,
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id: uuid::Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"huge": "x".repeat(10_000_000)}).into(),
+            logs: vec![],
+            execution_time_ms: 0,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+            fuel: None,
+        };
+        let replacement = truncate_oversized_job_result(&original, 10_000_000, 4_000_000);
+        let bytes = serde_json::to_vec(&replacement).unwrap();
+        // Replacement is small — well under any realistic cap.
+        assert!(
+            bytes.len() < 4096,
+            "replacement should serialize to a small payload; got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn max_job_result_bytes_uses_default_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WORKER_MAX_JOB_RESULT_BYTES");
+        assert_eq!(max_job_result_bytes(), DEFAULT_MAX_JOB_RESULT_BYTES);
+    }
+
+    #[test]
+    fn max_job_result_bytes_respects_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WORKER_MAX_JOB_RESULT_BYTES", "8388608"); // 8 MiB
+        assert_eq!(max_job_result_bytes(), 8_388_608);
+        std::env::remove_var("WORKER_MAX_JOB_RESULT_BYTES");
+    }
+
+    // ─── B2: env-tunable concurrency caps ─────────────────────────────────
+
+    #[test]
+    fn concurrency_caps_use_defaults_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AEGIX_MAX_CONCURRENT_JOBS");
+        assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+    }
+
+    #[test]
+    fn concurrency_caps_respect_positive_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("AEGIX_MAX_CONCURRENT_JOBS", "42");
+        assert_eq!(max_concurrent_jobs(), 42);
+        std::env::remove_var("AEGIX_MAX_CONCURRENT_JOBS");
+    }
+
+    #[test]
+    fn concurrency_cap_zero_falls_back_to_default() {
+        // =0/negative footgun guard: a 0 Semaphore permits nothing and
+        // would silently stall the worker. `nonzero_env_or_default`
+        // substitutes the default (>= 1) with a WARN.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("AEGIX_MAX_CONCURRENT_JOBS", "0");
+        assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+        std::env::remove_var("AEGIX_MAX_CONCURRENT_JOBS");
+    }
+
+    #[test]
+    fn concurrency_cap_negative_falls_back_to_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("AEGIX_MAX_CONCURRENT_JOBS", "-5");
+        assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+        std::env::remove_var("AEGIX_MAX_CONCURRENT_JOBS");
+    }
+
+    #[test]
+    fn concurrency_cap_non_numeric_falls_back_to_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("AEGIX_MAX_CONCURRENT_JOBS", "lots");
+        assert_eq!(max_concurrent_jobs(), DEFAULT_MAX_CONCURRENT_JOBS);
+        std::env::remove_var("AEGIX_MAX_CONCURRENT_JOBS");
+    }
+
+    #[test]
+    fn default_concurrency_within_pooling_capacity() {
+        // The startup capacity gate in `main()` WARNs when
+        // max_concurrent_jobs > TOTAL_COMPONENT_INSTANCES. Pin the
+        // shipped defaults so a future bump that would silently exceed
+        // the pooling allocator's instance ceiling trips here first.
+        let total = worker::runtime::TOTAL_COMPONENT_INSTANCES as usize;
+        assert!(
+            DEFAULT_MAX_CONCURRENT_JOBS <= total,
+            "default single-job concurrency {DEFAULT_MAX_CONCURRENT_JOBS} exceeds pooling total_component_instances {total}"
+        );
+    }
+
+    // ─── D3 (2026-09-10): per-job fuel clamp ──────────────────────────────
+
+    #[test]
+    fn clamp_job_fuel_zero_means_runtime_default() {
+        assert_eq!(clamp_job_fuel(uuid::Uuid::nil(), 0, 50_000_000), None);
+    }
+
+    #[test]
+    fn clamp_job_fuel_honours_a_request_within_the_ceiling() {
+        assert_eq!(
+            clamp_job_fuel(uuid::Uuid::nil(), 5_000_000, 50_000_000),
+            Some(5_000_000)
+        );
+        assert_eq!(
+            clamp_job_fuel(uuid::Uuid::nil(), 50_000_000, 50_000_000),
+            Some(50_000_000),
+            "exactly the ceiling is not a clamp"
+        );
+    }
+
+    #[test]
+    fn clamp_job_fuel_caps_an_oversized_request() {
+        assert_eq!(
+            clamp_job_fuel(uuid::Uuid::nil(), u64::MAX, 50_000_000),
+            Some(50_000_000)
+        );
+        assert_eq!(
+            clamp_job_fuel(uuid::Uuid::nil(), 50_000_001, 50_000_000),
+            Some(50_000_000)
+        );
+    }
+
+    #[test]
+    fn worker_fuel_ceiling_default_is_the_protocol_constant() {
+        // Unless an operator set the env var in this test process, the ceiling
+        // is the shared constant — the same number the controller caps at.
+        // Check 73: an EMPTY value is "unset" everywhere in this workspace, so
+        // the guard must read the value, not merely its presence.
+        if std::env::var("AEGIX_WORKER_MAX_JOB_FUEL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_none()
+        {
+            assert_eq!(
+                worker_max_job_fuel(),
+                aegix_workflow_job_protocol::MAX_JOB_FUEL
+            );
+        }
+    }
+
+    // ─── H-1: pick_trusted_reply_topic decision matrix ────────────────────
+    //
+    // The whole point of H-1 is that a NATS-channel attacker who
+    // substitutes `msg.reply` cannot redirect the worker's signed
+    // JobResult to an attacker-controlled subject. These tests pin
+    // the policy at the function boundary so a future "simplification"
+    // can't silently re-introduce the regression.
+
+    #[test]
+    fn pick_reply_signed_and_wire_match() {
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, Some("_INBOX.abc"), Some("_INBOX.abc"));
+        assert_eq!(r.as_deref(), Some("_INBOX.abc"));
+    }
+
+    #[test]
+    fn pick_reply_signed_and_wire_mismatch_returns_signed() {
+        // SECURITY: an attacker substituted `msg.reply` — the worker
+        // MUST publish to the signed value, not the wire value.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, Some("_INBOX.legit"), Some("talos.admin.commands"));
+        assert_eq!(
+            r.as_deref(),
+            Some("_INBOX.legit"),
+            "wire taking priority would be the security regression"
+        );
+    }
+
+    #[test]
+    fn pick_reply_signed_only() {
+        // msg.reply stripped in transit; signed value is authoritative.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, Some("_INBOX.signed"), None);
+        assert_eq!(r.as_deref(), Some("_INBOX.signed"));
+    }
+
+    #[test]
+    fn pick_reply_wire_only_is_ignored() {
+        // 2026-09-10: an unsigned wire header with no signed twin is NOT a
+        // reply path. Pre-fix this returned `Some("_INBOX.legacy")` — the
+        // one arm through which a replayed job's signed output could be
+        // steered to an attacker-chosen inbox.
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, None, Some("_INBOX.legacy"));
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn pick_reply_neither_present() {
+        let jid = uuid::Uuid::new_v4();
+        let r = pick_trusted_reply_topic(jid, None, None);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn pick_reply_mismatch_does_not_publish_to_attacker_subject() {
+        // Specific regression guard: an attacker substituting a
+        // sensitive admin subject MUST NOT result in the worker
+        // publishing there. This is the whole point of H-1.
+        let jid = uuid::Uuid::new_v4();
+        let bad_subjects = [
+            "talos.admin.commands",
+            "talos.jobs",          // would create a NATS loop
+            "$SYS.REQ.ACCOUNT",    // NATS system subject
+            "_INBOX.attacker.xyz", // inbox-prefix but not the signed one
+        ];
+        for bad in bad_subjects {
+            let r = pick_trusted_reply_topic(jid, Some("_INBOX.legit"), Some(bad));
+            assert_eq!(
+                r.as_deref(),
+                Some("_INBOX.legit"),
+                "H-1 regression: wire subject {bad:?} leaked through"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod nats_connect_options_tests {
+    //! The inbox prefix is the one client-side half of the broker permission
+    //! model: the worker credential is granted subscribe on `_WINBOX.>` and
+    //! not `_INBOX.>`, so a worker that drifted back to the default prefix
+    //! would issue RPCs whose replies it can never receive. `ConnectOptions`
+    //! exposes no getter; its `Debug` output names the field, which is the
+    //! only observation available short of a live broker (the live check is
+    //! `aegix-workflow-engine-nats/tests/nats_worker_permissions.rs`).
+    use super::worker_connect_options;
+    use aegix_workflow_job_protocol::nats_permissions::{
+        CONTROLLER_INBOX_PREFIX, WORKER_INBOX_PREFIX,
+    };
+
+    #[test]
+    fn worker_connect_options_use_the_worker_inbox_prefix() {
+        let dbg = format!("{:?}", worker_connect_options());
+        // `ConnectOptions` renders as a map of quoted keys: `"inbox_prefix": "_WINBOX"`.
+        assert!(
+            dbg.contains(&format!("\"inbox_prefix\": {WORKER_INBOX_PREFIX:?}")),
+            "ConnectOptions must carry the worker inbox prefix; got: {dbg}"
+        );
+        assert!(!dbg.contains(&format!("\"inbox_prefix\": {CONTROLLER_INBOX_PREFIX:?}")));
+    }
+}

@@ -1,0 +1,56 @@
+[package]
+name = "aegix-runtime"
+# not-inherited: the embeddable runtime boundary is versioned on its own, apart
+# from the platform around it. `RUNTIME_API_VERSION` in src/lib.rs is held
+# equal to this line by a test; bump both together.
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Aegix runtime as one embeddable unit: the wasmtime WASM host, the signed job protocol, the signed-RPC client side, the capability worlds and the WIT inspector, with no platform crate in its dependency closure (structural check 109)."
+readme = "README.md"
+
+# A facade: every dependency below is re-exported, nothing is implemented
+# here. Structural check 109 (`make check-runtime-boundary`) refuses a
+# platform crate anywhere in this crate's normal-dependency closure, so a new
+# dependency of any crate listed here is a boundary change.
+[dependencies]
+aegix-worker-runtime = { path = "../aegix-worker-runtime" }
+aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
+aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
+aegix-capability-world = { path = "../aegix-capability-world" }
+aegix-wit-inspector = { path = "../aegix-wit-inspector" }
+aegix-replay-guard = { path = "../aegix-replay-guard" }
+
+[features]
+default = []
+# An embedder that exports traces over OTLP/gRPC turns this on; off, the
+# closure holds no `opentelemetry-otlp`, `tonic` or `prost` (check 109 refuses
+# them), and `init_tracing` refuses a configured endpoint with a log line.
+otlp = ["aegix-worker-runtime/otlp"]
+# An embedder that runs modules pulled from an OCI registry (`oci://` module
+# URIs, Sigstore-verified) turns this on; off, the closure holds no
+# `oci-client` / `oci-spec` (check 109 refuses them) and `module_fetcher::fetch`
+# refuses an `oci://` dispatch with `NoRegistryClientInThisBuild`.
+oci = ["aegix-worker-runtime/oci"]
+# An embedder that serves a Prometheus `/metrics` exposition turns this on;
+# off, the closure holds no `prometheus` / `opentelemetry-prometheus` (check
+# 109 refuses them) and `metrics::init_telemetry` refuses with
+# `NoMetricsExporterInThisBuild`; the OTel instruments record into the no-op
+# global meter.
+prometheus = ["aegix-worker-runtime/prometheus"]
+
+[dev-dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# tests/embed.rs builds a real `minimal-node` component from WAT at test time,
+# the same way worker/tests does, so the embed path is proved without a
+# toolchain or a checked-in binary.
+wat.workspace = true
+wit-component.workspace = true
+wit-parser.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,163 @@
+# A release: the tag v<version> on a tree that says that version.
+#
+# Three images (worker, reference-controller, demo) are built on a runner of
+# each architecture, with no emulation; each architecture's demo image must
+# run the whole demo before anything of that architecture is pushed. The two
+# builds of an image are then joined under one tag, the joined image is signed
+# with this workflow's identity (no stored key), and the GitHub release
+# carries the changelog's section, the digests and compose.pinned.yaml.
+#
+# To check an image against the workflow that built it:
+#
+#   cosign verify \
+#     --certificate-identity-regexp '^https://github\.com/aegix-dev/aegix-runtime/\.github/workflows/release\.yml@' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     ghcr.io/aegix-dev/aegix-runtime/demo@sha256:…
+#
+# The `@` that ends the pattern is needed: without it a workflow file whose
+# name merely begins with release.yml would match.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: The tree says this version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - run: make release-check TAG="$GITHUB_REF_NAME" REPOSITORY="$GITHUB_REPOSITORY"
+
+  build:
+    name: Images for ${{ matrix.arch }}
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+
+      # One job builds all three: they share a build directory, so the worker
+      # is compiled once.
+      - name: Build
+        run: make images PROFILE=dist PLATFORM="linux/$ARCH"
+
+      - name: Run each image once, the demo in full
+        run: make images-smoke
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push this architecture's images
+        run: |
+          while read -r name _dockerfile reference; do
+            docker tag "$reference" "$reference-$ARCH" </dev/null
+            docker push "$reference-$ARCH" </dev/null
+            pushed="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$reference-$ARCH" </dev/null)"
+            digest="$(grep -F "${reference%:*}@" <<<"$pushed" | sed -n 1p)"
+            [ -n "$digest" ] || { echo "no digest was recorded for $reference-$ARCH"; exit 1; }
+            echo "$name ${digest##*@}" >> "digests-$ARCH.txt"
+          done < <(python3 -I scripts/runtime-release.py images)
+          cat "digests-$ARCH.txt"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: digests-${{ matrix.arch }}
+          path: digests-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Join, sign and release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # the GitHub release
+      packages: write   # the joined image and its signature
+      id-token: write   # this workflow's identity, for the signature
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5  # v3.10.1
+
+      # The joined image names the two builds by digest: what is tagged is
+      # what was built and run above, whatever a tag has come to mean since.
+      - name: Join the two architectures under the version's tag
+        run: |
+          while read -r name _dockerfile reference; do
+            sources=()
+            for arch in amd64 arm64; do
+              digest="$(awk -v n="$name" '$1 == n { print $2 }' "digests-$arch.txt")"
+              [ -n "$digest" ] || { echo "no $arch digest for $name"; exit 1; }
+              sources+=( "${reference%:*}@$digest" )
+            done
+            docker buildx imagetools create --tag "$reference" "${sources[@]}" </dev/null
+            joined="$(docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}' </dev/null | jq -r .digest)"
+            echo "$name $joined" >> digests.txt
+          done < <(python3 -I scripts/runtime-release.py images)
+          cat digests.txt
+
+      - name: Sign each joined image
+        run: |
+          while read -r name _dockerfile reference; do
+            digest="$(awk -v n="$name" '$1 == n { print $2 }' digests.txt)"
+            cosign sign --yes "${reference%:*}@$digest" </dev/null
+          done < <(python3 -I scripts/runtime-release.py images)
+
+      - name: The compose file held to the signed digests, and the notes
+        run: |
+          python3 -I scripts/runtime-release.py pin --digests digests.txt --out compose.pinned.yaml
+          python3 -I scripts/runtime-release.py notes > release-notes.md
+
+      - name: The GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME"
+          --notes-file release-notes.md compose.pinned.yaml digests.txt

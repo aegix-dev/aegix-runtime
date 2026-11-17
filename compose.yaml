@@ -1,0 +1,32 @@
+# The refusal demo from its image: the one `make demo-image` built on this
+# machine, or, where a release has been published, the one it pulls. Once the
+# image exists the run needs a container engine and nothing else: no
+# toolchain, no account, no network.
+#
+#   docker compose run --rm demo
+#   docker compose run --rm demo --posture worker-identity
+#
+# A release's image is pulled from ghcr.io/aegix-dev/aegix-runtime. Where that
+# pull finds no image, no release has been published yet, and the image has
+# to be built here first.
+#
+# The image holds a message bus, the reference controller, one worker and a
+# hostile module, and starts them inside the one container. It is given no
+# network: every attempt the module makes is refused before a connection is
+# opened. docs/reference-controller.md says what the run shows.
+#
+# The tag is this tree's version. A release's page also carries
+# compose.pinned.yaml, this file with the image held to the digest that was
+# signed.
+services:
+  demo:
+    # allow-unpinned-image: this tree's own image at this tree's version; its digest exists only once the release is built, and compose.pinned.yaml carries it
+    image: ghcr.io/aegix-dev/aegix-runtime/demo:0.1.0
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

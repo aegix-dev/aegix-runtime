@@ -1,0 +1,48 @@
+[package]
+name = "aegix-trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Fail-closed DLP redaction for every caller-supplied string that lands in a
+# span attribute, span status or the stderr/stdout span lines. See
+# `redact_span_text` in src/lib.rs.
+aegix-dlp-provider = { path = "../aegix-dlp-provider" }
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+# Only the gRPC/tonic exporter is used. `default-features = false` drops otlp's
+# default http-proto + reqwest-blocking-client (opentelemetry-http + reqwest 0.13,
+# a duplicate of the workspace's reqwest 0.12) for an HTTP path we never take.
+# OPTIONAL, behind the `otlp` feature below (2026-11-01): the exporter is the
+# only thing in this crate that links a gRPC stack.
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "trace"], optional = true }
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber = { workspace = true, features = ["default"] }
+
+[dev-dependencies]
+# `InMemorySpanExporter` is gated behind opentelemetry_sdk's `testing` feature.
+# It lets the span-redaction tests assert on the attributes/status the sink
+# ACTUALLY exported, rather than on a reconstruction of them.
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "testing"] }
+
+[features]
+# The OTLP/gRPC span exporter that `init_tracing` builds when an endpoint is
+# configured: `opentelemetry-otlp` with `grpc-tonic`, which brings `tonic`,
+# `tonic-prost`, `tonic-types`, `prost`, `prost-types` and `opentelemetry-proto`.
+# Default OFF so the worker RUNTIME, and through it `aegix-runtime`, link no
+# gRPC stack (structural check 109 refuses those crates in the runtime's
+# closure; docs/engineering-log/packages/2026-11-01-otlp-below-the-runtime-boundary.md).
+# The two binaries that export traces — the controller directly, the worker
+# through `aegix-worker-runtime/otlp` — turn it on. Without it, every other
+# item of this crate is unchanged (`ExecutionSpan`, the bridge layer, the
+# redaction sink, the endpoint and sampler readers), and `init_tracing` with a
+# configured endpoint REFUSES it with a log line naming this feature
+# (`NoExporterInThisBuild`) rather than exporting nothing in silence.
+otlp = ["dep:opentelemetry-otlp"]
+
+[lints]
+workspace = true

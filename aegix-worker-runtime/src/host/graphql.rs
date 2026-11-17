@@ -1,0 +1,1700 @@
+//! `graphql` host interface plus the L-17 shape-based introspection
+//! query detector.
+
+use super::*;
+
+/// The sentence an operator needs when the GraphQL write-ceiling gate refuses.
+///
+/// This gate INFERS rather than proves: GraphQL is always POST and the
+/// operation type is not cheaply provable from the request string, so every
+/// GraphQL call is treated as a mutation. That is the right fail-closed
+/// default and it was already stated in the code — but never to the operator,
+/// who saw only `graphql-execute denied by policy 'write-ceiling'` and had no
+/// way to learn that a pure QUERY is refused too.
+pub(crate) const GRAPHQL_INFERRED_DETAIL: &str =
+    "GraphQL is always POST and the operation type is not provable from the request string, \
+     so this gate treats EVERY GraphQL call as a mutation — a pure query is refused too. An \
+     actor that needs GraphQL reads needs the write ceiling; the controls that bound it are \
+     the module's allowed_hosts and its source";
+
+use crate::reason_class;
+
+/// L-17 (2026-05-22): shape-based introspection-query detector.
+/// Returns true if the GraphQL `query` text looks like it's asking
+/// for schema introspection at the top level (`__schema` or
+/// `__type`). False otherwise.
+///
+/// Detection strategy:
+///   1. Strip GraphQL block / line comments (#... up to EOL).
+///   2. Find the first `{` (the root selection-set opener).
+///   3. Scan ahead for `__schema` or `__type` *before* any inner
+///      `{` — that is, at the root selection level. Introspection
+///      fields buried in fragments or aliases are not flagged
+///      (intentional limitation; see callsite comment).
+///
+/// Pure function so the policy is unit-testable. Conservatively
+/// returns `false` on malformed input — the request will fail
+/// downstream at the remote GraphQL endpoint anyway; we don't want
+/// to over-block legitimate-but-weird queries.
+pub(crate) fn looks_like_graphql_introspection(query: &str) -> bool {
+    // Strip line comments (GraphQL uses `#` for comments).
+    let comment_stripped: String = query
+        .lines()
+        .map(|line| match line.find('#') {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // L-finding-8: also strip the contents of string literals so a
+    // `fragment Sneaky on Query { __schema }` substring embedded
+    // inside a user-supplied string argument is NOT mistaken for a
+    // real fragment definition. GraphQL has two string forms — `"..."`
+    // (with `\"` and `\\` escapes) and `"""..."""` block strings (no
+    // escapes, terminator is three quotes). Both are replaced with
+    // same-length spaces so byte offsets stay stable for downstream
+    // diagnostics.
+    let stripped = strip_graphql_string_literals(&comment_stripped);
+
+    // Pass 1 (primary): top-level introspection in the operation's
+    // root selection set. Find the root `{` and walk for `__schema`
+    // or `__type` until the first nested `{`. This is the high-
+    // confidence path that catches the canonical
+    // `{ __schema { types { name } } }` pattern.
+    let primary = top_level_root_selection_has_introspection(&stripped);
+    if primary {
+        return true;
+    }
+
+    // Pass 2 (L-finding-8, 2026-05-23): fragment-hidden introspection.
+    // Pre-fix a guest could bury `__schema` / `__type` inside a
+    // `fragment X on Query { ... }` and reference the fragment from
+    // the root selection set:
+    //     fragment Sneaky on Query { __schema { types { name } } }
+    //     query Q { ...Sneaky }
+    // Pass 1 only walked the operation body so this query slipped
+    // through with no audit event fired. We don't pull in a full
+    // GraphQL parser (the only worker-bound option,
+    // async-graphql-parser, would add ~1 ms of parse cost to the
+    // wit_graphql hot path); instead we do a shape-based scan
+    // specifically for fragment definitions and check whether each
+    // fragment's body imports an introspection meta-field.
+    //
+    // The detector intentionally over-fires on rare patterns (e.g.
+    // a fragment defined on a custom type with a user-defined field
+    // named `__schema_foo` — though `__` is reserved by GraphQL
+    // spec so that should not occur in well-formed schemas). The
+    // existing `actor_tier1 || env_block` gating in the caller
+    // means false positives are observable via WARN (allow-mode)
+    // and only HARD-BLOCK under the deliberate operator opt-in;
+    // false negatives, by contrast, leave the audit stream silent.
+    // Prefer false-positive WARN over false-negative silence.
+    fragment_body_has_introspection(&stripped)
+}
+
+/// Inner scan for the primary "top-level introspection" pattern.
+/// Returns true if the operation body's root selection set
+/// imports `__schema` or `__type` (before any nested selection
+/// opens its own brace pair).
+fn top_level_root_selection_has_introspection(stripped: &str) -> bool {
+    let Some(brace_idx) = stripped.find('{') else {
+        return false;
+    };
+    let after_brace = &stripped[brace_idx + 1..];
+    let bytes = after_brace.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'{' {
+            // Entered a nested selection — primary scan ends here.
+            return false;
+        }
+        if b == b'_'
+            && bytes.get(i + 1).copied() == Some(b'_')
+            && has_introspection_token_at(after_brace, i)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// L-finding-8: scan for `fragment <name> on <type> { ... }`
+/// blocks and return true if ANY fragment body imports a
+/// `__schema` / `__type` meta-field at its top level. The
+/// fragment's brace-balanced body is matched lexically (no full
+/// parse) — sufficient for shape-based detection.
+///
+/// **Linear since 2026-09-25.** The first version found each fragment's
+/// body by walking forward from its `{` to the matching `}`
+/// (`find_brace_balanced_body`) and, when there was no matching `}`, stepped
+/// past the keyword and tried again. An input of `fragment{` repeated —
+/// every body unbalanced — therefore rescanned the whole remaining query once
+/// per keyword: O(n²), about 5·10¹⁰ byte steps for a 1 MB query (the cap
+/// `execute_graphql_inner` allows), and it ran BEFORE the allowlist and the
+/// rate-limit charge, so a guest could repeat it for free. Every `{` is now
+/// matched to its `}` once, up front, by [`match_braces`]; the scan itself
+/// only moves forward. The verdict is unchanged for every input — pinned
+/// against the retained quadratic reference by
+/// `the_linear_scan_agrees_with_the_quadratic_reference`.
+fn fragment_body_has_introspection(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let braces = match_braces(bytes);
+    // Index into `braces` of the first `{` not yet behind the scan. The scan
+    // position only ever increases, so this pointer does too.
+    let mut next_brace = 0usize;
+    let mut i = 0;
+    while i + 8 < bytes.len() {
+        // Cheap initial filter: only attempt the full keyword match
+        // when we see `f`. `bytes[i]` being ASCII also makes `i` a char
+        // boundary, so the slice below cannot panic.
+        if bytes[i] == b'f'
+            && stripped[i..].starts_with("fragment")
+            && is_word_boundary_left(bytes, i)
+            && bytes
+                .get(i + 8)
+                .map(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                .unwrap_or(true)
+        {
+            // The opening brace of the fragment body is the first `{` after
+            // the keyword. Anything between is the fragment name + `on
+            // <type>` clause — we don't care about its contents.
+            while next_brace < braces.len() && braces[next_brace].0 < i + 8 {
+                next_brace += 1;
+            }
+            if let Some(&(open, close)) = braces.get(next_brace) {
+                match close {
+                    Some(close) => {
+                        if root_selection_imports_introspection(&stripped[open + 1..close]) {
+                            return true;
+                        }
+                        // Skip past the body we already scanned.
+                        i = close;
+                        continue;
+                    }
+                    None => {
+                        // Malformed fragment — give up on this match and
+                        // continue scanning. The whole query will almost
+                        // certainly fail downstream parse, so we don't need
+                        // a precise verdict here.
+                        i += 8;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Every `{` in `bytes`, in order, paired with the index of its matching `}`
+/// (`None` = it never closes). One pass with a stack, so a query is walked
+/// once however many fragments it declares. A `}` with nothing open is
+/// ignored, exactly as the depth counter it replaces ignored it (that counter
+/// started at 1 on the `{` it was matching, so a stray `}` before any `{`
+/// never reached it). The stack holds indices into the result, so the
+/// allocation is bounded by the number of braces in the (1 MB-capped) query.
+fn match_braces(bytes: &[u8]) -> Vec<(usize, Option<usize>)> {
+    let mut out: Vec<(usize, Option<usize>)> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                open.push(out.len());
+                out.push((i, None));
+            }
+            b'}' => {
+                if let Some(slot) = open.pop() {
+                    out[slot].1 = Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The pre-2026-09-25 body finder, kept ONLY as the reference the linear
+/// scan is checked against. Returns the brace-balanced body of a block whose
+/// opening `{` has already been consumed, or `None` if it never closes.
+#[cfg(test)]
+fn find_brace_balanced_body(after_open: &str) -> Option<&str> {
+    let bytes = after_open.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&after_open[..i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The pre-2026-09-25 QUADRATIC fragment scan, verbatim, kept only as the
+/// reference implementation for the equivalence test. Never call it from
+/// production code.
+#[cfg(test)]
+fn fragment_body_has_introspection_reference(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i + 8 < bytes.len() {
+        if bytes[i] == b'f'
+            && stripped[i..].starts_with("fragment")
+            && is_word_boundary_left(bytes, i)
+            && bytes
+                .get(i + 8)
+                .map(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                .unwrap_or(true)
+        {
+            let tail = &stripped[i + 8..];
+            if let Some(brace_off) = tail.find('{') {
+                let body_start = i + 8 + brace_off + 1;
+                let body = match find_brace_balanced_body(&stripped[body_start..]) {
+                    Some(b) => b,
+                    None => {
+                        i += 8;
+                        continue;
+                    }
+                };
+                if root_selection_imports_introspection(body) {
+                    return true;
+                }
+                i = body_start + body.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Same shape as `top_level_root_selection_has_introspection` but
+/// scans the body of a brace-balanced selection set (the caller
+/// has already consumed the opening `{`).
+fn root_selection_imports_introspection(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Nested selection — stop here for shape-based detection
+            // (same semantics as the primary scan; nested `__schema`
+            // on a non-Query type isn't introspection).
+            return false;
+        }
+        if bytes[i] == b'_'
+            && bytes.get(i + 1).copied() == Some(b'_')
+            && has_introspection_token_at(body, i)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Returns true when `slice[start..]` begins with either `__schema`
+/// or `__type` followed by a word boundary. Shared by the primary
+/// scan and the fragment-body scan.
+fn has_introspection_token_at(slice: &str, start: usize) -> bool {
+    let rest = &slice[start..];
+    let bytes = rest.as_bytes();
+    for tok in ["__schema", "__type"] {
+        if rest.len() >= tok.len() && rest.starts_with(tok) {
+            let next = bytes.get(tok.len()).copied();
+            let is_word_boundary = match next {
+                None => true,
+                Some(c) => !(c.is_ascii_alphanumeric() || c == b'_'),
+            };
+            if is_word_boundary {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// L-finding-8: word-boundary check for the LEFT side of a
+/// keyword match (the `is_word_boundary` checks elsewhere only
+/// guard the right side because the scan walks forward).
+fn is_word_boundary_left(bytes: &[u8], at: usize) -> bool {
+    if at == 0 {
+        return true;
+    }
+    let prev = bytes[at - 1];
+    !(prev.is_ascii_alphanumeric() || prev == b'_')
+}
+
+/// L-finding-8: replace the contents of GraphQL string literals
+/// (both `"..."` and `"""..."""` block strings) with spaces so
+/// the scan can't match `fragment` / `__schema` inside string
+/// arguments. Preserves the opening/closing quotes (and all byte
+/// offsets) so brace-balance accounting elsewhere stays consistent.
+///
+/// String forms (per GraphQL October 2021 spec):
+///   - Regular string: `"<chars or \uXXXX or \" or \\ or \n etc.>"`
+///   - Block string:   `"""<any chars, terminator is three quotes>"""`
+///
+/// The implementation is a small state machine over bytes; it
+/// runs in O(n) and allocates one String of the same length as
+/// input. Not a parser — only handles enough to defeat the shape-
+/// based-detection bypass cases. A malformed query that opens a
+/// string without closing it is treated as "rest of input is
+/// inside the string" which over-strips but is safe (the
+/// downstream GraphQL server will reject the malformed query
+/// anyway).
+fn strip_graphql_string_literals(input: &str) -> String {
+    enum State {
+        Normal,
+        InRegularString,
+        InBlockString,
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut state = State::Normal;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            State::Normal => {
+                // Detect `"""` first because `"` is a prefix of `"""`.
+                if b == b'"'
+                    && bytes.get(i + 1).copied() == Some(b'"')
+                    && bytes.get(i + 2).copied() == Some(b'"')
+                {
+                    out.extend_from_slice(b"\"\"\"");
+                    state = State::InBlockString;
+                    i += 3;
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b'"');
+                    state = State::InRegularString;
+                    i += 1;
+                    continue;
+                }
+                out.push(b);
+                i += 1;
+            }
+            State::InRegularString => {
+                if b == b'\\' {
+                    // Skip the backslash AND the next byte (the
+                    // escaped char). Replace BOTH with spaces so
+                    // length is preserved.
+                    out.push(b' ');
+                    if i + 1 < bytes.len() {
+                        out.push(b' ');
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b'"');
+                    state = State::Normal;
+                    i += 1;
+                    continue;
+                }
+                // Regular strings don't span newlines per spec; a raw
+                // newline inside is malformed. Preserve it as a space
+                // so line numbers in diagnostics stay consistent. The
+                // detector doesn't care either way.
+                out.push(b' ');
+                i += 1;
+            }
+            State::InBlockString => {
+                // Block-string terminator is `"""` with no escape
+                // for embedded quotes (the spec uses `\"""` to escape).
+                if b == b'\\'
+                    && bytes.get(i + 1).copied() == Some(b'"')
+                    && bytes.get(i + 2).copied() == Some(b'"')
+                    && bytes.get(i + 3).copied() == Some(b'"')
+                {
+                    // Escaped triple-quote inside a block string —
+                    // four bytes, all stripped to spaces so we don't
+                    // confuse the terminator check below.
+                    out.extend_from_slice(b"    ");
+                    i += 4;
+                    continue;
+                }
+                if b == b'"'
+                    && bytes.get(i + 1).copied() == Some(b'"')
+                    && bytes.get(i + 2).copied() == Some(b'"')
+                {
+                    out.extend_from_slice(b"\"\"\"");
+                    state = State::Normal;
+                    i += 3;
+                    continue;
+                }
+                out.push(b' ');
+                i += 1;
+            }
+        }
+    }
+    // SAFETY: we only ever pushed ASCII bytes (`"`, spaces) or
+    // copied original bytes verbatim. Since the original input was
+    // valid UTF-8 and we only mutate bytes that were themselves
+    // ASCII (string-literal contents → spaces; quotes preserved as
+    // ASCII), every emitted byte sequence is a valid UTF-8 sequence
+    // or an ASCII space, which is also valid UTF-8. The total
+    // length matches the input length so byte offsets are preserved
+    // for downstream diagnostics.
+    String::from_utf8(out).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod strip_string_literals_tests {
+    use super::strip_graphql_string_literals;
+
+    #[test]
+    fn strips_regular_string_content() {
+        let s = strip_graphql_string_literals(r#"query { f(x: "fragment X on Q { __schema }") }"#);
+        // Quotes preserved, contents replaced with spaces.
+        assert!(s.starts_with("query { f(x: \""));
+        assert!(s.ends_with("\") }"));
+        // The `fragment` keyword inside the literal MUST NOT survive.
+        assert!(!s.contains("fragment"));
+        assert!(!s.contains("__schema"));
+    }
+
+    #[test]
+    fn handles_escaped_quote_in_string() {
+        let s = strip_graphql_string_literals(r#"f(x: "a\"b") {}"#);
+        // Two quotes (open, close), no other quote characters in output
+        // because the escaped `\"` was stripped to spaces.
+        let quote_count = s.bytes().filter(|c| *c == b'"').count();
+        assert_eq!(quote_count, 2, "expected 2 quotes in {s:?}");
+    }
+
+    #[test]
+    fn strips_block_string_content() {
+        let s = strip_graphql_string_literals(r#"f(desc: """fragment X on Q { __schema }""") {}"#);
+        assert!(!s.contains("fragment"));
+        assert!(!s.contains("__schema"));
+    }
+
+    #[test]
+    fn preserves_normal_query_unchanged() {
+        let q = r#"{ __schema { types { name } } }"#;
+        let s = strip_graphql_string_literals(q);
+        assert_eq!(s, q);
+    }
+
+    #[test]
+    fn length_preserved_for_offset_stability() {
+        let q = r#"f(x: "fragment Sneaky")"#;
+        let s = strip_graphql_string_literals(q);
+        assert_eq!(s.len(), q.len(), "byte length must be preserved");
+    }
+}
+
+#[cfg(test)]
+mod introspection_detector_tests {
+    use super::looks_like_graphql_introspection;
+
+    #[test]
+    fn detects_top_level_schema_query() {
+        assert!(looks_like_graphql_introspection(
+            "{ __schema { types { name } } }"
+        ));
+    }
+
+    #[test]
+    fn detects_top_level_type_query() {
+        assert!(looks_like_graphql_introspection(
+            "{ __type(name: \"User\") { name } }"
+        ));
+    }
+
+    #[test]
+    fn detects_with_query_keyword() {
+        assert!(looks_like_graphql_introspection(
+            "query IntrospectionQuery { __schema { types { name } } }"
+        ));
+    }
+
+    #[test]
+    fn ignores_user_field_named_similarly() {
+        // `__schema_extension` is a custom field on the schema,
+        // not the meta-field. Word-boundary check should prevent
+        // false-positive.
+        assert!(!looks_like_graphql_introspection(
+            "{ user { __schema_extension } }"
+        ));
+    }
+
+    #[test]
+    fn ignores_introspection_buried_in_nested_selection() {
+        // Documented limitation: only top-level introspection
+        // selections are flagged. A query where `__schema` is
+        // nested inside a user field isn't really doing GraphQL
+        // introspection in the normal sense — there's no field
+        // named `user.__schema` at the schema level — and false-
+        // positives here would block more than they protect.
+        assert!(!looks_like_graphql_introspection(
+            "{ user { profile { __schema { types } } } }"
+        ));
+    }
+
+    #[test]
+    fn handles_comments_before_schema() {
+        assert!(looks_like_graphql_introspection(
+            "# explore schema\n{ __schema { types { name } } }"
+        ));
+    }
+
+    #[test]
+    fn returns_false_on_normal_query() {
+        assert!(!looks_like_graphql_introspection(
+            "query { user(id: 1) { name email } }"
+        ));
+    }
+
+    #[test]
+    fn returns_false_on_malformed_query() {
+        // Defensive: malformed → false. We don't want to over-
+        // block; the downstream GraphQL endpoint will reject it
+        // for the right reason.
+        assert!(!looks_like_graphql_introspection("not a query at all"));
+        assert!(!looks_like_graphql_introspection(""));
+    }
+
+    #[test]
+    fn detects_query_with_alias() {
+        // GraphQL aliases: `s: __schema { ... }` is also an
+        // introspection query. Our shape-based scan walks token-
+        // by-token until a nested `{` so a leading alias `s:` is
+        // skipped and the `__schema` selection is still flagged.
+        assert!(looks_like_graphql_introspection(
+            "{ s: __schema { types { name } } }"
+        ));
+    }
+
+    #[test]
+    fn does_not_double_count_word_boundary() {
+        // `__schemafoo` is a custom field — must NOT match. The
+        // word-boundary check guards against this.
+        assert!(!looks_like_graphql_introspection(
+            "{ __schemafoo { name } }"
+        ));
+    }
+
+    // ─── L-finding-8: fragment-hidden introspection ───
+
+    /// The canonical bypass: introspection in a fragment definition,
+    /// referenced from the query body. Pre-L-finding-8 this returned
+    /// false because the primary scan only walked the operation body.
+    #[test]
+    fn detects_fragment_hidden_schema() {
+        let q = r#"
+            fragment Sneaky on Query { __schema { types { name } } }
+            query Q { ...Sneaky }
+        "#;
+        assert!(looks_like_graphql_introspection(q));
+    }
+
+    /// Same bypass with `__type` instead of `__schema`.
+    #[test]
+    fn detects_fragment_hidden_type() {
+        let q = r#"
+            fragment Sneaky on Query { __type(name: "User") { name } }
+            query Q { ...Sneaky }
+        "#;
+        assert!(looks_like_graphql_introspection(q));
+    }
+
+    /// Fragment-hidden introspection with the fragment defined
+    /// AFTER the query body. Detector should not depend on
+    /// declaration order.
+    #[test]
+    fn detects_fragment_hidden_schema_fragment_after_query() {
+        let q = r#"
+            query Q { ...Sneaky }
+            fragment Sneaky on Query { __schema { queryType { name } } }
+        "#;
+        assert!(looks_like_graphql_introspection(q));
+    }
+
+    /// A fragment that does NOT import an introspection meta-field
+    /// must not trigger. False-positive guard.
+    #[test]
+    fn ignores_fragment_without_introspection() {
+        let q = r#"
+            fragment Fields on User { id name email }
+            query Q { user(id: 1) { ...Fields } }
+        "#;
+        assert!(!looks_like_graphql_introspection(q));
+    }
+
+    /// A fragment defined on a non-Query type that imports `__schema`
+    /// at its root WILL be flagged — `__` prefixes are reserved by
+    /// GraphQL spec so a user-defined field with that name shouldn't
+    /// exist in well-formed schemas. Over-firing here is acceptable
+    /// (audit WARN only in allow-mode); the alternative is a silent
+    /// bypass when an operator misuses the prefix. Documents the
+    /// trade-off.
+    #[test]
+    fn flags_fragment_on_non_query_with_introspection_token() {
+        // Note: `__schema` on a user type is semantically nonsense
+        // (introspection meta-fields only exist on Query) — but
+        // detector intentionally errs toward catching it.
+        let q = r#"
+            fragment Weird on User { __schema { types { name } } }
+            query Q { user(id: 1) { ...Weird } }
+        "#;
+        assert!(looks_like_graphql_introspection(q));
+    }
+
+    /// `__schema` buried inside a NESTED selection of a fragment
+    /// (not at the fragment's root) is NOT introspection at GraphQL
+    /// semantics — same logic as the primary scan's
+    /// `ignores_introspection_buried_in_nested_selection` test.
+    /// Confirms parity between the two scan passes.
+    #[test]
+    fn ignores_introspection_nested_inside_fragment_body() {
+        let q = r#"
+            fragment Inner on User { profile { __schema { types } } }
+            query Q { user(id: 1) { ...Inner } }
+        "#;
+        assert!(!looks_like_graphql_introspection(q));
+    }
+
+    /// The word `fragment` appearing inside a string literal MUST
+    /// NOT trigger the fragment scan. (Defense-in-depth check —
+    /// the current implementation doesn't handle string literals
+    /// specifically, but the brace-balanced body extraction won't
+    /// find a matching `}` inside a string so the scan bails out
+    /// safely on malformed input.)
+    #[test]
+    fn ignores_fragment_keyword_inside_string_literal_argument() {
+        // The introspection token is in the same string literal
+        // but never appears as a top-level selection of any
+        // fragment, so neither scan should fire.
+        let q = r#"query Q { thing(label: "fragment Sneaky on Query { __schema }") { id } }"#;
+        assert!(!looks_like_graphql_introspection(q));
+    }
+
+    /// Multi-line normal query with fragments — no introspection —
+    /// remains a clean negative.
+    #[test]
+    fn complex_normal_query_with_fragments_is_negative() {
+        let q = r#"
+            query OrderDetails($id: ID!) {
+              order(id: $id) {
+                ...OrderHeader
+                items { ...LineItem }
+              }
+            }
+            fragment OrderHeader on Order { id status total }
+            fragment LineItem on Item { sku name qty }
+        "#;
+        assert!(!looks_like_graphql_introspection(q));
+    }
+}
+
+// ============================================================================
+// GraphQL client
+// ============================================================================
+
+/// Latch `class` against the `networkerror` discriminant and return it.
+///
+/// The ONE place a `wit_graphql` failure becomes a WIT error, and the reason
+/// it is a function rather than seventeen inline `record_http_denial` calls:
+/// `wit_graphql::Error` has **no deny variant at all** (`networkerror`,
+/// `parseerror`, `queryerror`, `invalidvariables`), so every policy denial,
+/// every cap, the URL-parse failure, the secret-slot failure, the cancellation
+/// AND the genuine transport failure all return the SAME `networkerror`.
+///
+/// [`crate::reason_class::Reason`]'s pairing — which is what stops a stale
+/// class riding an unrelated later failure on `host::http` — is therefore
+/// VACUOUS here: every one of those messages carries the same token. The bound
+/// that replaces it is TOTALITY. Every failing return of
+/// `execute_graphql_inner` goes through this helper or through
+/// [`AegixContext::record_network_outcome`], so the latch always describes
+/// THIS call, and the transport site (which is transient, and the only one
+/// that is) overwrites any deny class immediately before returning. That is
+/// what makes it impossible for a swallowed denial to suppress a real
+/// transport retry — see the module doc of [`crate::reason_class`] for the two
+/// designs rejected in favour of it.
+///
+/// Latch-only: the policy sites already publish their operator diagnostic
+/// through `record_capability_denied`, and the pure caps deliberately publish
+/// none.
+///
+/// `&AegixContext` (not `&mut`) so it composes inside a `map_err` closure that
+/// only holds a shared borrow.
+/// Clamp a guest-requested GraphQL retry count to
+/// [`MAX_GRAPHQL_RETRIES_PER_CALL`]. The shadowing line at the top of
+/// `execute_graphql_inner` is the one caller.
+pub(crate) fn clamp_graphql_retries(requested: u32) -> u32 {
+    requested.min(MAX_GRAPHQL_RETRIES_PER_CALL)
+}
+
+fn gql_deny(ctx: &AegixContext, class: &'static str) -> wit_graphql::Error {
+    ctx.record_http_denial(class, reason_class::WIT_NETWORKERROR);
+    wit_graphql::Error::Networkerror
+}
+
+impl AegixContext {
+    /// Latch the honest transport class for a failed `wit_graphql` send, and
+    /// log the sanitized detail to the WORKER LOG only.
+    ///
+    /// A named method rather than an inline block for the reason the testing
+    /// convention gives: the graphql transport path cannot be reached from a
+    /// test — every route to it passes the SSRF gate, which is the point of
+    /// the gate — so the safety property ("a swallowed denial cannot suppress
+    /// a later transport retry") is proven by calling THIS function with a
+    /// real `reqwest::Error`, i.e. the same call with the same argument the
+    /// production site makes, rather than by a test-local copy of the logic.
+    ///
+    /// The class comes from the same `classify_reqwest_send_error` the
+    /// single-fetch path uses, which reads the SOURCE CHAIN only — never
+    /// reqwest's own `Display`, which appends the full request URL and its
+    /// query string. Every class it can return is TRANSIENT, so the retry
+    /// reading is identical to the bare `networkerror` this replaced; only the
+    /// diagnosis is new.
+    pub(crate) async fn record_graphql_transport_outcome(
+        &mut self,
+        host: &str,
+        e: &reqwest::Error,
+    ) {
+        let class = reason_class::classify_reqwest_send_error(e);
+        // The sanitized raw detail is WORKER-LOG ONLY and never crosses the
+        // host→guest boundary. Gated on the SAME per-execution `HOST_DIAG_CAP`
+        // the diagnostic channel spends — and the `emit_network_failure` below
+        // is what SPENDS it. A peek that never spends would leave this line
+        // bounded only by `MAX_GRAPHQL_QUERIES_PER_EXECUTION` (200) × the
+        // sanitizer's 2000-char truncation, i.e. a second uncapped stream;
+        // `host::http`'s transport site pairs the peek with a spend for
+        // exactly this reason.
+        if self.host_diag_budget_remaining() {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                host,
+                reason = class,
+                detail = %reason_class::sanitized_transport_detail(e),
+                "wit_graphql::execute transport failure (sanitized transport detail)"
+            );
+        }
+        // Latch + publish in one step, exactly as the single-fetch path does.
+        // `host` is safe to name: the module author declared it in
+        // `allowed_hosts`. The path, the query string and the resolved IP are
+        // not, and none of them appears here.
+        self.emit_network_failure(
+            class,
+            reason_class::WIT_NETWORKERROR,
+            &format!("the GraphQL request to '{host}' failed before a response was read"),
+        )
+        .await;
+    }
+}
+
+impl wit_graphql::Host for AegixContext {
+    async fn execute(
+        &mut self,
+        req: wit_graphql::Request,
+    ) -> Result<wit_graphql::Response, wit_graphql::Error> {
+        self.host_call("graphql::execute");
+        let __start = std::time::Instant::now();
+        let __metrics = self.metrics.clone();
+        let __result = self.execute_graphql_inner(req, 0).await;
+
+        if let Some(ref m) = __metrics {
+            m.record_host_function_call("graphql::execute", __start.elapsed().as_millis() as f64);
+        }
+        __result
+    }
+
+    async fn execute_with_retry(
+        &mut self,
+        req: wit_graphql::Request,
+        max_retries: u32,
+    ) -> Result<wit_graphql::Response, wit_graphql::Error> {
+        self.host_call("graphql::execute-with-retry");
+        let __start = std::time::Instant::now();
+        let __metrics = self.metrics.clone();
+        let __result = self.execute_graphql_inner(req, max_retries).await;
+
+        if let Some(ref m) = __metrics {
+            m.record_host_function_call(
+                "graphql::execute_with_retry",
+                __start.elapsed().as_millis() as f64,
+            );
+        }
+        __result
+    }
+}
+
+impl AegixContext {
+    async fn execute_graphql_inner(
+        &mut self,
+        req: wit_graphql::Request,
+        max_retries: u32,
+    ) -> Result<wit_graphql::Response, wit_graphql::Error> {
+        // Guest-supplied `u32`. Every retry re-sends the whole query to a
+        // third-party host on ONE rate-limit charge, so an unclamped value
+        // turned one `execute_with_retry` into up to 4 billion sends (30 s
+        // backoff cap each) bounded only by the job timeout. Shadowed here, at
+        // the top, so no later line can read the raw value.
+        let max_retries = clamp_graphql_retries(max_retries);
+        if self.rehearsal_refuses("graphql::execute").await {
+            return Err(wit_graphql::Error::Networkerror);
+        }
+        // MCP-605 (2026-05-12): per-method capability gate. WIT-world
+        // linkage already restricts `aegix:core/graphql` to http-node
+        // and above (minimal-node is the only world that does NOT
+        // `import graphql`). Both `execute` and `execute_with_retry`
+        // delegate to this inner function — one gate here covers
+        // both public entry points without redundancy. Defense in
+        // depth in the same shape as MCP-603 (wit_state) — Tier-1
+        // check below is privacy-class, not capability-class, so it
+        // alone doesn't enforce the world boundary.
+        use crate::wit_inspector::CapabilityWorld;
+        if matches!(
+            self.capability_world,
+            CapabilityWorld::Minimal | CapabilityWorld::Unknown
+        ) {
+            // MCP-697 (2026-05-13): audit-ledger parity (sibling of MCP-696
+            // wit_cache sweep). Pre-fix the capability-world denial branch
+            // emitted only `tracing::warn!`. Tier-1 + host-allowlist
+            // denial branches farther down already audit via
+            // `record_capability_denied`; this completes the surface so a
+            // Minimal-world module probing the GraphQL host function
+            // leaves the same WORM trail as one probing http-fetch.
+            self.record_capability_denied("graphql-execute", "capability-world", "")
+                .await;
+            tracing::warn!(
+                world = ?self.capability_world,
+                "WASM module attempted graphql call but lacks the required capability"
+            );
+            return Err(gql_deny(self, reason_class::CAPABILITY_WORLD));
+        }
+        // Write-ceiling gate: a GraphQL operation may be a query (read) or a
+        // mutation, and the operation type can't be cheaply proven read-only
+        // from the request string. Fail-closed — treat GraphQL as a mutation
+        // and refuse for read-only actors. An actor that needs GraphQL reads
+        // uses the `Write` ceiling. Inert unless enforcement is on.
+        if self
+            .write_ceiling_refuses_detailed(
+                aegix_workflow_job_protocol::CeilingAxis::VerbInferred,
+                "graphql-execute",
+                "",
+                Some(GRAPHQL_INFERRED_DETAIL),
+            )
+            .await
+        {
+            // Paired with `queryerror`, the discriminant this arm returns —
+            // NOT with `networkerror`. The token matters here beyond
+            // diagnostics: `queryerror` contains `query`, which
+            // `aegix_retry_intelligence` keys on for `database_error`, so a
+            // read-only actor's refusal was being reported as a DATABASE
+            // failure. Both readings are non-transient, so this changes the
+            // remediation an operator is shown and nothing else.
+            self.record_http_denial(reason_class::WRITE_CEILING, reason_class::WIT_QUERYERROR);
+            return Err(wit_graphql::Error::Queryerror);
+        }
+        // MCP-787 (2026-05-14): pure-validation surfaces (query size,
+        // variables size, URL parse, empty allowlist, SSRF IP literal,
+        // allowed_hosts pattern, DNS-rebinding, Tier-1 LLM egress, POST
+        // method allowlist) MUST run BEFORE `check_rate_limit` charges
+        // `graphql_query_count`. Pre-fix the rate-limit charge ran first,
+        // so a guest with the http-node capability could loop execute()
+        // calls targeting blocked hosts ("http://127.0.0.1/graphql"),
+        // oversized queries (1 MB+1 bytes), or tier-1-denied LLM hosts
+        // and drain MAX_GRAPHQL_QUERIES_PER_EXECUTION (200/exec) without
+        // a single outbound POST. Subsequent legitimate queries were
+        // then blocked for the rest of the execution despite the
+        // rate-limit being conceptually unused. Same shape as MCP-770
+        // (wit_files::write byte-CAS before path sanitize), MCP-783
+        // (wit_http::fetch_all batch CAS before per-request validation),
+        // MCP-784 (wit_messaging payload-size after rate-limit), MCP-785
+        // (wit_webhook::send rate-limit before URL/SSRF/allowlist/
+        // DNS-rebind/Tier-1), MCP-786 (wit_email::send rate-limit
+        // before Tier-1/addr-validation/recipient-cap), and MCP-612 (the
+        // original counter-only-advances-when-admitted rule).
+        // MCP-537 (the original rate-limit add) is preserved — only the
+        // ordering moves; cancellation check also relocates to stay
+        // paired with the rate-limit charge.
+
+        let url = req.url.clone();
+        let query = req.query.clone();
+        let variables = req.variables.clone();
+        let headers = req.headers.clone().unwrap_or_default();
+        // MCP-1148: cap URL bytes BEFORE invoking `url::Url::parse`
+        // below. Sibling-parity with wit_http::fetch. `Invalidurl` is
+        // not in the graphql Error enum — `Networkerror` is the
+        // canonical mapping for guest-visible URL-validation failures
+        // (matches the existing url-parse-error path further down).
+        if url.len() > MAX_OUTBOUND_URL_BYTES {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                url_len = url.len(),
+                limit = MAX_OUTBOUND_URL_BYTES,
+                "wit_graphql::execute rejected: URL length exceeds cap"
+            );
+            return Err(gql_deny(self, reason_class::URL_TOO_LONG));
+        }
+        // MCP-1105: cap caller-supplied header count. See
+        // MAX_OUTBOUND_HEADERS doc-comment. graphql adds extra urgency
+        // because the retry loop below re-iterates headers on every
+        // attempt — 10k headers × `max_retries` vault lookups per call.
+        if headers.len() > MAX_OUTBOUND_HEADERS {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                header_count = headers.len(),
+                limit = MAX_OUTBOUND_HEADERS,
+                "wit_graphql::execute rejected: header count exceeds cap"
+            );
+            return Err(gql_deny(self, reason_class::REQUEST_HEADER_CAP));
+        }
+        // MCP-584: clamp caller-supplied timeout in GraphQL exactly
+        // as in http::fetch — `option<u32>` is unbounded otherwise.
+        // 2026-09-25: and floored, through the helper `fetch` shares.
+        let timeout_ms = crate::circuit_breaker::clamp_guest_timeout_ms(req.timeout_ms);
+
+        // Reject oversized queries and variable payloads to prevent sending
+        // multi-GB requests to the remote server (OOM + bandwidth abuse).
+        const MAX_GRAPHQL_QUERY_BYTES: usize = 1_000_000; // 1 MB
+        if query.len() > MAX_GRAPHQL_QUERY_BYTES {
+            // The GraphQL query IS the request body, so it shares
+            // `request-body-cap` with `http`'s outbound-body cap rather than
+            // minting a second token for the same thing.
+            return Err(gql_deny(self, reason_class::REQUEST_BODY_CAP));
+        }
+        if let Some(ref vars) = variables {
+            if vars.len() > MAX_GRAPHQL_QUERY_BYTES {
+                return Err(wit_graphql::Error::Invalidvariables);
+            }
+        }
+
+        let allowed_hosts = self.allowed_hosts.clone();
+
+        // Hoisted out of the validation block below so the transport-failure
+        // diagnostic can name it. The HOST is the one piece of the URL that is
+        // safe to report: the module author already declared it in
+        // `allowed_hosts`, whereas the path and query string routinely carry
+        // access tokens. See the sanitization contract in `reason_class`.
+        let target_host: String;
+
+        // Enforce host allowlist for GraphQL endpoints too.
+        // Empty allowlist = DENY ALL (same policy as the HTTP host function).
+        {
+            let parsed: url::Url = url
+                .parse()
+                .map_err(|_| gql_deny(self, reason_class::URL_PARSE))?;
+            let host = parsed.host_str().unwrap_or("").to_string();
+            target_host = host.clone();
+
+            // HTTPS-only by default. The GraphQL Error enum has no
+            // dedicated insecure-scheme variant; `Networkerror` is the
+            // mapping used for every URL-validation failure on this
+            // path (matches the empty-allowlist arm below).
+            match classify_url_scheme(parsed.scheme(), self.dev_egress.insecure_http) {
+                UrlSchemeVerdict::Https => {}
+                UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
+                    tracing::warn!(
+                        scheme = %scheme,
+                        host = %host,
+                        "graphql: insecure-scheme request allowed by WASM_ALLOW_INSECURE_HTTP=1"
+                    );
+                }
+                UrlSchemeVerdict::InsecureRefused { scheme } => {
+                    self.record_capability_denied(
+                        "graphql",
+                        "insecure-scheme",
+                        &format!("{scheme} {host}"),
+                    )
+                    .await;
+                    tracing::warn!(
+                        scheme = %scheme,
+                        host = %host,
+                        "WASM module attempted non-https GraphQL request — denied."
+                    );
+                    return Err(gql_deny(self, reason_class::INSECURE_SCHEME));
+                }
+            }
+
+            if allowed_hosts.is_empty() {
+                self.record_capability_denied("graphql", "no-allowlist-configured", &host)
+                    .await;
+                tracing::warn!(
+                    host = %host,
+                    "WASM module attempted GraphQL request but no host allowlist is \
+                             configured — denying."
+                );
+                return Err(gql_deny(self, reason_class::NO_ALLOWLIST));
+            }
+
+            // SSRF protection: shared classifier covers CGNAT and IPv4-mapped IPv6
+            // the duplicated logic was missing.
+            if let Some((ip, policy)) = denied_ip_literal(&parsed) {
+                self.record_capability_denied("graphql", policy, &ip.to_string())
+                    .await;
+                tracing::warn!(
+                    ip = %ip,
+                    policy,
+                    "WASM module attempted GraphQL request to a private IP literal — blocking"
+                );
+                return Err(gql_deny(self, reason_class::PRIVATE_IP));
+            }
+
+            if !host_allowlist_match_at(&allowed_hosts, &host, parsed.port_or_known_default()) {
+                self.record_capability_denied("graphql", "allowed-hosts", &host)
+                    .await;
+                return Err(gql_deny(self, reason_class::ALLOWED_HOSTS));
+            }
+
+            // DNS rebinding — resolve hostname URLs and reject if any answer
+            // falls in the private deny-list. IP literals already handled
+            // above by classify_private_ip.
+            if matches!(parsed.host(), Some(url::Host::Domain(_))) {
+                // The ONE mixed site: `validate_no_dns_rebinding` answers
+                // `Err(policy)` for an SSRF hit (deterministic, a denial) and
+                // `Err("dns-resolution-failed")` for a resolver failure
+                // (transient, not a denial at all). Reading its `Err` as one
+                // thing would file a DNS blip as a capability denial and
+                // permanently un-retry it — so the two are split.
+                if let Err(e) = self.validate_no_dns_rebinding(&host, "graphql").await {
+                    // `dns` is TRANSIENT, exactly as a bare `networkerror`
+                    // already was here, so the resolver-failure reading is
+                    // unchanged and only gains a name.
+                    let class = reason_class::dns_rebinding_class(e).unwrap_or(reason_class::DNS);
+                    return Err(gql_deny(self, class));
+                }
+            }
+
+            // Tier-1 LLM egress ceiling — same host deny-list as fetch.
+            // GraphQL is an orthogonal transport, not a way around the
+            // privacy ceiling.
+            // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
+            // public IP literals for ANY local-egress-only actor (a resolver never
+            // sees a literal) — one predicate, `egress_posture_deny_reason`.
+            {
+                let host_lower = host.to_ascii_lowercase();
+                if let Some(policy) = egress_posture_deny_reason(
+                    &host_lower,
+                    self.max_llm_tier,
+                    self.local_egress_only,
+                ) {
+                    self.record_capability_denied("graphql", policy, &host)
+                        .await;
+                    tracing::warn!(
+                        host = %host,
+                        actor_id = ?self.actor_id,
+                        policy,
+                        "actor egress posture refused GraphQL egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
+                    );
+                    return Err(gql_deny(self, reason_class::tier1_egress_class(policy)));
+                }
+            }
+        }
+
+        // GraphQL requests are always POST. Reject if POST is not in the
+        // allowlist — and an EMPTY allowlist denies, which is the whole point
+        // of `method_permitted` (see its docs: empty was the one member of the
+        // three-part grant that meant ALLOW).
+        if !aegix_workflow_job_protocol::method_permitted(&self.allowed_methods, "POST") {
+            self.record_capability_denied_detailed(
+                "graphql-execute",
+                "method-allowlist",
+                "",
+                Some(aegix_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
+            )
+            .await;
+            tracing::warn!(
+                allowed_methods = ?self.allowed_methods,
+                "WASM module attempted GraphQL (POST) but POST is not in allowed_methods"
+            );
+            return Err(gql_deny(self, reason_class::METHOD_ALLOWLIST));
+        }
+
+        // MCP-537 (rate limit + cancellation): now charged AFTER all pure
+        // validation has passed — see MCP-787 reorder comment at top of
+        // this function.
+        if !self.check_rate_limit(&self.graphql_query_count, MAX_GRAPHQL_QUERIES_PER_EXECUTION) {
+            tracing::warn!(module_id = ?self.module_id, "GraphQL query rate limit exceeded");
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("graphql");
+            }
+            return Err(gql_deny(self, reason_class::EXECUTION_RATE_LIMIT));
+        }
+        if self.is_cancelled() {
+            tracing::info!(module_id = ?self.module_id, "Execution cancelled before GraphQL query");
+            if let Some(ref m) = self.metrics {
+                m.record_execution_cancelled();
+            }
+            // `wit_graphql::Error::Networkerror` renders the same bare
+            // `networkerror` token as its HTTP namesake, so without a
+            // `[reason_class=cancelled]` marker both transient gates classify a
+            // cancelled GraphQL query `network_transient` and the controller
+            // RE-DISPATCHES it onto a fresh, uncancelled `AegixContext`. The
+            // latch `last_network_reason_suffix` reads is per-CONTEXT, not
+            // per-interface, and its only precondition is that the guest error
+            // carries the `networkerror` token — which this one does. Same
+            // parity fix as `http::fetch_all`.
+            self.emit_network_failure(
+                crate::reason_class::CANCELLED,
+                crate::reason_class::WIT_NETWORKERROR,
+                "the execution was cancelled before the GraphQL query was sent",
+            )
+            .await;
+            return Err(wit_graphql::Error::Networkerror);
+        }
+
+        // Dry run: a document that may be a mutation is answered here, not
+        // sent (security review 2026-10-14, G-27); every gate above ran.
+        if self.dry_run && crate::dry_run::graphql_may_mutate(&query) {
+            tracing::info!(url = %url, "Dry-run: intercepted GraphQL mutation");
+            self.dry_run_ledger
+                .record(crate::dry_run::StubbedSurface::Graphql);
+            return Ok(wit_graphql::Response {
+                data: Some(r#"{"__dry_run__":true}"#.to_string()),
+                errors: None,
+            });
+        }
+
+        // The introspection scan runs HERE — after the allowlist, the method
+        // gate and the rate-limit charge — since 2026-09-25. It used to run
+        // before all of them, and it was quadratic: a guest could send a 1 MB
+        // `fragment{fragment{…` query to a host it was not even allowed to
+        // reach, pay no rate-limit slot, get `allowed-hosts` back, and do it
+        // again — ~5·10¹⁰ byte steps of host CPU per call. The scan is linear
+        // now (`fragment_body_has_introspection`), and every scan costs one of
+        // the execution's MAX_GRAPHQL_QUERIES_PER_EXECUTION slots. A blocked
+        // introspection query therefore spends its slot; that is deliberate —
+        // MCP-787's "don't charge for denied calls" rule protects the budget
+        // from PURE VALIDATION denials, and this one runs a scan over the
+        // whole query first.
+        // L-17 (2026-05-22): GraphQL introspection detector + opt-in
+        // block. A guest with `http-node` (or higher) capability and a
+        // remote GraphQL endpoint in its `allowed_hosts` allowlist
+        // can currently enumerate the remote schema via `__schema` /
+        // `__type` queries. Whether that's actually a problem
+        // depends on the endpoint — public APIs (GitHub GraphQL,
+        // GitLab) deliberately ship introspection on; private
+        // internal endpoints often don't. We default to ALLOW
+        // (introspection is a legitimate GraphQL feature) but emit
+        // a structured event on every attempt so operators have
+        // visibility, and gate a hard block behind two opt-in
+        // signals:
+        //
+        //   1. **Tier-1 actor** — privacy-class actors (Ollama-only)
+        //      shouldn't be probing third-party schema shapes; block
+        //      unconditionally so the existing Tier-1 data-egress
+        //      gate has no companion-bypass surface.
+        //   2. **`AEGIX_WIT_GRAPHQL_BLOCK_INTROSPECTION=1` env var**
+        //      — operator-wide deny for clusters that don't run
+        //      schema-aware clients.
+        //
+        // Detection is shape-based, not parse-based: we look for the
+        // top-level `__schema` or `__type` selection. A
+        // sophisticated attacker can hide introspection inside a
+        // fragment or alias — that's a known limitation; the
+        // structured event still fires and operators alerting on
+        // `event_kind = "graphql_introspection_attempt"` see the
+        // raw query length and host. Full parse-based detection
+        // would require pulling in a GraphQL parser (e.g.
+        // `async-graphql-parser`) on the worker's WASM execution
+        // hot path — not justified for a defense-in-depth check.
+        if looks_like_graphql_introspection(&query) {
+            let actor_tier = self.max_llm_tier == aegix_workflow_job_protocol::LlmTier::Tier1;
+            let env_block =
+                aegix_config::bool_env_or_default("AEGIX_WIT_GRAPHQL_BLOCK_INTROSPECTION", false);
+            let blocked = actor_tier || env_block;
+
+            // Always emit the structured event so dashboards see
+            // attempts even in allow-mode deployments.
+            tracing::warn!(
+                target: "aegix_security_audit",
+                module_id = ?self.module_id,
+                event_kind = "graphql_introspection_attempt",
+                url = %url,
+                query_bytes = query.len(),
+                actor_tier1 = actor_tier,
+                env_block = env_block,
+                blocked,
+                "WASM module attempted a GraphQL introspection query"
+            );
+
+            if blocked {
+                self.record_capability_denied(
+                    "graphql-execute",
+                    if actor_tier {
+                        "tier1-introspection"
+                    } else {
+                        "env-introspection-block"
+                    },
+                    &url,
+                )
+                .await;
+                return Err(gql_deny(self, reason_class::GRAPHQL_INTROSPECTION));
+            }
+        }
+
+        let client = self.http_client.clone();
+
+        // The composed envelope is SCOPED to this block and serialized inside
+        // it, so the `Value` does not outlive the serialization. That is
+        // deliberate: it makes `.json(&body)` — the one-token revert that would
+        // send the guest's placeholder instead of the resolved bytes — fail to
+        // compile rather than fail silently on the wire.
+        let body_bytes: Vec<u8> = {
+            let mut body = serde_json::json!({ "query": query });
+            if let Some(vars) = variables {
+                let vars_val: serde_json::Value = serde_json::from_str(&vars)
+                    .map_err(|_| wit_graphql::Error::Invalidvariables)?;
+                body["variables"] = vars_val;
+            }
+            serde_json::to_vec(&body).map_err(|_| wit_graphql::Error::Invalidvariables)?
+        };
+
+        // Resolve any `vault://` reference in the request body, under the SAME
+        // four rules and the same refusal as `http::fetch` — one home,
+        // `resolve_vault_json_body`. Until 2026-09-24 this surface resolved
+        // headers and sent the body VERBATIM, so a marker in a GraphQL
+        // variable was neither substituted nor refused and the vault PATH went
+        // to the destination.
+        //
+        // Serialized ONCE here, which is exactly the byte sequence reqwest's
+        // `.json()` would have produced, and the resolver works on those bytes
+        // rather than re-parsing its own output: a round trip back through
+        // `Value` would re-format every float in the guest's variables for no
+        // gain. With no marker present the bytes are unchanged, so a send that
+        // does not use this feature is byte-identical to before.
+        //
+        // The content type is the HOST's (`application/json`) — this envelope
+        // is composed here, not supplied by the guest — so the JSON-declaration
+        // rule is satisfied by construction and the marker rule that can still
+        // refuse is the unaddressable-pointer one.
+        let body_bytes: Vec<u8> = match self
+            .resolve_vault_json_body(
+                crate::context::SecretUseSurface::GraphqlJsonBody,
+                &target_host,
+                &body_bytes,
+                Some("application/json"),
+            )
+            .await
+        {
+            Ok(Some(substituted)) => substituted,
+            Ok(None) => body_bytes,
+            Err(_) => return Err(gql_deny(self, reason_class::SECRET_LOOKUP)),
+        };
+
+        let mut attempts = 0;
+        loop {
+            let mut req_builder = client
+                .post(&url)
+                .body(body_bytes.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .timeout(std::time::Duration::from_millis(timeout_ms));
+            for (k, v) in &headers {
+                // Networkerror is the closest existing variant; a dedicated forbiddenhost
+                // variant would be a WIT-level breaking change. Operators see the real
+                // reason in the WARN log emitted by check_secret_allowlist.
+                let resolved = self
+                    .resolve_vault_header(
+                        crate::context::SecretUseSurface::GraphqlHeader,
+                        &target_host,
+                        k.as_str(),
+                        v.as_str(),
+                    )
+                    .await
+                    .map_err(|_| gql_deny(self, reason_class::SECRET_LOOKUP))?;
+                req_builder = req_builder.header(k.as_str(), resolved.as_ref());
+            }
+
+            let result = req_builder.send().await;
+            attempts += 1;
+
+            match result {
+                Ok(resp) => {
+                    let gql_status = resp.status().as_u16();
+                    if let Ok(gql_parsed) = url::Url::parse(&url) {
+                        // Host + path LENGTH only — paths carry capability
+                        // tokens and presigned keys.
+                        tracing::info!(
+                            method = "POST",
+                            host = %gql_parsed.host_str().unwrap_or("unknown"),
+                            path_len = gql_parsed.path().len(),
+                            status = gql_status,
+                            "HTTP audit"
+                        );
+                    }
+                    // Cap GraphQL response at 10 MB to prevent WASM OOM from
+                    // malicious or oversized remote server responses (H6).
+                    const MAX_GRAPHQL_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+                    let mut bytes = Vec::new();
+                    let mut stream = resp.bytes_stream();
+                    use futures_util::StreamExt;
+                    while let Some(chunk_result) = stream.next().await {
+                        let chunk = chunk_result.map_err(|_| wit_graphql::Error::Parseerror)?;
+                        if bytes.len() + chunk.len() > MAX_GRAPHQL_RESPONSE_BYTES {
+                            tracing::warn!(
+                                "GraphQL response exceeds 10 MB size limit during streaming"
+                            );
+                            return Err(wit_graphql::Error::Parseerror);
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    // MCP-H7: parse via a typed struct with
+                    // `Box<RawValue>` fields so the `data` and `errors`
+                    // payloads pass through as borrowed JSON text
+                    // without materialising a full
+                    // `HashMap<String, Value>` tree. Pre-fix the
+                    // `serde_json::Value` materialisation then
+                    // `.to_string()` reserialisation paid 3-10x WASM
+                    // fuel cost vs typed parsing on the 10 MB cap.
+                    // See CLAUDE.md WASM rules ("never use top-level
+                    // Value for upstream payloads") + the 2026-05-28
+                    // perf audit.
+                    #[derive(serde::Deserialize)]
+                    struct GqlResp<'a> {
+                        #[serde(borrow, default)]
+                        data: Option<&'a serde_json::value::RawValue>,
+                        #[serde(borrow, default)]
+                        errors: Option<Vec<&'a serde_json::value::RawValue>>,
+                    }
+                    let resp_parsed: GqlResp<'_> = serde_json::from_slice(&bytes)
+                        .map_err(|_| wit_graphql::Error::Parseerror)?;
+
+                    let data = resp_parsed.data.map(|d| d.get().to_string());
+                    let errors = resp_parsed
+                        .errors
+                        .map(|arr| arr.into_iter().map(|e| e.get().to_string()).collect());
+
+                    return Ok(wit_graphql::Response { data, errors });
+                }
+                Err(_) if attempts <= max_retries => {
+                    // Cap backoff at 30 s to prevent indefinitely blocked workers.
+                    let backoff_ms = (100u64 * 2u64.saturating_pow(attempts - 1)).min(30_000);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+                Err(e) => {
+                    // THE transport site — the only one of the 17
+                    // `Networkerror` returns that is a genuine, retryable
+                    // failure. It latches UNCONDITIONALLY, and that is the
+                    // load-bearing half of the totality rule: whatever deny
+                    // class a swallowed earlier call left behind is
+                    // OVERWRITTEN here, immediately before returning, so it
+                    // can never be stamped onto this message and veto a retry
+                    // this failure is entitled to.
+                    self.record_graphql_transport_outcome(&target_host, &e)
+                        .await;
+                    return Err(wit_graphql::Error::Networkerror);
+                }
+            }
+        }
+    }
+
+    /// Count one tier-2 `expose_secret` call against the user's daily window
+    /// and say whether it is within [`MAX_TIER2_EXPOSES_PER_USER_PER_DAY`].
+    ///
+    /// **Atomic since 2026-09-10.** This was GET-then-INCR / SET EX — two round
+    /// trips with a window between them, so two concurrent exposes at
+    /// `limit - 1` both read `limit - 1`, both passed, and the cap was
+    /// exceeded by one per racing caller; a fresh key was `SET EX 1` with no
+    /// atomicity against a sibling's `INCR`. Its three sibling limiters
+    /// (`aegix-rate-limit`, `aegix-api-keys`, `aegix-auth`) already used the
+    /// one-EVAL `INCR` + conditional `EXPIRE` script (MCP-442, "either both
+    /// succeed or neither modifies state"); this is the fourth. The count is
+    /// taken AFTER the increment, so `count <= limit` admits exactly `limit`
+    /// calls per window — the same admission the old `c >= limit → deny`
+    /// pre-increment test gave. A denied call still advances the counter,
+    /// which changes nothing the caller can observe (it stays denied).
+    ///
+    /// Generic over the connection so the caller hands it the runtime's
+    /// shared `ConnectionManager` (`AegixContext::redis_conn`) and the test
+    /// hands it a plain connection.
+    ///
+    /// #661 still holds: a command failure is `Err`, never a verdict, and the
+    /// key is untouched by it — `INCR` on a WRONGTYPE key modifies nothing,
+    /// where the old `None` branch ran `SET EX` and erased the day's count.
+    pub(crate) async fn check_global_expose_limit<C>(
+        conn: &mut C,
+        key: &str,
+    ) -> anyhow::Result<bool>
+    where
+        C: redis::aio::ConnectionLike + Send,
+    {
+        const EXPOSE_LIMIT_SCRIPT: &str = r#"
+            local count = redis.call('INCR', KEYS[1])
+            if count == 1 then
+                redis.call('EXPIRE', KEYS[1], ARGV[1])
+            end
+            return count
+        "#;
+        let count: i64 = redis::cmd("EVAL")
+            .arg(EXPOSE_LIMIT_SCRIPT)
+            .arg(1)
+            .arg(key)
+            .arg(TIER2_EXPOSE_WINDOW_SECS)
+            .query_async(conn)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Redis INCR/EXPIRE for tier-2 expose counter failed: {}", e)
+            })?;
+        Ok(expose_count_within_limit(count))
+    }
+}
+
+/// The daily window the tier-2 expose counter lives in (seconds).
+const TIER2_EXPOSE_WINDOW_SECS: i64 = 86_400;
+
+/// The admission rule for a POST-increment count: at most
+/// [`MAX_TIER2_EXPOSES_PER_USER_PER_DAY`] calls per window. A negative count
+/// (impossible from `INCR`, but the type allows it) is refused rather than
+/// wrapped into a huge `u64`.
+pub(crate) fn expose_count_within_limit(count: i64) -> bool {
+    u64::try_from(count).is_ok_and(|c| c <= MAX_TIER2_EXPOSES_PER_USER_PER_DAY)
+}
+
+#[cfg(test)]
+mod linear_fragment_scan_tests {
+    use super::{
+        clamp_graphql_retries, fragment_body_has_introspection,
+        fragment_body_has_introspection_reference, looks_like_graphql_introspection,
+        MAX_GRAPHQL_RETRIES_PER_CALL,
+    };
+
+    /// The linear scan must give the SAME verdict as the quadratic one it
+    /// replaced, for every input — this is a performance fix, not a policy
+    /// change. Inputs are built from the tokens the scan actually reacts to,
+    /// in random order and nesting, from a fixed seed (no `rand` dependency;
+    /// a failure reproduces exactly).
+    #[test]
+    fn the_linear_scan_agrees_with_the_quadratic_reference() {
+        const TOKENS: &[&str] = &[
+            "fragment",
+            "fragment ",
+            " fragment",
+            "fragments",
+            "xfragment",
+            "{",
+            "}",
+            "{ ",
+            " }",
+            "__schema",
+            "__type",
+            "__typename",
+            " on Q ",
+            "a",
+            " ",
+            "\n",
+            "_",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            // xorshift64*
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let mut disagreements = Vec::new();
+        let (mut positives, mut negatives) = (0usize, 0usize);
+        for _ in 0..20_000 {
+            let len = (next() % 40) as usize;
+            let q: String = (0..len)
+                .map(|_| TOKENS[(next() % TOKENS.len() as u64) as usize])
+                .collect();
+            let linear = fragment_body_has_introspection(&q);
+            if linear {
+                positives += 1;
+            } else {
+                negatives += 1;
+            }
+            if linear != fragment_body_has_introspection_reference(&q) {
+                disagreements.push(q);
+            }
+        }
+        // Anti-vacuity: agreement over inputs that are all `false` would prove
+        // nothing about the arm that returns `true`.
+        assert!(
+            positives >= 100 && negatives >= 100,
+            "the generator must exercise both verdicts (true: {positives}, false: {negatives})"
+        );
+        assert!(
+            disagreements.is_empty(),
+            "linear and reference scans disagree on {} input(s), e.g. {:?}",
+            disagreements.len(),
+            disagreements.first()
+        );
+    }
+
+    /// The input the quadratic scan could not survive: every fragment body is
+    /// unbalanced, so the old finder walked to the end of the query once per
+    /// keyword. A near-1 MB query (the `execute_graphql_inner` cap) must scan
+    /// in bounded time. The bound is generous for a debug build; the old code
+    /// needed ~5·10¹⁰ byte steps for this input.
+    #[test]
+    fn an_unbalanced_fragment_flood_scans_in_linear_time() {
+        let q = "fragment{".repeat(110_000); // 990 000 bytes
+        let start = std::time::Instant::now();
+        let verdict = looks_like_graphql_introspection(&q);
+        let elapsed = start.elapsed();
+        assert!(!verdict);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a 1 MB unbalanced-fragment query must scan in linear time, took {elapsed:?}"
+        );
+    }
+
+    /// And the verdict still fires on a real fragment AFTER a flood of
+    /// unbalanced ones — the linear scan must not stop early.
+    #[test]
+    fn a_real_fragment_after_an_unbalanced_flood_is_still_found() {
+        let mut q = "fragment{".repeat(1_000);
+        q.push_str("} ".repeat(1_000).as_str());
+        q.push_str("fragment S on Query { __schema { types { name } } } query Q { ...S }");
+        assert!(fragment_body_has_introspection(&q));
+        assert!(fragment_body_has_introspection_reference(&q));
+    }
+
+    #[test]
+    fn graphql_retries_are_clamped() {
+        assert_eq!(clamp_graphql_retries(0), 0);
+        assert_eq!(clamp_graphql_retries(3), 3);
+        assert_eq!(
+            clamp_graphql_retries(u32::MAX),
+            MAX_GRAPHQL_RETRIES_PER_CALL
+        );
+    }
+
+    /// The clamp is only worth its unit test if the entry point applies it
+    /// before the raw value can be read, and the scan only stops being a free
+    /// CPU sink if it sits after the allowlist and the rate charge. Neither is
+    /// visible to a unit test, so both are pinned in the source of the
+    /// production function (split at the test modules, so this test's own
+    /// text cannot satisfy it).
+    #[test]
+    fn the_entry_point_clamps_first_and_scans_after_the_rate_charge() {
+        let src = include_str!("graphql.rs");
+        let start = src
+            .find("async fn execute_graphql_inner(")
+            .expect("entry point present");
+        let body = &src[start..];
+        let body = &body[..body
+            .find("\n    pub(crate) async fn check_global_expose_limit")
+            .unwrap_or(body.len())];
+        let clamp = body
+            .find(&["let max_retries = clamp_graphql_", "retries(max_retries);"].concat())
+            .expect("max_retries is shadowed by the clamp");
+        let first_gate = body
+            .find("CapabilityWorld::Minimal")
+            .expect("capability gate");
+        assert!(
+            clamp < first_gate,
+            "the clamp must precede every other statement"
+        );
+        let allowlist = body
+            .find("host_allowlist_match_at(&allowed_hosts, &host, ")
+            .expect("allowlist check");
+        let rate = body
+            .find(&["self.check_rate_limit(&self.graphql_", "query_count"].concat())
+            .expect("rate-limit charge");
+        let scan = body
+            .find(&["if looks_like_graphql_", "introspection(&query)"].concat())
+            .expect("introspection scan");
+        assert!(
+            allowlist < scan && rate < scan,
+            "the introspection scan must run after the allowlist and the rate-limit charge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod expose_limit_admission_tests {
+    use super::{expose_count_within_limit, MAX_TIER2_EXPOSES_PER_USER_PER_DAY};
+
+    /// Exactly `limit` calls are admitted per window — the same admission the
+    /// pre-2026-09-10 GET-then-INCR gave, now over a post-increment count.
+    #[test]
+    fn exactly_the_limit_is_admitted() {
+        let limit = MAX_TIER2_EXPOSES_PER_USER_PER_DAY as i64;
+        assert!(expose_count_within_limit(1));
+        assert!(expose_count_within_limit(limit));
+        assert!(!expose_count_within_limit(limit + 1));
+        assert!(!expose_count_within_limit(i64::MAX));
+        assert!(!expose_count_within_limit(-1));
+    }
+}
+
+#[cfg(test)]
+mod expose_limit_absence_tests {
+    use super::*;
+
+    /// #661 — a Redis command **failure** must not be reported as "no counter yet
+    /// today". (Since 2026-09-10 the command is the atomic INCR+EXPIRE EVAL;
+    /// WRONGTYPE still fails it before any write.)
+    ///
+    /// Reproduced against a real Redis with a real per-command failure: the key
+    /// is made a LIST, so `GET` returns `WRONGTYPE` while the connection itself
+    /// stays healthy. That is the exact shape the pre-fix `.ok()` swallowed —
+    /// connection acquisition already propagated, so only a per-command failure
+    /// could reach the bug.
+    ///
+    /// Asserts BOTH halves of the defect, because either alone would pass on a
+    /// half-fix:
+    ///   1. the call returns `Err`, so the caller's in-memory fallback in
+    ///      `host/secrets.rs` actually runs. Pre-fix it returned `Ok(true)` —
+    ///      the tier-2 `expose_secret` was ALLOWED.
+    ///   2. the key is UNCHANGED. Pre-fix the `None` branch ran
+    ///      `set_ex(key, 1, 86400)`, overwriting the day's accumulated count
+    ///      with 1 and restarting the 24 h window — the guard erasing its own
+    ///      state. A fix that returned `Err` *after* clobbering the key would
+    ///      satisfy (1) and still leak the budget.
+    ///
+    /// Gated on `AEGIX_TEST_REDIS_URL` following the house idiom
+    /// (`aegix-replay-guard`, `aegix-idempotency`). It is NOT only gated: it is
+    /// named explicitly by `scripts/test-integration.sh`, which provisions the
+    /// Redis, so it is real coverage there rather than a green skip.
+    #[tokio::test]
+    async fn redis_get_failure_is_not_reported_as_an_absent_counter() {
+        let Ok(url) = std::env::var("AEGIX_TEST_REDIS_URL") else {
+            eprintln!("skipping: AEGIX_TEST_REDIS_URL unset");
+            return;
+        };
+        let client = std::sync::Arc::new(aegix_redis::client(url).expect("redis client"));
+        let mut conn = aegix_redis::multiplexed(&client)
+            .await
+            .expect("redis connection");
+        let key = format!("talos:test:tier2_expose:{}", uuid::Uuid::new_v4());
+
+        // Make GET fail without breaking the connection.
+        let _: () = redis::AsyncCommands::del(&mut conn, &key).await.unwrap();
+        let _: i64 = redis::AsyncCommands::rpush(&mut conn, &key, "sentinel")
+            .await
+            .unwrap();
+
+        let verdict = AegixContext::check_global_expose_limit(&mut conn, &key).await;
+        assert!(
+            verdict.is_err(),
+            "a failed Redis INCR must not be laundered into an allow/deny verdict; got {:?}",
+            verdict.as_ref().ok()
+        );
+
+        let key_type: String = redis::cmd("TYPE")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            key_type, "list",
+            "the counter key must be untouched — pre-fix the error path ran \
+             set_ex(key, 1, 86400) and destroyed the day's accumulated count"
+        );
+
+        let _: () = redis::AsyncCommands::del(&mut conn, &key).await.unwrap();
+    }
+}

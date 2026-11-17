@@ -1,0 +1,535 @@
+# cargo-deny configuration — supply-chain policy gate for the Aegix workspace.
+#
+# What this enforces:
+#   [advisories] — fail CI on any RUSTSEC advisory for a crate we actually
+#     use. This is the main security gate.
+#   [licenses]   — allow only OSI-approved permissive licenses. Copyleft
+#     (GPL/AGPL/LGPL/SSPL) is rejected; we don't want any crate pulling us
+#     into license obligations.
+#   [bans]       — deny specific crate versions / duplicates / unmaintained
+#     crates that carry elevated risk.
+#   [sources]    — only allow crates.io + our sibling workspace path.
+#     Blocks "someone published a poisoned fork to a custom registry"
+#     attacks.
+#
+# Run locally:
+#   cargo install cargo-deny --locked
+#   cargo deny check
+#
+# Run CI gate:
+#   cargo deny --all-features check advisories bans sources licenses
+#
+# See https://embarkstudios.github.io/cargo-deny/ for the schema.
+
+[graph]
+# Check every target — Aegix ships for Linux x86_64 + aarch64 in Docker,
+# plus macOS for dev. Limiting to those targets cuts scan time in half
+# vs. the default "every target triple ever seen".
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+    # WASM targets — modules compile to wasm32-wasip1; any advisory on a
+    # crate that builds for WASM still matters for the WASM runtime.
+    { triple = "wasm32-wasip1" },
+    { triple = "wasm32-unknown-unknown" },
+]
+# Exclude dev-dependencies from the scan — a vuln in a test-only crate
+# (dev-dep) can't reach production. Build-deps (proc-macros, build.rs)
+# DO reach CI/build machines so we keep them in scope.
+exclude-dev = true
+
+# ============================================================================
+# Advisories — RUSTSEC vulnerability database gate.
+# ============================================================================
+[advisories]
+# Fail on any advisory unless explicitly ignored below.
+# `db-path` and `db-urls` left defaults (~/.cargo/advisory-dbs).
+version = 2
+yanked = "deny"
+# Unsoundness advisories are reported for EVERY crate in the tree, not only
+# the workspace's direct dependencies (cargo-deny's default). Measured
+# 2026-10-06: once our own `lru` declaration moved to a patched release, the
+# default scope stopped reporting the affected copy `async-graphql` still
+# links — the gate went quiet about a crate that is still there. With "all"
+# it stays visible (and excepted, with its reachability argument, below), and
+# the one further finding — `event-listener` 5.4.1, RUSTSEC-2026-0221 — was a
+# patch release away.
+unsound = "all"
+ignore = [
+    # --- Transitive vulnerabilities in unused / unreachable code paths ---
+    #
+    # Each entry documents: (1) what pulls the bad crate, (2) why the vuln
+    # is not reachable in our deployment, and (3) what we're tracking
+    # upstream for a real fix. Re-review quarterly — silent suppressions
+    # are forbidden.
+
+    # NOTE (2026-06-02): the RUSTSEC-2024-0437 exemption (protobuf 2.x
+    # uncontrolled-recursion crash) was REMOVED. It was pulled by `prometheus`
+    # 0.13.x, which `opentelemetry-prometheus` 0.27 pinned. The otel stack is now
+    # at 0.32, whose `opentelemetry-prometheus` 0.32 supports `prometheus` 0.14 —
+    # and prometheus 0.14 drops protobuf 2.x (it uses protobuf 3.x as an optional,
+    # non-default feature we don't enable). protobuf 2.28 is no longer in the tree,
+    # so the advisory no longer applies. See controller/worker/aegix-metrics
+    # Cargo.toml (prometheus = "0.14").
+
+    { id = "RUSTSEC-2023-0071", reason = """
+Marvin Attack timing sidechannel in the `rsa` crate's RSA PRIVATE-KEY
+operations (decryption / signing). The `rsa` crate is pulled by
+`jsonwebtoken` 10.x (rust_crypto feature). Our exposure to the
+VULNERABLE operation is nil — it is never invoked:
+  * Session JWTs use HS256 (symmetric HMAC) — no RSA at all.
+  * RS256 VERIFICATION (gmail Pub/Sub push) is an RSA PUBLIC-key
+    operation, which the Marvin sidechannel does not affect.
+  * RS256 SIGNING (GitHub App JWTs — aegix-github, RFC 0008) is done
+    with `ring` (constant-time, blinded), NOT the `rsa` crate. The
+    `rsa` crate is used in aegix-github ONLY to parse/normalize the
+    App private-key PEM to PKCS#8 (a parse/encode operation), never a
+    private-key sign/decrypt op.
+So the `rsa` crate's vulnerable private-key code path is not reached
+anywhere. No upstream fix is available per the advisory ("No safe
+upgrade"). Re-evaluate ONLY if a signing/decryption op is ever routed
+THROUGH the `rsa` crate (i.e. `jsonwebtoken` RS256 *signing*, or a
+direct `RsaPrivateKey::{sign,decrypt}`) — switch such a path to `ring`
+or `aws-lc-rs` instead.
+""" },
+
+    # NOTE (2026-06-02): the four rustls-webpki 0.101/0.102 exemptions
+    # (RUSTSEC-2026-0098/0099/0104/0049) were REMOVED. They covered the
+    # aws-smithy-http-client `legacy-rustls` chain (rustls 0.21 + rustls-webpki
+    # 0.101). aws-sdk-s3 is now pinned `default-features = false` WITHOUT its
+    # default `rustls` feature, so it uses only the modern `default-https-client`
+    # TLS stack (rustls 0.23 + rustls-webpki 0.103 + aws-lc-rs). rustls 0.21 and
+    # rustls-webpki 0.101/0.102 are no longer in the tree, so the advisories no
+    # longer apply and the exemptions are unnecessary. See controller/Cargo.toml
+    # + aegix-audit-ledger/Cargo.toml.
+
+    # --- Unmaintained crates (supply-chain risk, no current exploit) ---
+
+    { id = "RUSTSEC-2024-0384", reason = """
+`instant` is unmaintained. Pulled transitively. Provides Wasm-compatible
+Instant; replacement `web-time` exists but upstream adoption is
+gradual. No security issue — maintenance flag. Re-review 2026-Q3.
+""" },
+
+    { id = "RUSTSEC-2024-0436", reason = """
+`paste` is unmaintained but still functional. Widely-used proc-macro
+for identifier concatenation; no known vuln. Maintenance flag only.
+Tracking: no single obvious replacement yet; many crates use it.
+""" },
+
+    { id = "RUSTSEC-2025-0012", reason = """
+`backoff` is unmaintained. Pulled transitively for exponential-backoff
+retries. No vulnerability — maintenance flag. Replacement target when
+retry code is next touched: `backon` or `tokio-retry`.
+""" },
+
+    { id = "RUSTSEC-2025-0134", reason = """
+`rustls-pemfile` is unmaintained — functionality has moved into
+`rustls-pki-types` 1.9+. Pulled by `neo4rs` (Bolt TLS) and
+`rustls-native-certs`. No vulnerability — maintenance flag. Will
+drop automatically when upstream consumers migrate to the new API.
+""" },
+
+    { id = "RUSTSEC-2026-0249", reason = """
+`smartstring` is unmaintained. Advisory published 2026-08-10/11; it
+turned CI red on main at an UNCHANGED sha (1f5eefe passed 08-10 13:40Z,
+failed 08-11 08:10Z), so this is a new advisory against an existing
+dependency, not a new dependency.
+
+Pulled by: `rhai` 1.24 only (`cargo tree -i smartstring` → a single
+edge). rhai is our expression sandbox — `verdict_expr`, `skip_condition`
+and dispatch expressions, the one engine required by structural check 63.
+
+No escape hatch exists, verified rather than assumed:
+  * NOT optional — `[dependencies.smartstring]` in rhai's manifest has no
+    `optional = true` and no feature gate; rhai's own `std` feature
+    requires `smartstring/std`.
+  * Upgrading does NOT help — rhai 1.25.1 (tested by resolving to it)
+    still depends on smartstring 1.0.1.
+
+No vulnerability — maintenance flag only (cargo-deny reports it as
+`error[unmaintained]`). The residual risk is the absence of FUTURE
+patches, not a present defect.
+
+The only real fixes are upstream rhai moving off smartstring, or Aegix
+dropping rhai — the latter is an architectural change to the expression
+sandbox, deliberately not undertaken to clear a maintenance flag.
+Re-review 2026-Q4, or sooner if rhai publishes a release that drops it.
+""" },
+
+    # --- chrono and chrono-tz: wound down by their maintainer (2026-11-17) ---
+    # The plan, the measurements and the conditions that void these three
+    # entries: docs/engineering-log/packages/2026-11-17-chrono-unmaintained-accepted.md
+    # Stage 1 of that plan is done (same date): the workspace's own chrono-tz
+    # is gone, and the two chrono-tz entries now stand for neo4rs's copy only.
+
+    { id = "RUSTSEC-2026-0543", reason = """
+`chrono` is unmaintained: its maintainer is winding it down
+(chronotope/chrono#1768) and recommends `jiff`. The advisory was issued
+2026-11-17 and turned main red at an unchanged dependency (chrono 0.4.45).
+It states no vulnerability and there is no release to move to.
+
+Accepted, not fixed: 70 crates of the workspace declare chrono and 207 Rust
+files name it, timestamps read from the database and written to the wire
+among them. Replacing it is a migration, not a fix to clear a flag.
+
+This entry is VOID, and the migration is due, on an advisory of a
+vulnerability or of unsoundness against chrono. An ignore is by id, so such
+an advisory would have its own id and fail the gate by itself.
+Re-review 2027-Q1.
+""" },
+
+    { id = "RUSTSEC-2026-0555", reason = """
+`chrono-tz` is unmaintained and no longer follows the IANA time zone
+database (the maintainer's answer in chronotope/chrono#1768). No
+vulnerability. One copy is left in the tree: 0.8.6 (zone rules of 2024a),
+required by `neo4rs` 0.8.0, the latest stable release, in the platform's
+`aegix-graph-rag`. Not ours to remove, and no Aegix code asks that copy
+for a zone.
+
+Our own copy (0.10.4, rules of 2025b, an hour out for several Canadian
+zones from 2026-11-01) left on 2026-11-17: a schedule's zone and a
+module's `local-offset-seconds` are answered by `aegix-zones`, from the
+database `jiff-tzdb` compiles in
+(docs/engineering-log/packages/2026-11-17-zone-rules-from-a-released-database.md).
+No crate of this workspace may take `chrono-tz` again.
+
+DELETE this entry when `cargo tree -i chrono-tz` finds nothing: when
+neo4rs drops it or `aegix-graph-rag` drops neo4rs. Re-review 2027-Q1.
+""" },
+
+    { id = "RUSTSEC-2026-0559", reason = """
+`chrono-tz-build` is unmaintained: the build-time half of `chrono-tz`
+0.8.6, in the tree only through `neo4rs` 0.8.0 (`cargo tree -i
+chrono-tz-build` shows that single path). Build-time only, no
+vulnerability. It leaves with neo4rs's chrono-tz, the only copy of that
+crate left in the tree since 2026-11-17; DELETE this entry when `cargo
+tree -i chrono-tz-build` finds nothing.
+""" },
+
+    # --- Unsound, but unreachable given our key types ---
+
+    { id = "RUSTSEC-2026-0253", reason = """
+`lru` `LruCache::pop()` is not panic-safe: if a stored KEY's `Drop`
+panics during `pop()`, `detach()` is skipped and a dangling pointer
+stays linked in the internal list, so a later eviction writes to freed
+memory (CWE-416 / CWE-415).
+
+Reachability — the trigger is specifically a panicking `Drop` ON THE
+KEY, so the key TYPE decides it. ONE path in this tree still links an
+affected version (lru 0.16.4), and its keys cannot panic on drop:
+  * async-graphql 7.2.1 — `LruCache<String, ExecutableDocument>`
+    (persisted queries) and a generic dataloader cache whose keys in
+    Aegix are `Uuid`/`String`. `String`'s drop frees a buffer; it does
+    not panic.
+A panicking `Drop` on a key is not something Aegix can introduce
+accidentally: it would require writing a custom key type with a
+panicking `Drop` impl. If a future cache does that, this exemption is
+void — that is the condition to re-check, not the version number.
+
+Why not simply upgrade: the fix is lru >=0.18.2, and `async-graphql`
+7.2.1 requires `^0.16.2`, which we do not control.
+
+What changed 2026-10-06: the other two paths are gone. `aws-sdk-s3`
+moved 1.119 -> 1.152 (it pulled lru 0.12.5; it now pulls 0.18.5), and
+`aegix-audit-ledger` — our only direct use,
+`LruCache<Uuid, SdkTracerProvider>` — declares `lru = "0.18"` and
+shares that copy. `controller`'s own `lru` declaration had already been
+removed (zero usages).
+
+Re-review 2026-Q4, or when async-graphql ships a release on
+lru >=0.18.2 — at which point this entry should be DELETED, not bumped.
+""" },
+
+    # --- Unmaintained, build-time only, and introduced DELIBERATELY ---
+
+    { id = "RUSTSEC-2026-0173", reason = """
+`proc-macro-error2` is unmaintained. Both it and the `proc-macro-error` it
+forked are now flagged (RUSTSEC-2024-0370).
+
+UNLIKE EVERY OTHER ENTRY IN THIS FILE, WE INTRODUCED THIS ONE. The others are
+advisories published against dependencies we already had; this arrived because
+2026-08-17 added `age` for client-side encryption of off-host backups. Saying
+so matters — an exemption for a cost you chose deserves a different level of
+scrutiny than one for a cost that landed on you.
+
+Pulled by exactly one edge:
+  proc-macro-error2 <- i18n-embed-fl (proc-macro) <- age 0.11 <- aegix-offhost-backup
+
+BUILD-TIME ONLY. `i18n-embed-fl` is a proc-macro crate — it runs in the
+compiler and is never linked into any shipped binary. The exposure is to the
+build host, not to the worker, the controller, or anything an attacker can
+reach at runtime.
+
+NOT REMOVABLE WHILE USING `age`, checked rather than assumed:
+  * `i18n-embed-fl` is an UNCONDITIONAL dependency in age's manifest — no
+    `optional = true`, no feature gate. It localises age's own error strings.
+  * We already declare `age = "0.11"` with default features `[]`; there is no
+    feature left to turn off.
+  * The alternatives are worse. The age CLI cannot do unattended encryption at
+    all (it reads its passphrase from `/dev/tty` and fails `ENOTTY` on a pipe,
+    with no `--passphrase-file` and no env var). Hand-rolling scrypt +
+    ChaCha20-Poly1305 is not on the table. Dropping client-side encryption
+    entirely would publish the plaintext columns a `pg_dump` carries —
+    workflow names, module source, `graph_json` — to the storage provider.
+
+No vulnerability: RUSTSEC-2026-0173 is a maintenance flag. The residual risk is
+the absence of FUTURE patches for a proc-macro that expands attribute macros at
+compile time.
+
+Tracking: `age` moving off the fluent/i18n stack, or `i18n-embed-fl` dropping
+`proc-macro-error2`. Re-review 2026-Q4 — and if `age` is ever removed from this
+workspace, DELETE this entry rather than leaving it to rot.
+
+NOTE ON WHY THIS REACHED CI RATHER THAN `make lint`: the local gate runs
+`cargo deny check bans licenses sources` and deliberately omits `advisories`
+(they need network); the advisory scan is CI-only plus the env-gated
+`make audit`. So an advisory introduced by a NEW dependency is structurally
+invisible locally. Run `cargo deny --all-features check advisories` by hand
+when adding a dependency — that is the only pre-CI signal for this class.
+""" },
+
+    { id = "RUSTSEC-2026-0374", reason = """
+`basic-toml` is unmaintained (the repository was archived 2025-03-02; the
+advisory was published 2026-10-20). Same provenance as RUSTSEC-2026-0173
+above: WE INTRODUCED IT, with `age` for the off-host backups.
+
+Pulled by exactly one crate, through two proc-macro edges:
+  basic-toml <- i18n-config <- i18n-embed-fl (proc-macro)   <- age 0.11 <- aegix-offhost-backup
+  basic-toml <- i18n-config <- i18n-embed-impl (proc-macro) <- i18n-embed <- age 0.11
+
+BUILD-TIME ONLY, checked with `cargo tree -i i18n-config`: both of its
+dependents are proc-macro crates, so `basic-toml` runs in the compiler to
+parse the `i18n.toml` that ships INSIDE the `age` crate, and is linked into no
+shipped binary. It never reads input an operator or a tenant supplies.
+
+NOT REMOVABLE, checked 2026-10-20 rather than assumed:
+  * `age` 0.12.1 (the latest) still depends on `i18n-embed` and
+    `i18n-embed-fl` unconditionally, so moving to 0.12 would not drop it.
+  * `i18n-config` 0.4.8 is the latest release and requires `basic-toml ^0.1`;
+    there is no release that moved to `toml`.
+  * The reasons `age` stays are the ones RUSTSEC-2026-0173 gives.
+
+No vulnerability: a maintenance flag. The residual risk is the absence of
+FUTURE patches for a TOML parser that runs at compile time over a file the
+`age` crate itself ships.
+
+Tracking: `i18n-config` moving to `toml` (the advisory's suggested
+replacement), or `age` leaving the fluent/i18n stack. Re-review 2026-Q4 with
+the entry above; if `age` is removed from this workspace, DELETE both.
+""" },
+
+    { id = "RUSTSEC-2026-0381", reason = """
+`webpki-roots` bundled the emSign intermediates browsers distrust. Fixed in
+1.0.10, and Cargo.lock holds 1.0.10 (bumped 2026-10-20 with rustls-webpki
+0.103.16 for RUSTSEC-2026-0382 and webpki-root-certs 1.0.10 for -0383).
+
+This entry is for the OTHER copy the advisory names, `webpki-roots` 0.26.11,
+which two carriers pull (`cargo tree -i webpki-roots@0.26.11`, 2026-10-20):
+  * `neo4rs` 0.8.0 (<- aegix-graph-rag) requires "0.26.0". 0.8.0 is the
+    latest release; 0.9 is a release candidate.
+  * `tokio-websockets` 0.10.1 (<- async-nats 0.50, whose default feature
+    `websockets` enables it with `rustls-webpki-roots`) requires "0.26".
+    async-nats pins "0.10", and 0.10.1 is the last of that line (0.13 is
+    current).
+0.26.11 is the latest 0.26 and is a semver-trick shim: its only dependency is
+`webpki-roots` "1", whose `TLS_SERVER_ROOTS` it re-exports (its lib.rs is one
+`pub use`), so it carries no certificates of its own and resolves to the
+fixed 1.0.10. Independently, rustls-webpki 0.103.16 (RUSTSEC-2026-0382)
+rejects a path containing the distrusted emSign keys whatever bundle is in
+use. The advisory flags 0.26.11 by version number; there is no 0.26 release
+to move to.
+
+The ignore is by advisory id, so it would also hide a 1.x copy below 1.0.10.
+The `[bans]` entry for `webpki-roots:>=1.0.0, <1.0.10` refuses that copy, so
+the fix cannot be undone under this ignore.
+
+Tracking: `neo4rs` depending on `webpki-roots` 1 directly, and `async-nats`
+pinning a `tokio-websockets` line that does. When nothing in the tree pulls
+0.26, DELETE this entry and the ban. Record:
+docs/engineering-log/packages/2026-10-20-webpki-emsign-advisories.md.
+""" },
+
+    { id = "RUSTSEC-2026-0387", reason = """
+`crypto-bigint` before 0.7.6: some operations meant to be constant-time
+(subtraction, zero counting, division, Montgomery multiplication) can branch
+on secret values, depending on the compiler and the target CPU. Fixed only
+in 0.7.6. The tree holds 0.5.5, which no 0.5 release fixes. Two crates pull
+it (`cargo tree -i crypto-bigint@0.5.5`, 2026-10-24):
+  * `elliptic-curve` 0.13.8, through `p256` 0.13.2 and `p384` 0.13.1, which
+    `jsonwebtoken` 11.1.0's `rust_crypto` feature always brings. 11.1.0 is
+    the latest `jsonwebtoken`, and it requires the 0.13 curves. `p256` 0.14
+    is out, but nothing here depends on it.
+  * `aws-sigv4` 1.6.0's default `sigv4a` feature (<- `aws-runtime` <-
+    `aws-config`, `aws-sdk-s3` <- aegix-audit-ledger). Only SigV4a signing
+    (multi-region access points) uses it. The audit ledger's S3 calls are
+    SigV4, an HMAC.
+
+Where a SECRET reaches it: ES256 signing in aegix-auth. `p256` 0.13's
+`Scalar` is a `crypto-bigint` U256 and uses its `sub`, `mul_wide` and invert,
+so signing a session JWT runs them on the private key and the nonce. That is
+the timing class that recovers ECDSA keys. Verifying a third-party ES256 or
+ES384 token touches only public values. ES256 is opt-in: `JWT_ALGORITHM`
+defaults to HS256, no shipped config (chart, compose, examples) selects it,
+and the reference deployment runs HS256. So the leak is LATENT on this fleet,
+and LIVE for any deployment that sets `JWT_ALGORITHM=ES256`. Such a
+deployment should use HS256 or RS256 until the tracking item below lands.
+
+The ignore is by advisory id, so it would also hide a 0.6 or 0.7 copy below
+0.7.6. The `[bans]` entry for `crypto-bigint:>=0.6.0, <0.7.6` refuses that
+copy.
+
+Tracking: `jsonwebtoken` moving to the 0.14 curves (`elliptic-curve` 0.14 is
+on `crypto-bigint` 0.7), and `aws-sigv4` moving `sigv4a` to 0.7. When no
+0.5 copy is left, DELETE this entry and the ban. Moving session signing off
+ES256 was considered and deferred (operator decision 2026-10-24). Re-review
+2026-Q4.
+""" },
+
+]
+
+# ============================================================================
+# Licenses — only permissive OSI licenses allowed.
+# ============================================================================
+[licenses]
+version = 2
+# SPDX IDs ONLY. cargo-deny will fail if a crate has no license metadata
+# rather than silently skipping — intentional.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    # Unicode-3.0 supersedes Unicode-DFS-2016; unicode-ident 1.0.14+ uses
+    # the new SPDX ID. Kept only 3.0 to surface any crate still stamping
+    # the old license header.
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    # CDLA-Permissive-2.0: Mozilla's license for the root-CA data set in
+    # `webpki-roots`. It's a permissive data-sharing license (functionally
+    # equivalent to MIT for our purposes — no copyleft, no patent trap).
+    # See https://cdla.dev/permissive-2-0/.
+    "CDLA-Permissive-2.0",
+    # MPL-2.0 is a weak copyleft — file-level. Acceptable for us because
+    # we don't modify MPL-licensed source; distributing binaries that
+    # merely link to MPL code is fine. Document any MPL crate in the
+    # third-party notices file.
+    "MPL-2.0",
+]
+# Confidence threshold for license detection — bump to 0.93 so heuristic
+# matches are rare. Known crates (in-tree workspace members) always
+# match cleanly.
+confidence-threshold = 0.93
+exceptions = [
+    # Per-crate license exemptions go here with justification, e.g.:
+    # { allow = ["OpenSSL"], name = "ring", version = "*" },
+    #
+    # BSL-1.0 (Boost Software License) — for this one crate, not the
+    # allowlist. `redis` depends on xxhash-rust unconditionally from 1.0 (its
+    # value-digest helper), so it cannot be switched off with a feature. The
+    # licence is permissive (OSI-approved, FSF free, no copyleft) and asks for
+    # its text only with SOURCE copies, not with a compiled binary. Accepted
+    # by the operator's merge of the redis 1.7 change (2026-10-07).
+    { allow = ["BSL-1.0"], name = "xxhash-rust" },
+]
+
+# ============================================================================
+# Bans — specific crate bans, duplicate-version policy, unmaintained gate.
+# ============================================================================
+[bans]
+# `deny` fails the build. `warn` surfaces in output but doesn't block.
+multiple-versions = "warn"  # bump to "deny" once the transitive-dep tree is cleaner
+wildcards = "deny"          # any `crate = "*"` dep is a supply-chain footgun
+# Exempt `path = "../..."` deps from the wildcard ban — in-tree workspace
+# crates resolve via filesystem paths, not versions, and don't create
+# the "version drift" risk the wildcard ban is targeting.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# Explicit crate denials — crates we'll NEVER accept as direct or
+# transitive deps. Kept small and specific; every entry has a reason.
+deny = [
+    # `openssl-src` bundles a vendored OpenSSL — rustls is our TLS stack,
+    # pulling in openssl-src means someone in the dep tree is using
+    # native-tls at build time, which is a security regression.
+    { name = "openssl-src", reason = "prefer rustls — vendored OpenSSL expands attack surface" },
+    # The hard deny the note below wished for. From 2026-10-07 nothing in the
+    # build needs native-tls: reqwest 0.13 is on rustls and oci-distribution,
+    # the last crate that dragged it in, is replaced by oci-client on rustls.
+    # Any of these back in the tree means some client in a binary has
+    # silently gone back to OpenSSL (`outbound_tls_pin` would also fail).
+    { name = "native-tls", reason = "outbound TLS is rustls; native-tls in the tree flips every reqwest client in the binary to OpenSSL" },
+    { name = "openssl-sys", reason = "outbound TLS is rustls; nothing in the build should link OpenSSL" },
+    # Holds the RUSTSEC-2026-0381 fix: the advisory is ignored for the 0.26
+    # shim (see [advisories]), which would also hide a 1.x copy below 1.0.10.
+    { crate = "webpki-roots:>=1.0.0, <1.0.10", reason = "RUSTSEC-2026-0381: webpki-roots before 1.0.10 trusts the distrusted emSign intermediates" },
+    # Holds the RUSTSEC-2026-0387 fix: the advisory is ignored for the 0.5.5
+    # copy the 0.13 curves and aws-sigv4 pull (see [advisories]), which would
+    # also hide a newer copy below 0.7.6.
+    { crate = "crypto-bigint:>=0.6.0, <0.7.6", reason = "RUSTSEC-2026-0387: crypto-bigint before 0.7.6 has secret-dependent branches in constant-time operations" },
+    # Holds stage 1 of the chrono plan (2026-11-17): the advisory against
+    # chrono-tz is ignored for neo4rs's copy (see [advisories]), which would
+    # also hide one a workspace crate took. Only neo4rs may bring it.
+    { crate = "chrono-tz", wrappers = ["neo4rs"], reason = "chrono-tz no longer follows the IANA database; a zone is asked of aegix-zones (jiff-tzdb). Only neo4rs's own copy is accepted" },
+]
+# NOTE on `native-tls` (HISTORY — the hard deny is in place above since
+# 2026-10-07): the ideal policy is a hard deny (rustls is our
+# TLS standard for every direct call). In practice, `oci-distribution`
+# 0.11 and `opentelemetry-otlp` 0.27's `reqwest-client` feature pull
+# native-tls transitively through reqwest's defaults — neither crate
+# currently offers a `rustls-only` feature. Our controller + worker
+# EXPLICITLY disable reqwest default features + enable only rustls-tls
+# for our direct HTTP calls, so the native-tls code path is only hit
+# by OCI registry fetches (our internal registry — trust boundary) and
+# OTLP export (our OTLP collector — trust boundary). Both endpoints
+# are operator-controlled, not attacker-controlled.
+#
+# CORRECTION, 2026-10-07: the paragraph above was not true when written.
+# Disabling reqwest's default features in OUR manifests did not keep
+# native-tls out of OUR calls: Cargo merges features into the one reqwest
+# a binary links, and reqwest uses native-tls for every client once it is
+# compiled in. Every direct call ran on OpenSSL until the workspace moved
+# to reqwest 0.13 (feature `rustls`), which oci-distribution's 0.12 copy
+# no longer shares. `outbound_tls_pin` in the controller and the worker
+# now checks the built client. See
+# docs/engineering-log/packages/2026-10-07-reqwest-0.13.md.
+# Tracking upstream:
+#   - oci-distribution: https://github.com/oras-project/rust-oci-client/issues (rustls feature)
+#   - opentelemetry-rust: rustls support via default-features = false
+# Revisit the ban once either ships a rustls-only path.
+
+# Skip duplicate-version warnings for crates that are KNOWN to have
+# legitimate multi-version transitive roots (the Rust ecosystem's
+# long-tail of rand/syn/windows-sys migrations). Kept empty initially;
+# fill in after the first `cargo deny check bans` run.
+skip = []
+skip-tree = []
+
+# ============================================================================
+# Sources — only crates.io + the sibling aegix-workflow-engine workspace.
+# ============================================================================
+[sources]
+# Unknown registries are blocked — a poisoned fork published to a custom
+# registry can't sneak in even if someone accidentally adds it.
+unknown-registry = "deny"
+# Local paths / git sources must be explicitly listed below.
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+# `path = "../aegix-workflow-engine/..."` deps are in-tree sibling
+# workspace members; cargo-deny categorizes them as "unknown-git"
+# when they resolve via path. Allow them explicitly so we don't have
+# to blanket `unknown-git = "allow"`.
+[sources.allow-org]
+# No GitHub orgs whitelisted — if we ever need `git = "https://github.com/foo/bar"`
+# deps, add the org here and explain why.
+github = []
+gitlab = []
+bitbucket = []

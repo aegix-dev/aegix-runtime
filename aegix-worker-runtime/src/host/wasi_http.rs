@@ -1,0 +1,1639 @@
+//! `wasi:http/outgoing-handler` for the trusted/automation world, GATED
+//! (2026-09-25).
+//!
+//! # What was wrong
+//!
+//! `build_trusted_linker` linked the upstream `outgoing-handler`, and
+//! `AegixContext`'s `WasiHttpView` supplied `default_hooks()`, whose
+//! `send_request` connects with raw hyper/tokio: no host allowlist, no SSRF
+//! check on the authority or on what it resolves to, no tier-1 LLM-host deny,
+//! no local-only egress, no rate limit, no method allowlist, no write ceiling,
+//! nothing in the audit ledger. `aegix-compilation` keeps a JS module's
+//! `fetch` wired to it for exactly this world (`world_grants_raw_wasi_http`),
+//! so an automation-node module had a complete second egress channel beside
+//! `aegix:core/http` with none of that channel's controls. The comment
+//! justifying it — "trusted modules are operator-authored" — was not true of
+//! the platform: any user holding an `automation-node` capability grant
+//! compiles one.
+//!
+//! # The shape of the fix
+//!
+//! Two layers, because either alone leaves a hole:
+//!
+//! 1. [`gated_handle`] replaces the upstream `handle`. It sees the request
+//!    AND the whole [`AegixContext`], so it applies the SAME gate set, in the
+//!    same order, as `aegix:core/http::fetch`: scheme, empty allowlist, SSRF on
+//!    an IP-literal authority, `allowed_hosts`, the egress posture (tier-1 LLM
+//!    hosts, public literals under tier 1 or local-only egress), the write
+//!    ceiling on its verb axis / strict read egress, the method allowlist, the
+//!    per-execution and per-host rate limits, cancellation and dry-run. Each
+//!    refusal is recorded the way every other surface records one (guest
+//!    diagnostic + WORM ledger). Then it delegates to the upstream `handle`.
+//! 2. [`HardenedWasiHttpHooks`] replaces `default_hooks()`: `send_request`
+//!    goes through the execution's hardened `reqwest` client — the
+//!    `SsrfFilteringResolver` (private-IP and local-only egress checked on the
+//!    RESOLVED address, at connect, which is the only place a hostname's DNS
+//!    answer can be checked without a rebinding window), no proxy, no
+//!    redirects. The default path resolved the name itself.
+//!
+//! # Stated limits
+//!
+//! * The gate runs synchronously (the p2 host trait is sync), so a refusal is
+//!   appended to the ledger with a non-blocking lock; see
+//!   [`AegixContext::record_capability_denied_now`].
+//! * A hostname that resolves to a refused address is refused at connect by
+//!   the resolver and reaches the guest as a connection error, with no ledger
+//!   entry — the same limit as `aegix:core/http`'s resolver layer, minus the
+//!   pre-flight lookup `fetch` does for the audit signal (a lookup here would
+//!   block the sync gate).
+//! * `vault://` markers are not substituted on this channel. A guest that puts
+//!   one in a header or body sends the literal marker.
+//! * `allowed_methods` is the closed five-verb set; `HEAD`, `OPTIONS`,
+//!   `CONNECT`, `TRACE` and custom verbs can never be declared, so they are
+//!   always refused here.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures_util::TryStreamExt;
+use http_body::{Body, Frame, SizeHint};
+use http_body_util::BodyExt;
+use wasmtime::component::Resource;
+use wasmtime_wasi_http::p2::bindings::http::{outgoing_handler, types as wt};
+use wasmtime_wasi_http::p2::body::HyperIncomingBody;
+use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, HostOutgoingRequest};
+use wasmtime_wasi_http::p2::HttpResult;
+use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks, WasiHttpView};
+
+use super::limits::{MAX_HTTP_CALLS_PER_EXECUTION, MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION};
+use crate::context::AegixContext;
+
+/// The capability token on this surface's audit rows. A raw `wasi:http`
+/// request IS an `http-fetch` through another ABI, so it carries that op
+/// label: the write ceiling's op partition (`write_gated_ops`, the
+/// verb-inferred set pinned by `ceiling_axis_pins`) and the audit vocabulary
+/// an operator correlates against stay closed. The SURFACE is told apart in
+/// the target, which reads `wasi:http <host>`.
+pub(crate) const WASI_HTTP_OP: &str = "http-fetch";
+
+/// Prefix on every audit target from this surface.
+pub(crate) const WASI_HTTP_TARGET_PREFIX: &str = "wasi:http";
+
+/// Upper bound on a response body read through this channel, the same knob
+/// and default as `aegix:core/http::fetch`.
+pub(crate) fn max_response_bytes() -> usize {
+    aegix_config::positive_env_or_default::<usize>("WASM_HTTP_MAX_RESPONSE_BYTES", 10 * 1024 * 1024)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The admission decision — pure, so every refusal is unit-testable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The request fields the gate reads, lifted out of the resource table.
+#[derive(Debug, Clone)]
+pub(crate) struct WasiHttpTarget {
+    /// Upper-case verb token (`GET`, `POST`, …, or a custom verb).
+    pub(crate) method: String,
+    /// `None` = the guest set no scheme (upstream defaults to HTTPS).
+    pub(crate) scheme: Option<wt::Scheme>,
+    pub(crate) authority: Option<String>,
+}
+
+/// The policy the gate applies, read from the context at call time.
+pub(crate) struct WasiHttpPolicy<'a> {
+    pub(crate) allowed_hosts: &'a [String],
+    pub(crate) allowed_methods: &'a [String],
+    pub(crate) max_llm_tier: aegix_workflow_job_protocol::LlmTier,
+    pub(crate) local_egress_only: bool,
+    pub(crate) max_write_ceiling: aegix_workflow_job_protocol::WriteCeiling,
+    pub(crate) http_verb_ceiling: Option<aegix_workflow_job_protocol::WriteCeiling>,
+    pub(crate) write_ceiling_enforced: bool,
+    pub(crate) strict_egress: bool,
+    pub(crate) insecure_http_opt_in: bool,
+}
+
+/// A refusal: what to record, and what the guest gets back.
+#[derive(Debug, Clone)]
+pub(crate) struct WasiHttpRefusal {
+    /// Audit `policy` token (same vocabulary as `aegix:core/http`).
+    pub(crate) policy: &'static str,
+    /// Audit `target` (host, IP, or `"<METHOD> <host>"`; never a secret).
+    pub(crate) target: String,
+    pub(crate) code: wt::ErrorCode,
+    pub(crate) detail: Option<&'static str>,
+}
+
+/// An admitted request: the normalized host and the per-host rate-limit key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WasiHttpAdmitted {
+    pub(crate) host: String,
+    pub(crate) host_for_limit: String,
+    pub(crate) mutates: bool,
+    /// The destination the gate judged, as `host:port` ([`destination_key`]).
+    /// The send refuses any other (E2-1).
+    pub(crate) send_key: String,
+}
+
+/// `host:port` of a URL (WHATWG-normalised host, the scheme's port when none
+/// is written): how the gate and the send both name a destination.
+pub(crate) fn destination_key(url: &url::Url) -> Option<String> {
+    Some(format!(
+        "{}:{}",
+        url.host_str()?.to_ascii_lowercase(),
+        url.port_or_known_default()?
+    ))
+}
+
+fn refuse(policy: &'static str, target: impl Into<String>) -> WasiHttpRefusal {
+    WasiHttpRefusal {
+        policy,
+        target: target.into(),
+        code: wt::ErrorCode::HttpRequestDenied,
+        detail: None,
+    }
+}
+
+/// `GET` and `HEAD` are reads; every other verb, including a custom one, is
+/// treated as a mutation (fail closed on the write-ceiling axis).
+fn method_mutates(method: &str) -> bool {
+    !matches!(method, "GET" | "HEAD")
+}
+
+/// The stateless half of the gate, in `aegix:core/http::fetch`'s order.
+pub(crate) fn wasi_http_admission(
+    target: &WasiHttpTarget,
+    policy: &WasiHttpPolicy<'_>,
+) -> Result<WasiHttpAdmitted, WasiHttpRefusal> {
+    let scheme = match &target.scheme {
+        None | Some(wt::Scheme::Https) => "https",
+        Some(wt::Scheme::Http) => "http",
+        Some(wt::Scheme::Other(_)) => {
+            return Err(WasiHttpRefusal {
+                code: wt::ErrorCode::HttpProtocolError,
+                ..refuse("insecure-scheme", "other-scheme")
+            })
+        }
+    };
+    let authority_str = target.authority.as_deref().unwrap_or("");
+    // Parsed with the SAME parser the upstream request builder uses, so a
+    // string this gate reads one way cannot be sent as another.
+    let authority: http::uri::Authority = authority_str.parse().map_err(|_| WasiHttpRefusal {
+        code: wt::ErrorCode::HttpRequestUriInvalid,
+        ..refuse("invalid-authority", "")
+    })?;
+    // The host:port the gate judges must be exactly the one presented. The
+    // authority parser accepts a port that is not a u16 (`:99999`) or is empty
+    // or zero-padded, and `port_u16()` silently drops those — so the gate
+    // would judge `host:443` while `host:99999` was presented. Refuse any
+    // authority that does not round-trip rather than read it two ways
+    // (userinfo, if any, is not part of the comparison).
+    let presented = authority
+        .as_str()
+        .rsplit_once('@')
+        .map_or(authority.as_str(), |(_, host_port)| host_port);
+    let canonical = match authority.port_u16() {
+        Some(p) => format!("{}:{p}", authority.host()),
+        None => authority.host().to_string(),
+    };
+    if !presented.eq_ignore_ascii_case(&canonical) {
+        return Err(WasiHttpRefusal {
+            code: wt::ErrorCode::HttpRequestUriInvalid,
+            ..refuse("invalid-authority", "")
+        });
+    }
+    // WHATWG normalisation (decimal / hex IP spellings become dotted quads) —
+    // the same normaliser `reqwest` applies when it sends.
+    let port = authority
+        .port_u16()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    let url =
+        url::Url::parse(&format!("{scheme}://{}{port}/", authority.host())).map_err(|_| {
+            WasiHttpRefusal {
+                code: wt::ErrorCode::HttpRequestUriInvalid,
+                ..refuse("invalid-authority", "")
+            }
+        })?;
+    let send_key = destination_key(&url).ok_or_else(|| WasiHttpRefusal {
+        code: wt::ErrorCode::HttpRequestUriInvalid,
+        ..refuse("invalid-authority", "")
+    })?;
+    // Scheme, allowlist, IP literal, `allowed_hosts`, egress posture: the
+    // same function `aegix:core/http::fetch` / `fetch_all` call.
+    let url_policy = super::egress_admission::UrlPolicy {
+        allowed_hosts: policy.allowed_hosts,
+        max_llm_tier: policy.max_llm_tier,
+        local_egress_only: policy.local_egress_only,
+        insecure_http_opt_in: policy.insecure_http_opt_in,
+    };
+    let super::egress_admission::UrlAdmitted {
+        host,
+        host_match: matched,
+        host_for_limit,
+        ..
+    } = super::egress_admission::admit_parsed_url(url, &url_policy)
+        .map_err(|r| refuse(r.policy, r.target))?;
+    let mutates = method_mutates(&target.method);
+    // The write ceiling on its VERB-INFERRED axis, under the `http-fetch` op
+    // label (see `WASI_HTTP_OP`). The pair is written on one line so
+    // `ceiling_axis_pins` counts this site with the other gates.
+    let (axis, _op) = (
+        aegix_workflow_job_protocol::CeilingAxis::VerbInferred,
+        "http-fetch",
+    );
+    if mutates
+        && aegix_workflow_job_protocol::write_ceiling_denies_axis(
+            policy.write_ceiling_enforced,
+            axis,
+            policy.max_write_ceiling,
+            policy.http_verb_ceiling,
+        )
+    {
+        return Err(WasiHttpRefusal {
+            detail: Some(super::http::WRITE_CEILING_VERB_DETAIL),
+            ..refuse("write-ceiling", host)
+        });
+    }
+    if !mutates
+        && crate::context::strict_egress_denies(
+            policy.write_ceiling_enforced,
+            policy.strict_egress,
+            policy.max_write_ceiling,
+            matched,
+        )
+    {
+        return Err(refuse("write-ceiling-strict-egress", host));
+    }
+    if !aegix_workflow_job_protocol::method_permitted(policy.allowed_methods, &target.method) {
+        return Err(WasiHttpRefusal {
+            detail: Some(aegix_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
+            ..refuse("method-allowlist", format!("{} {host}", target.method))
+        });
+    }
+    Ok(WasiHttpAdmitted {
+        host,
+        host_for_limit,
+        mutates,
+        send_key,
+    })
+}
+
+fn method_token(m: &wt::Method) -> String {
+    match m {
+        wt::Method::Get => "GET".into(),
+        wt::Method::Head => "HEAD".into(),
+        wt::Method::Post => "POST".into(),
+        wt::Method::Put => "PUT".into(),
+        wt::Method::Delete => "DELETE".into(),
+        wt::Method::Connect => "CONNECT".into(),
+        wt::Method::Options => "OPTIONS".into(),
+        wt::Method::Trace => "TRACE".into(),
+        wt::Method::Patch => "PATCH".into(),
+        wt::Method::Other(s) => s.to_ascii_uppercase(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The gated handler.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `wasi:http` package version upstream binds (`wit/deps/http.wit`).
+/// The linker matches semver-compatible `0.2.x` imports against it, exactly
+/// as it does for upstream's own registration.
+pub(crate) const OUTGOING_HANDLER_INTERFACE: &str = "wasi:http/outgoing-handler@0.2.12";
+
+/// Link the gated `handle` in place of upstream's `add_only_http_to_linker_async`
+/// (which the trusted linker used), beside `wasi:http/types`.
+///
+/// Registered directly with `func_wrap` rather than through the generated
+/// `outgoing_handler::add_to_linker`: that trait has `wasi:http/types::Host` as
+/// a supertrait, so a wrapper type would have to re-implement the whole types
+/// surface. The signature is the WIT one —
+/// `handle(outgoing-request, option<request-options>) -> result<future-incoming-response, error-code>`
+/// — and the typed resources are upstream's own (`with` mappings), so the
+/// upstream `handle` this delegates to sees exactly what it would have.
+pub(crate) fn add_gated_outgoing_handler(
+    l: &mut wasmtime::component::Linker<AegixContext>,
+) -> anyhow::Result<()> {
+    let mut inst = l.instance(OUTGOING_HANDLER_INTERFACE)?;
+    inst.func_wrap(
+        "handle",
+        |mut store: wasmtime::StoreContextMut<'_, AegixContext>,
+         (request, options): (
+            Resource<HostOutgoingRequest>,
+            Option<Resource<wt::RequestOptions>>,
+        )| {
+            let outcome = match gated_handle(store.data_mut(), request, options) {
+                Ok(future) => Ok(future),
+                // An `ErrorCode` goes to the guest; anything else traps —
+                // upstream's `convert_error_code`, verbatim.
+                Err(e) => Err(e.downcast()?),
+            };
+            Ok((outcome,))
+        },
+    )?;
+    Ok(())
+}
+
+/// The gated `wasi:http/outgoing-handler.handle`: the WHOLE context in view,
+/// not the `WasiHttpCtxView` projection the upstream handler gets.
+pub(crate) fn gated_handle(
+    ctx: &mut AegixContext,
+    request: Resource<HostOutgoingRequest>,
+    options: Option<Resource<wt::RequestOptions>>,
+) -> HttpResult<Resource<HostFutureIncomingResponse>> {
+    ctx.host_call("wasi-http::handle");
+    // A rehearsal answers `aegix:core/http` from recordings and sends nothing
+    // else. This function is synchronous, so the refusal is logged rather than
+    // written as a host diagnostic.
+    if ctx.http_replay.is_some() {
+        drop(ctx.table.delete(request));
+        tracing::info!(
+            module_id = ?ctx.module_id,
+            "wasi:http request refused: the run is a rehearsal (http_fixtures)"
+        );
+        return Err(wt::ErrorCode::HttpRequestDenied.into());
+    }
+    let target = {
+        let req = ctx.table.get(&request)?;
+        WasiHttpTarget {
+            method: method_token(&req.method),
+            scheme: req.scheme.clone(),
+            authority: req.authority.clone(),
+        }
+    };
+    let decision = {
+        let policy = WasiHttpPolicy {
+            allowed_hosts: &ctx.allowed_hosts,
+            allowed_methods: &ctx.allowed_methods,
+            max_llm_tier: ctx.max_llm_tier,
+            local_egress_only: ctx.local_egress_only,
+            max_write_ceiling: ctx.max_write_ceiling,
+            http_verb_ceiling: ctx.http_verb_ceiling,
+            write_ceiling_enforced: crate::context::write_ceiling_enforced(),
+            strict_egress: crate::context::write_ceiling_strict_egress(),
+            insecure_http_opt_in: ctx.dev_egress.insecure_http,
+        };
+        wasi_http_admission(&target, &policy)
+    };
+    let admitted = match decision {
+        Ok(a) => a,
+        Err(r) => return Err(ctx.refuse_wasi_http(request, r)),
+    };
+
+    // Budget + cancellation: charged AFTER the stateless checks admitted,
+    // exactly as `fetch` does (a refused request spends no budget).
+    if !ctx.check_rate_limit(&ctx.http_call_count, MAX_HTTP_CALLS_PER_EXECUTION) {
+        let host = admitted.host.clone();
+        return Err(ctx.refuse_wasi_http(request, refuse("execution-rate-limit", host)));
+    }
+    if !ctx.check_per_host_rate_limit(
+        &admitted.host_for_limit,
+        MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION,
+    ) {
+        let host = admitted.host.clone();
+        return Err(ctx.refuse_wasi_http(request, refuse("per-host-rate-limit", host)));
+    }
+    if ctx.is_cancelled() {
+        drop(ctx.table.delete(request));
+        return Err(wt::ErrorCode::HttpRequestDenied.into());
+    }
+
+    // Dry-run: a mutating request is mocked, never sent — the contract
+    // `aegix:core/http::fetch` already honours.
+    if ctx.dry_run && admitted.mutates {
+        drop(ctx.table.delete(request));
+        tracing::info!(
+            method = %target.method,
+            host = %admitted.host,
+            "Dry-run: intercepted mutating wasi:http request (pre-network)"
+        );
+        ctx.dry_run_ledger
+            .record(crate::dry_run::StubbedSurface::WasiHttp);
+        return Ok(ctx
+            .table
+            .push(dry_run_response(&target.method, &admitted.host))?);
+    }
+
+    // The send may go only where the gate judged (E2-1, 2026-10-15): the
+    // hooks refuse a request whose built URI names another host:port.
+    ctx.wasi_http_hooks.admit(admitted.send_key.clone());
+    let mut view = <AegixContext as WasiHttpView>::http(ctx);
+    outgoing_handler::Host::handle(&mut view, request, options)
+}
+
+impl AegixContext {
+    /// Record a `wasi:http` refusal the way every other egress surface records
+    /// one, drop the request resource, and return what the guest receives.
+    fn refuse_wasi_http(
+        &mut self,
+        request: Resource<HostOutgoingRequest>,
+        refusal: WasiHttpRefusal,
+    ) -> wasmtime_wasi_http::p2::HttpError {
+        // Consume the request (and its body) so the resource is not leaked.
+        drop(self.table.delete(request));
+        let target = format!("{WASI_HTTP_TARGET_PREFIX} {}", refusal.target);
+        self.record_capability_denied_now(WASI_HTTP_OP, refusal.policy, &target, refusal.detail);
+        tracing::warn!(
+            op = WASI_HTTP_OP,
+            policy = refusal.policy,
+            target = %refusal.target,
+            module_id = ?self.module_id,
+            actor_id = ?self.actor_id,
+            "wasi:http outgoing request refused by the egress gate"
+        );
+        refusal.code.into()
+    }
+}
+
+fn dry_run_response(method: &str, host: &str) -> HostFutureIncomingResponse {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "__dry_run__": true,
+        "intercepted_method": method,
+        "intercepted_host": host,
+    }))
+    .unwrap_or_default();
+    let body: HyperIncomingBody = http_body_util::Full::new(Bytes::from(body))
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed_unsync();
+    let resp = http::Response::builder()
+        .status(200)
+        .header("x-talos-dry-run", "true")
+        .header("content-type", "application/json")
+        .body(body);
+    match resp {
+        // The response's "I/O driver" handle: a mock has no connection to
+        // drive, so it is a task that is already finished.
+        Ok(resp) => {
+            HostFutureIncomingResponse::Ready(Ok((resp, wasmtime_wasi::runtime::spawn(async {}))))
+        }
+        Err(_) => {
+            HostFutureIncomingResponse::Ready(Err(wasmtime_wasi_http::Error::InternalError(None)))
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The send path: the execution's hardened client, never a raw connect.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The request/response I/O-completion future the hook API passes around.
+type IoFuture = Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>;
+
+/// `WasiHttpHooks` whose `send_request` uses the execution's hardened
+/// `reqwest` client (SSRF-filtering resolver incl. local-only egress, no
+/// proxy, no redirects, 5 s connect timeout) instead of upstream's raw
+/// `TcpStream::connect` on a name it resolves itself.
+pub(crate) struct HardenedWasiHttpHooks {
+    client: reqwest::Client,
+    /// Every destination ([`destination_key`]) the gate admitted in this
+    /// execution. Bounded by the per-execution call budget, which is charged
+    /// before a destination is added.
+    admitted: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl HardenedWasiHttpHooks {
+    pub(crate) fn new(client: reqwest::Client) -> Self {
+        Self {
+            client,
+            admitted: std::sync::Arc::default(),
+        }
+    }
+
+    /// Record a destination the gate admitted.
+    pub(crate) fn admit(&self, send_key: String) {
+        self.admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(send_key);
+    }
+
+    /// Whether the request's URI names a destination the gate admitted.
+    /// Aegix's own comparison (security review 2026-10-15, E2-1): the gate
+    /// judges the guest's `authority`, and upstream builds the URI it sends
+    /// from scheme + authority + path — RUSTSEC-2026-0350 was that builder
+    /// sending to another host. A repeat of that bug class is refused here
+    /// rather than trusted.
+    fn sends_where_admitted(&self, uri: &http::Uri) -> bool {
+        let Some(key) = url::Url::parse(&uri.to_string())
+            .ok()
+            .as_ref()
+            .and_then(destination_key)
+        else {
+            return false;
+        };
+        self.admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    }
+}
+
+impl WasiHttpHooks for HardenedWasiHttpHooks {
+    fn send_request(
+        &mut self,
+        request: http::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        // Upstream's default also ignores it: response-processing errors reach
+        // the guest through the body itself.
+        _response_done: IoFuture,
+    ) -> Box<
+        dyn Future<Output = wasmtime_wasi_http::Result<(http::Response<WasiBody>, IoFuture)>>
+            + Send,
+    > {
+        let client = self.client.clone();
+        let admitted = self.sends_where_admitted(request.uri());
+        Box::new(async move {
+            if !admitted {
+                tracing::warn!(
+                    target: "talos_security",
+                    "wasi:http request refused: the URI to be sent names a host or port the \
+                     gate did not admit"
+                );
+                return Err(wasmtime_wasi_http::Error::HttpRequestDenied);
+            }
+            let response = send_via_hardened_client(client, request, options).await?;
+            // reqwest drives its own connection, so there is no separate I/O
+            // task for the caller to await.
+            Ok((response, Box::new(std::future::ready(Ok(()))) as IoFuture))
+        })
+    }
+}
+
+/// A guest-set `request-options` timeout through the clamp `aegix:core/http`
+/// applies (E-9, 2026-10-14): unset is `fetch`'s default, and a value outside
+/// `[MIN_HTTP_TIMEOUT_MS, MAX_HTTP_TIMEOUT_MS]` is pulled inside it. Until
+/// then an unset timeout was upstream's 600 s and a set one was unbounded.
+fn clamped_timeout(requested: Option<Duration>) -> Duration {
+    let ms = requested.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
+    Duration::from_millis(crate::circuit_breaker::clamp_guest_timeout_ms(ms))
+}
+
+/// Was this send refused because the guest's request body passed the cap?
+/// The `Limited` wrapper's error travels inside reqwest's error chain as the
+/// payload of an `io::Error`; a `source()` walk skips that payload, so each
+/// `io::Error` is opened with `get_ref`.
+fn request_body_over_cap(e: &reqwest::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if io
+                .get_ref()
+                .is_some_and(|inner| inner.is::<http_body_util::LengthLimitError>())
+            {
+                return true;
+            }
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// The caps `aegix:core/http::fetch` puts on a response's headers, as the
+/// `wasi:http` error a guest receives.
+fn response_header_violation(headers: &http::HeaderMap) -> Option<wasmtime_wasi_http::Error> {
+    use super::limits::{MAX_INBOUND_HEADERS, MAX_INBOUND_HEADER_VALUE_BYTES};
+    if headers.len() > MAX_INBOUND_HEADERS {
+        return Some(wasmtime_wasi_http::Error::HttpResponseHeaderSectionSize(
+            u32::try_from(MAX_INBOUND_HEADERS).ok(),
+        ));
+    }
+    headers
+        .iter()
+        .find(|(_, v)| v.as_bytes().len() > MAX_INBOUND_HEADER_VALUE_BYTES)
+        .map(|(k, v)| wasmtime_wasi_http::Error::HttpResponseHeaderSize {
+            field_name: Some(k.to_string()),
+            field_size: u32::try_from(v.as_bytes().len()).ok(),
+        })
+}
+
+/// The send. Since E-9 (2026-10-14) it carries the caps `aegix:core/http::fetch`
+/// has: the guest timeouts clamped, an outbound header-count cap, the request
+/// body capped at [`MAX_OUTBOUND_HTTP_BODY_BYTES`] while it streams, the
+/// inbound header caps, and a circuit-breaker permit from the same
+/// process-global breaker, settled exactly as `fetch` settles it.
+///
+/// [`MAX_OUTBOUND_HTTP_BODY_BYTES`]: super::limits::MAX_OUTBOUND_HTTP_BODY_BYTES
+async fn send_via_hardened_client(
+    client: reqwest::Client,
+    request: http::Request<WasiBody>,
+    options: Option<RequestOptions>,
+) -> wasmtime_wasi_http::Result<http::Response<WasiBody>> {
+    use super::limits::{MAX_OUTBOUND_HEADERS, MAX_OUTBOUND_HTTP_BODY_BYTES};
+    use wasmtime_wasi_http::Error;
+
+    let first_byte_timeout = clamped_timeout(options.and_then(|o| o.first_byte_timeout));
+    let between_bytes_timeout = clamped_timeout(options.and_then(|o| o.between_bytes_timeout));
+
+    let (parts, body) = request.into_parts();
+    if parts.headers.len() > MAX_OUTBOUND_HEADERS {
+        return Err(Error::HttpRequestHeaderSectionSize(
+            u32::try_from(MAX_OUTBOUND_HEADERS).ok(),
+        ));
+    }
+    // Capped while it streams: the guest writes the body through an
+    // `outgoing-body` stream, so there is no length to check up front.
+    let body = http_body_util::Limited::new(body, MAX_OUTBOUND_HTTP_BODY_BYTES);
+    let stream =
+        TryStreamExt::map_err(http_body_util::BodyStream::new(body), std::io::Error::other)
+            .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
+    let request = http::Request::from_parts(parts, reqwest::Body::wrap_stream(stream));
+    let request = reqwest::Request::try_from(request).map_err(|_| Error::HttpRequestUriInvalid)?;
+
+    // The breaker `fetch` consults, keyed the same way (`host:port`).
+    let target = crate::circuit_breaker::BreakerTarget::from_url(request.url())
+        .ok_or(Error::HttpRequestUriInvalid)?;
+    let Some(mut permit) =
+        crate::circuit_breaker::get_global_circuit_breaker().begin_request(&target)
+    else {
+        tracing::warn!(
+            target = %target.key(),
+            "wasi:http request refused: circuit breaker open"
+        );
+        return Err(Error::DestinationUnavailable);
+    };
+    let timeout_ms = u64::try_from(first_byte_timeout.as_millis()).unwrap_or(u64::MAX);
+
+    let response = match tokio::time::timeout(first_byte_timeout, client.execute(request)).await {
+        Err(_) => {
+            permit.settle_send_error(false, true, timeout_ms);
+            return Err(Error::ConnectionReadTimeout);
+        }
+        Ok(Err(e)) => {
+            let over_cap = request_body_over_cap(&e);
+            if over_cap {
+                // The guest's own body, refused by this process: nothing was
+                // learned about the host.
+                permit.settle_no_evidence();
+            } else {
+                permit.settle_send_error(e.is_builder(), e.is_timeout(), timeout_ms);
+            }
+            return Err(if over_cap {
+                Error::HttpRequestBodySize(u64::try_from(MAX_OUTBOUND_HTTP_BODY_BYTES).ok())
+            } else if e.is_timeout() {
+                Error::ConnectionTimeout
+            } else if e.is_connect() {
+                // Includes the SSRF resolver refusing a private / public-under-
+                // local-only address — the connect is the gate.
+                Error::ConnectionRefused
+            } else {
+                Error::HttpProtocolError
+            });
+        }
+        Ok(Ok(response)) => {
+            permit.settle_response(response.status().as_u16());
+            response
+        }
+    };
+    if let Some(violation) = response_header_violation(response.headers()) {
+        tracing::warn!(
+            target = %target.key(),
+            "wasi:http response refused: header caps exceeded"
+        );
+        return Err(violation);
+    }
+
+    let (parts, body) = http::Response::<reqwest::Body>::from(response).into_parts();
+    let body = harden_response_body(body, max_response_bytes(), between_bytes_timeout);
+    Ok(http::Response::from_parts(parts, body))
+}
+
+/// The response body the guest reads: capped at `max` bytes, and failed with
+/// `ConnectionReadTimeout` when no data arrives for `between_bytes`.
+///
+/// Wasmtime 47 applied `between_bytes_timeout` to every response itself; since
+/// 48 only upstream's own sender does, so a custom hook has to bound a stalled
+/// body or lose the bound entirely.
+fn harden_response_body(body: reqwest::Body, max: usize, between_bytes: Duration) -> WasiBody {
+    use wasmtime_wasi_http::Error;
+    let capped: WasiBody = http_body_util::Limited::new(body, max)
+        .map_err(move |e| {
+            if e.is::<http_body_util::LengthLimitError>() {
+                Error::HttpResponseBodySize(u64::try_from(max).ok())
+            } else {
+                Error::HttpProtocolError
+            }
+        })
+        .boxed_unsync();
+    BetweenBytesTimeout::new(capped, between_bytes).boxed_unsync()
+}
+
+/// A response body that fails with `ConnectionReadTimeout` when no frame
+/// arrives within `timeout` of the previous one (or of the headers). One timer
+/// per body, reset per frame — no allocation on the data path.
+struct BetweenBytesTimeout {
+    inner: WasiBody,
+    timeout: Duration,
+    idle: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl BetweenBytesTimeout {
+    fn new(inner: WasiBody, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            idle: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+}
+
+impl Body for BetweenBytesTimeout {
+    type Data = Bytes;
+    type Error = wasmtime_wasi_http::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                let next = tokio::time::Instant::now() + this.timeout;
+                this.idle.as_mut().reset(next);
+                Poll::Ready(frame)
+            }
+            Poll::Pending => match this.idle.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    Poll::Ready(Some(Err(wasmtime_wasi_http::Error::ConnectionReadTimeout)))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegix_workflow_job_protocol::{LlmTier, WriteCeiling};
+
+    fn target(method: &str, authority: &str) -> WasiHttpTarget {
+        WasiHttpTarget {
+            method: method.to_string(),
+            scheme: Some(wt::Scheme::Https),
+            authority: Some(authority.to_string()),
+        }
+    }
+
+    struct P {
+        hosts: Vec<String>,
+        methods: Vec<String>,
+        tier: LlmTier,
+        local: bool,
+        write: WriteCeiling,
+        verb: Option<WriteCeiling>,
+        enforced: bool,
+    }
+
+    impl Default for P {
+        fn default() -> Self {
+            Self {
+                hosts: vec!["api.example.com".into()],
+                methods: vec!["GET".into(), "POST".into()],
+                tier: LlmTier::Tier2,
+                local: false,
+                write: WriteCeiling::Write,
+                verb: None,
+                enforced: false,
+            }
+        }
+    }
+
+    fn admit(t: &WasiHttpTarget, p: &P) -> Result<WasiHttpAdmitted, WasiHttpRefusal> {
+        wasi_http_admission(
+            t,
+            &WasiHttpPolicy {
+                allowed_hosts: &p.hosts,
+                allowed_methods: &p.methods,
+                max_llm_tier: p.tier,
+                local_egress_only: p.local,
+                max_write_ceiling: p.write,
+                http_verb_ceiling: p.verb,
+                write_ceiling_enforced: p.enforced,
+                strict_egress: false,
+                insecure_http_opt_in: false,
+            },
+        )
+    }
+
+    fn policy_of(r: Result<WasiHttpAdmitted, WasiHttpRefusal>) -> &'static str {
+        r.expect_err("expected a refusal").policy
+    }
+
+    /// Control: a request every gate admits.
+    #[test]
+    fn an_allowed_host_and_verb_is_admitted() {
+        let a = admit(&target("GET", "api.example.com"), &P::default()).unwrap();
+        assert_eq!(a.host, "api.example.com");
+        assert_eq!(a.host_for_limit, "api.example.com:443");
+        assert!(!a.mutates);
+    }
+
+    /// The upstream handler had NONE of these.
+    #[test]
+    fn the_talos_http_gate_set_applies() {
+        let p = P::default();
+        assert_eq!(
+            policy_of(admit(&target("GET", "evil.example.org"), &p)),
+            "allowed-hosts"
+        );
+        let star = P {
+            hosts: vec!["*".into()],
+            ..P::default()
+        };
+        // SSRF on an IP-literal authority, including a decimal spelling of
+        // loopback and the cloud metadata endpoint — even under `*`.
+        for a in [
+            "127.0.0.1",
+            "2130706433",
+            "169.254.169.254",
+            "[::1]",
+            "10.0.0.5:8080",
+        ] {
+            let pol = policy_of(admit(&target("GET", a), &star));
+            assert!(
+                pol.starts_with("private-ip")
+                    || pol.contains("metadata")
+                    || pol.starts_with("link-local"),
+                "{a}: {pol}"
+            );
+        }
+        assert_eq!(
+            policy_of(admit(
+                &target("GET", "api.example.com"),
+                &P {
+                    hosts: vec![],
+                    ..P::default()
+                }
+            )),
+            "no-allowlist-configured"
+        );
+        // Method allowlist: an undeclared verb, and verbs outside the closed set.
+        for m in ["DELETE", "HEAD", "CONNECT", "TRACE", "PROPFIND"] {
+            assert_eq!(
+                policy_of(admit(&target(m, "api.example.com"), &p)),
+                "method-allowlist",
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_posture_applies_on_this_channel_too() {
+        let star = P {
+            hosts: vec!["*".into()],
+            ..P::default()
+        };
+        // Tier 1: provider hostname and public literals refused.
+        let t1 = P {
+            tier: LlmTier::Tier1,
+            ..star
+        };
+        assert_eq!(
+            policy_of(admit(&target("POST", "api.anthropic.com"), &t1)),
+            "tier1-llm-egress"
+        );
+        assert_eq!(
+            policy_of(admit(&target("GET", "8.8.8.8"), &t1)),
+            "tier1-public-ip-egress"
+        );
+        // Tier 2 + local-only egress: a public literal is refused.
+        let local = P {
+            hosts: vec!["*".into()],
+            local: true,
+            ..P::default()
+        };
+        assert_eq!(
+            policy_of(admit(&target("GET", "8.8.8.8"), &local)),
+            "local-egress-public-ip"
+        );
+    }
+
+    /// The write ceiling applies on its VERB axis, override included.
+    #[test]
+    fn the_write_ceiling_governs_mutating_verbs() {
+        let ro = P {
+            write: WriteCeiling::ReadOnly,
+            enforced: true,
+            ..P::default()
+        };
+        let r = admit(&target("POST", "api.example.com"), &ro).unwrap_err();
+        assert_eq!(r.policy, "write-ceiling");
+        assert!(
+            r.detail.is_some(),
+            "the verb-rule detail travels with the refusal"
+        );
+        // A read is still admitted.
+        assert!(admit(&target("GET", "api.example.com"), &ro).is_ok());
+        // The verb override lifts it, exactly as on aegix:core/http.
+        let granted = P {
+            verb: Some(WriteCeiling::Write),
+            ..ro
+        };
+        assert!(admit(&target("POST", "api.example.com"), &granted).is_ok());
+        // Unenforced deployments refuse nothing on this axis.
+        let off = P {
+            write: WriteCeiling::ReadOnly,
+            ..P::default()
+        };
+        assert!(admit(&target("POST", "api.example.com"), &off).is_ok());
+    }
+
+    #[test]
+    fn plaintext_and_other_schemes_are_refused() {
+        let mut t = target("GET", "api.example.com");
+        t.scheme = Some(wt::Scheme::Http);
+        assert_eq!(policy_of(admit(&t, &P::default())), "insecure-scheme");
+        t.scheme = Some(wt::Scheme::Other("ftp".into()));
+        assert!(admit(&t, &P::default()).is_err());
+    }
+
+    /// Control for the round-trip rule: well-formed ports and userinfo pass.
+    #[test]
+    fn a_well_formed_authority_round_trips() {
+        let p = P::default();
+        let a = admit(&target("GET", "api.example.com:8443"), &p).unwrap();
+        assert_eq!(a.host_for_limit, "api.example.com:8443");
+        assert!(admit(&target("GET", "user:pw@api.example.com"), &p).is_ok());
+        let star = P {
+            hosts: vec!["*".into()],
+            ..P::default()
+        };
+        assert_eq!(
+            policy_of(admit(&target("GET", "[::1]:8080"), &star)),
+            policy_of(admit(&target("GET", "[::1]"), &star)),
+            "an IPv6 literal with a port is still judged as that literal"
+        );
+    }
+
+    #[test]
+    fn a_malformed_authority_is_refused() {
+        for a in [
+            "",
+            "evil.com/@api.example.com",
+            "api.example.com:99999",
+            "api.example.com:",
+            "api.example.com:0443",
+        ] {
+            let r = admit(&target("GET", a), &P::default());
+            assert!(r.is_err(), "{a:?}: {r:?}");
+        }
+    }
+
+    // ── The handler itself, on a real context ─────────────────────────────
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn trusted_ctx(hosts: &[&str], methods: &[&str]) -> AegixContext {
+        AegixContext::new(
+            crate::wit_inspector::CapabilityWorld::Trusted,
+            hosts.iter().map(|h| (*h).to_string()).collect(),
+            methods.iter().map(|m| (*m).to_string()).collect(),
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds")
+    }
+
+    fn push_request(
+        ctx: &mut AegixContext,
+        method: wt::Method,
+        authority: &str,
+    ) -> Resource<HostOutgoingRequest> {
+        ctx.table
+            .push(HostOutgoingRequest {
+                method,
+                scheme: Some(wt::Scheme::Https),
+                authority: Some(authority.to_string()),
+                path_with_query: Some("/x".to_string()),
+                headers: Default::default(),
+                body: None,
+            })
+            .expect("push request")
+    }
+
+    fn error_code(e: wasmtime_wasi_http::p2::HttpError) -> wt::ErrorCode {
+        e.downcast().expect("a guest-visible ErrorCode, not a trap")
+    }
+
+    /// A refused request is refused BY THE HANDLER, recorded to the guest
+    /// diagnostic sink AND the WORM ledger, and its resource is consumed.
+    #[tokio::test]
+    async fn a_refused_request_is_recorded_and_never_sent() {
+        let mut ctx = trusted_ctx(&["api.example.com"], &["GET"]);
+        let sink: crate::context::HostDiagSink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        ctx.host_diag_sink = Some(sink.clone());
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "exec",
+        )));
+        ctx.set_audit_ledger(ledger.clone());
+
+        let req = push_request(&mut ctx, wt::Method::Get, "169.254.169.254");
+        let rep = req.rep();
+        let err = gated_handle(&mut ctx, req, None).expect_err("SSRF target refused");
+        assert!(matches!(error_code(err), wt::ErrorCode::HttpRequestDenied));
+
+        let lines = sink.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("http-fetch denied by policy")
+                    && l.contains("wasi:http 169.254.169.254")),
+            "{lines:?}"
+        );
+        assert_eq!(ledger.lock().await.current_sequence, 1, "one ledger event");
+        assert!(
+            ctx.table
+                .get(&Resource::<HostOutgoingRequest>::new_own(rep))
+                .is_err(),
+            "the refused request's resource was consumed"
+        );
+    }
+
+    /// Dry-run: a mutating verb is answered with a mock, never sent.
+    #[tokio::test]
+    async fn dry_run_mocks_a_mutating_request() {
+        let mut ctx = trusted_ctx(&["api.example.com"], &["POST"]);
+        ctx.set_dry_run(true);
+        let req = push_request(&mut ctx, wt::Method::Post, "api.example.com");
+        let fut = gated_handle(&mut ctx, req, None).expect("mocked");
+        let fut = ctx.table.delete(fut).unwrap();
+        let HostFutureIncomingResponse::Ready(Ok((resp, _io))) = fut else {
+            panic!("answered in place with a mock, not sent");
+        };
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["x-talos-dry-run"], "true");
+    }
+
+    /// An admitted request reaches the SEND path (a pending future from the
+    /// hardened hooks), and spends one unit of the shared HTTP budget.
+    #[tokio::test]
+    async fn an_admitted_request_is_sent_and_charged() {
+        let mut ctx = trusted_ctx(&["api.example.com"], &["GET"]);
+        let before = ctx
+            .http_call_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let req = push_request(&mut ctx, wt::Method::Get, "api.example.com");
+        let fut = gated_handle(&mut ctx, req, None).expect("admitted");
+        let fut = ctx.table.delete(fut).unwrap();
+        assert!(
+            matches!(fut, HostFutureIncomingResponse::Pending(_)),
+            "handed to the send path, which runs in a task"
+        );
+        assert_eq!(
+            ctx.http_call_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+        // A refusal spends nothing.
+        let req = push_request(&mut ctx, wt::Method::Get, "evil.example.org");
+        assert!(gated_handle(&mut ctx, req, None).is_err());
+        assert_eq!(
+            ctx.http_call_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+    }
+
+    /// E2-1 (2026-10-15): the send goes only where the gate judged. A request
+    /// whose URI names a host:port the gate did not admit — what an upstream
+    /// URI-builder bug (RUSTSEC-2026-0350) produced — is refused before any
+    /// connection: the listener it names is never reached, even under the
+    /// opt-in that lets this context reach loopback. CONTROL: once that
+    /// destination is admitted, the same request reaches it.
+    #[tokio::test]
+    async fn a_request_sent_to_another_destination_than_the_admitted_one_is_refused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _read = sock.read(&mut buf).await;
+                let _written = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let opted = trusted_ctx(&["localhost"], &["GET"]).with_dev_egress(
+            crate::context::DevEgressOptIns {
+                private_host_targets: true,
+                insecure_http: true,
+            },
+        );
+        let mut hooks = HardenedWasiHttpHooks::new(opted.http_client.clone());
+        hooks.admit("api.example.test:443".to_string());
+        let refused = Pin::from(hooks.send_request(
+            get_localhost(port),
+            options(),
+            Box::new(std::future::ready(Ok(()))),
+        ))
+        .await;
+        assert!(
+            matches!(refused, Err(wasmtime_wasi_http::Error::HttpRequestDenied)),
+            "a destination the gate did not admit is refused: {:?}",
+            refused.map(|(r, _)| r.status())
+        );
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing connected"
+        );
+
+        hooks.admit(format!("localhost:{port}"));
+        let reached = Pin::from(hooks.send_request(
+            get_localhost(port),
+            options(),
+            Box::new(std::future::ready(Ok(()))),
+        ))
+        .await
+        .map(|(r, _)| r.status());
+        assert!(
+            matches!(reached, Ok(status) if status == 200),
+            "{reached:?}"
+        );
+    }
+
+    /// The gate reads the insecure-HTTP opt-in from ITS context: a plaintext
+    /// request is refused as `insecure-scheme` unless this context opted in,
+    /// whatever any other context in the process was built with. CONTROL: the
+    /// same request under the stated opt-ins is handed to the send path (a
+    /// loopback listener, so nothing leaves the host).
+    #[tokio::test]
+    async fn a_plaintext_request_is_refused_unless_this_context_opted_in() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = format!("localhost:{}", listener.local_addr().unwrap().port());
+        let push_plaintext = |ctx: &mut AegixContext| {
+            ctx.table
+                .push(HostOutgoingRequest {
+                    method: wt::Method::Get,
+                    scheme: Some(wt::Scheme::Http),
+                    authority: Some(authority.clone()),
+                    path_with_query: Some("/x".to_string()),
+                    headers: Default::default(),
+                    body: None,
+                })
+                .expect("push request")
+        };
+
+        let mut ctx = trusted_ctx(&["localhost"], &["GET"])
+            .with_dev_egress(crate::context::DevEgressOptIns::default());
+        let sink: crate::context::HostDiagSink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        ctx.host_diag_sink = Some(sink.clone());
+        let req = push_plaintext(&mut ctx);
+        assert!(
+            gated_handle(&mut ctx, req, None).is_err(),
+            "no opt-in: plaintext refused"
+        );
+        let lines = sink.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|l| l.contains("insecure-scheme")),
+            "refused BY the scheme gate: {lines:?}"
+        );
+
+        let mut opted = trusted_ctx(&["localhost"], &["GET"])
+            .with_dev_egress(crate::context::DevEgressOptIns::LOOPBACK);
+        let req = push_plaintext(&mut opted);
+        let fut = gated_handle(&mut opted, req, None).expect("control: admitted under the opt-in");
+        let fut = opted.table.delete(fut).unwrap();
+        assert!(matches!(fut, HostFutureIncomingResponse::Pending(_)));
+    }
+
+    // ── The send path: connect-time SSRF ──────────────────────────────────
+
+    fn get_localhost(port: u16) -> http::Request<WasiBody> {
+        let body: WasiBody = http_body_util::Empty::<Bytes>::new()
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed_unsync();
+        http::Request::builder()
+            .method("GET")
+            .uri(format!("http://localhost:{port}/"))
+            .body(body)
+            .unwrap()
+    }
+
+    fn options() -> Option<RequestOptions> {
+        Some(RequestOptions {
+            connect_timeout: Some(Duration::from_secs(5)),
+            first_byte_timeout: Some(Duration::from_secs(5)),
+            between_bytes_timeout: Some(Duration::from_secs(5)),
+        })
+    }
+
+    /// A HOSTNAME that resolves to loopback is refused at connect by the
+    /// hardened send path — the case the gate cannot see (it runs before DNS).
+    /// CONTROL: upstream's default send path, which this replaced, reaches the
+    /// same listener. Both directions run against one live socket.
+    ///
+    /// The refusing context runs with both dev opt-ins OFF, stated on it
+    /// rather than inherited: until 2026-10-06 the toggle was read from the
+    /// process environment, sibling tests set it, and under plain `cargo test`
+    /// this assertion saw `Ok(200)`. SECOND CONTROL: the same hardened path
+    /// under the stated private-target opt-in reaches the listener, so the
+    /// refusal is the private-address rule and not a path that cannot connect.
+    #[tokio::test]
+    async fn the_send_path_refuses_a_name_that_resolves_private_where_upstream_connected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _read = sock.read(&mut buf).await;
+                let _written = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+
+        // Control: the path this replaced connects to loopback.
+        let (reached, io) =
+            wasmtime_wasi_http::default_send_request(get_localhost(port), options())
+                .await
+                .expect("control: upstream's raw connect reaches the loopback listener");
+        let driver = tokio::spawn(io);
+        assert_eq!(reached.status(), 200);
+        driver.abort();
+
+        let ctx = trusted_ctx(&["localhost"], &["GET"])
+            .with_dev_egress(crate::context::DevEgressOptIns::default());
+        let mut hooks = HardenedWasiHttpHooks::new(ctx.http_client.clone());
+        hooks.admit(format!("localhost:{port}"));
+        let refused = Pin::from(hooks.send_request(
+            get_localhost(port),
+            options(),
+            Box::new(std::future::ready(Ok(()))),
+        ))
+        .await;
+        assert!(
+            matches!(refused, Err(wasmtime_wasi_http::Error::ConnectionRefused)),
+            "the hardened path refuses the resolved loopback address: {:?}",
+            refused.map(|(r, _)| r.status())
+        );
+
+        // Second control: what flips the verdict is the opt-in, and it is an
+        // argument to this context alone.
+        let opted = trusted_ctx(&["localhost"], &["GET"]).with_dev_egress(
+            crate::context::DevEgressOptIns {
+                private_host_targets: true,
+                insecure_http: false,
+            },
+        );
+        let mut hooks = HardenedWasiHttpHooks::new(opted.http_client.clone());
+        hooks.admit(format!("localhost:{port}"));
+        let reached = Pin::from(hooks.send_request(
+            get_localhost(port),
+            options(),
+            Box::new(std::future::ready(Ok(()))),
+        ))
+        .await
+        .map(|(r, _)| r.status());
+        assert!(
+            matches!(reached, Ok(status) if status == 200),
+            "control: the hardened path reaches the listener under the stated opt-in: {reached:?}"
+        );
+    }
+
+    // ── The response body: size cap and between-bytes idle timeout ────────
+
+    /// A body that yields `chunks`, then waits forever.
+    fn stalling_body(chunks: &'static [&'static [u8]]) -> reqwest::Body {
+        let data = futures_util::stream::iter(
+            chunks
+                .iter()
+                .map(|c| Ok::<Bytes, std::io::Error>(Bytes::from_static(c))),
+        );
+        reqwest::Body::wrap_stream(data.chain(futures_util::stream::pending()))
+    }
+
+    use futures_util::StreamExt as _;
+
+    /// Wasmtime 48 stopped applying `between_bytes_timeout` to a custom hook's
+    /// response, so the hardened path applies it: a body that stops mid-way
+    /// fails with `ConnectionReadTimeout` after the idle bound, having
+    /// delivered what arrived first.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_response_body_fails_after_the_between_bytes_bound() {
+        let mut body =
+            harden_response_body(stalling_body(&[b"partial"]), 1024, Duration::from_secs(5));
+        let first = body.frame().await.expect("a frame").expect("data");
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"partial"));
+        let started = tokio::time::Instant::now();
+        // Bounded from outside, so a missing idle timeout FAILS here (after 60
+        // virtual seconds) instead of hanging the test.
+        let stalled = tokio::time::timeout(Duration::from_secs(60), body.frame())
+            .await
+            .expect("the stalled body was not cut: no between-bytes bound")
+            .expect("an error frame");
+        assert!(
+            matches!(
+                stalled,
+                Err(wasmtime_wasi_http::Error::ConnectionReadTimeout)
+            ),
+            "{stalled:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    /// The bound is BETWEEN frames, not a total: a slow body that keeps
+    /// delivering within the bound is read to the end.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_body_that_keeps_arriving_is_read_in_full() {
+        let paced = futures_util::stream::iter(0..4).then(|i| async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok::<Bytes, std::io::Error>(Bytes::from(format!("{i}")))
+        });
+        let body = harden_response_body(
+            reqwest::Body::wrap_stream(paced),
+            1024,
+            Duration::from_secs(5),
+        );
+        let all = body.collect().await.expect("16 s in total, never 5 s idle");
+        assert_eq!(all.to_bytes(), Bytes::from_static(b"0123"));
+    }
+
+    /// The size cap still applies.
+    #[tokio::test]
+    async fn an_oversized_response_body_is_refused() {
+        let body = harden_response_body(
+            reqwest::Body::from(vec![b'x'; 2048]),
+            1024,
+            Duration::from_secs(5),
+        );
+        let err = body.collect().await.expect_err("over the cap");
+        assert!(
+            matches!(
+                err,
+                wasmtime_wasi_http::Error::HttpResponseBodySize(Some(1024))
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The hardened path wraps every response through the hardening above.
+    /// TEXTUAL: the hardened client refuses loopback by design, so no local
+    /// test can carry a real response through `send_via_hardened_client`.
+    #[test]
+    fn the_send_path_hardens_every_response_body() {
+        let src = code_only(include_str!("wasi_http.rs"));
+        let body = fn_body(&src, "async fn send_via_hardened_client(");
+        assert!(
+            body.contains(
+                "harden_response_body(body, max_response_bytes(), between_bytes_timeout)"
+            ),
+            "{body}"
+        );
+    }
+
+    // ── E-9 (2026-10-14): the send path's parity caps ─────────────────────
+    // Driven through `send_via_hardened_client` itself with a PLAIN client
+    // (no SSRF resolver), so a loopback listener can answer: what is under
+    // test is the caps this function applies, not the resolver, which has
+    // its own tests above.
+
+    fn plain_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client")
+    }
+
+    fn wasi_body(bytes: Vec<u8>) -> WasiBody {
+        http_body_util::Full::new(Bytes::from(bytes))
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed_unsync()
+    }
+
+    fn post(port: u16, body: Vec<u8>) -> http::Request<WasiBody> {
+        http::Request::builder()
+            .method("POST")
+            .uri(format!("http://127.0.0.1:{port}/x"))
+            .body(wasi_body(body))
+            .expect("request")
+    }
+
+    /// A loopback listener that reads what it is sent and answers with `raw`.
+    async fn answering(raw: Vec<u8>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(&raw).await;
+                let _ = s.flush().await;
+            }
+        });
+        port
+    }
+
+    fn ok_response(extra_headers: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n{extra_headers}\r\n{{}}"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn guest_timeouts_are_clamped_like_fetch() {
+        use super::super::limits::MAX_HTTP_TIMEOUT_MS;
+        let max = Duration::from_millis(u64::from(MAX_HTTP_TIMEOUT_MS));
+        // Unset: `fetch`'s default, no longer upstream's 600 s.
+        assert_eq!(
+            clamped_timeout(None),
+            Duration::from_millis(crate::circuit_breaker::clamp_guest_timeout_ms(None))
+        );
+        assert!(clamped_timeout(None) <= max);
+        assert_eq!(clamped_timeout(Some(Duration::from_secs(600))), max);
+        assert_eq!(
+            clamped_timeout(Some(Duration::from_secs(u64::MAX / 2))),
+            max
+        );
+        assert!(clamped_timeout(Some(Duration::from_millis(1))) > Duration::from_millis(1));
+    }
+
+    /// CONTROL for the cap tests below: an ordinary request is answered.
+    #[tokio::test]
+    async fn an_ordinary_request_is_answered() {
+        let port = answering(ok_response("")).await;
+        let resp = send_via_hardened_client(plain_client(), post(port, b"{}".to_vec()), None)
+            .await
+            .expect("answered");
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_request_body_is_refused() {
+        use super::super::limits::MAX_OUTBOUND_HTTP_BODY_BYTES;
+        let port = answering(ok_response("")).await;
+        let err = send_via_hardened_client(
+            plain_client(),
+            post(port, vec![b'x'; MAX_OUTBOUND_HTTP_BODY_BYTES + 1]),
+            None,
+        )
+        .await
+        .expect_err("over the cap");
+        assert!(
+            matches!(err, wasmtime_wasi_http::Error::HttpRequestBodySize(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_outbound_headers_are_refused_before_a_connect() {
+        use super::super::limits::MAX_OUTBOUND_HEADERS;
+        let mut req = post(1, b"{}".to_vec());
+        for i in 0..=MAX_OUTBOUND_HEADERS {
+            req.headers_mut().insert(
+                http::HeaderName::try_from(format!("x-h{i}")).unwrap(),
+                http::HeaderValue::from_static("v"),
+            );
+        }
+        let err = send_via_hardened_client(plain_client(), req, None)
+            .await
+            .expect_err("over the cap");
+        assert!(
+            matches!(
+                err,
+                wasmtime_wasi_http::Error::HttpRequestHeaderSectionSize(_)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_header_caps_apply() {
+        use super::super::limits::{MAX_INBOUND_HEADERS, MAX_INBOUND_HEADER_VALUE_BYTES};
+        let many: String = (0..=MAX_INBOUND_HEADERS)
+            .map(|i| format!("x-h{i}: v\r\n"))
+            .collect();
+        // Over HTTP/1 hyper refuses more than 100 response headers itself, so
+        // the count cap is asserted on the function the send path calls, and
+        // the wire leg only that the response is refused.
+        let port = answering(ok_response(&many)).await;
+        let r = send_via_hardened_client(plain_client(), post(port, b"{}".to_vec()), None).await;
+        assert!(r.is_err(), "too many headers");
+        let mut headers = http::HeaderMap::new();
+        for i in 0..=MAX_INBOUND_HEADERS {
+            headers.insert(
+                http::HeaderName::try_from(format!("x-h{i}")).unwrap(),
+                http::HeaderValue::from_static("v"),
+            );
+        }
+        assert!(matches!(
+            response_header_violation(&headers),
+            Some(wasmtime_wasi_http::Error::HttpResponseHeaderSectionSize(_))
+        ));
+        headers.remove("x-h0");
+        assert!(response_header_violation(&headers).is_none(), "at the cap");
+
+        let big = format!(
+            "x-big: {}\r\n",
+            "v".repeat(MAX_INBOUND_HEADER_VALUE_BYTES + 1)
+        );
+        let port = answering(ok_response(&big)).await;
+        let err = send_via_hardened_client(plain_client(), post(port, b"{}".to_vec()), None)
+            .await
+            .expect_err("a header value over the cap");
+        assert!(
+            matches!(
+                err,
+                wasmtime_wasi_http::Error::HttpResponseHeaderSize { ref field_name, .. }
+                    if field_name.as_deref() == Some("x-big")
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The process-global breaker `fetch` consults now gates this path too.
+    #[tokio::test]
+    async fn an_exhausted_circuit_refuses_without_sending() {
+        let port = answering(ok_response("")).await;
+        let key = format!("127.0.0.1:{port}");
+        crate::circuit_breaker::get_global_circuit_breaker().force_half_open(&key, 0);
+        let err = send_via_hardened_client(plain_client(), post(port, b"{}".to_vec()), None)
+            .await
+            .expect_err("circuit refuses");
+        assert!(
+            matches!(err, wasmtime_wasi_http::Error::DestinationUnavailable),
+            "{err:?}"
+        );
+    }
+
+    // ── Wiring pins ───────────────────────────────────────────────────────
+
+    /// Strip whole-line `//` comments, which quote the banned calls.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &src[start..];
+        &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+    }
+
+    /// The trusted linker links THIS handler, not upstream's. TEXTUAL, and it
+    /// says so: no test here instantiates a component that imports
+    /// `wasi:http`, so what proves the gate BEHAVES is `gated_handle`'s own
+    /// tests; this proves the linker reaches it. Lives outside `runtime.rs`
+    /// so reverting that file cannot delete its own pin.
+    #[test]
+    fn the_trusted_handler_is_the_gated_one() {
+        let runtime = code_only(include_str!("../runtime.rs"));
+        let body = fn_body(&runtime, "fn build_trusted_linker(");
+        let gated = format!("add_gated_{}(", "outgoing_handler");
+        let upstream = format!("add_only_http_to_{}(", "linker_async");
+        assert!(body.contains(&gated), "{body}");
+        assert!(
+            !body.contains(&upstream),
+            "upstream's ungated handler is back: {body}"
+        );
+    }
+
+    /// The send path is the hardened one, never `default_hooks()`.
+    #[test]
+    fn the_wasi_http_view_never_uses_default_hooks() {
+        let ctx_src = code_only(include_str!("../context.rs"));
+        let body = fn_body(
+            &ctx_src,
+            "impl wasmtime_wasi_http::WasiHttpView for AegixContext {",
+        );
+        assert!(body.contains("hooks: &mut self.wasi_http_hooks"), "{body}");
+        assert!(!body.contains(&format!("default_{}()", "hooks")), "{body}");
+    }
+}

@@ -1,0 +1,23 @@
+# What a build never needs, and what must never reach an image layer.
+**/target
+.git
+.github
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+compose.pinned.yaml
+
+# A build reads its Dockerfile and this file from disk, not from what is
+# copied in. Left out of that, an edit to either does not make every image
+# compile again.
+**/Dockerfile
+.dockerignore
+
+# The images are compiled by the toolchain their base image holds, which the
+# Dockerfiles name by digest. With this file in the build, rustup reads it,
+# finds the channel's newest patch release is not the one installed, and
+# downloads that one in the middle of the build: the compiler would then be
+# whatever was newest that day, not the one the digest names.
+rust-toolchain.toml

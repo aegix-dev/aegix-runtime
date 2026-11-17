@@ -1,0 +1,654 @@
+//! # Integration state NATS-RPC
+//!
+//! Wire protocol for the `integration-state` WIT host interface. Lets
+//! integration modules (gcal, gmail, jira, ...) persist scoped key/value
+//! state without adding per-integration tables to the core schema.
+//!
+//! ## Design
+//!
+//! Modeled on [`memory_rpc`] — request/reply over a single subject
+//! (`talos.integration_state.op`) multiplexed by a [`IntegrationOp`] enum.
+//! Same security envelope: HMAC-SHA256 signature bound to
+//! `(subject, actor_id, nonce, body)`, freshness window, nonce replay cache.
+//!
+//! ## Isolation boundary
+//!
+//! Rows are scoped by `(integration_name, user_id, key)`. BOTH
+//! `integration_name` and `user_id` MUST be derived by the controller
+//! from the module's execution context — NEVER from caller-supplied
+//! input. The WIT host function passes the module's compiled-in
+//! integration name (stored on `modules.integration_name`, formerly
+//! `node_templates`) + the executing user's uuid; guest code has no way to
+//! forge either. The SIGNER can: since 2026-11-06 the controller refuses a
+//! request whose `user_id` is not the owner of the signed actor, or (for a
+//! worker key) whose `integration_name` is not the bound job's module's
+//! (`aegix_rpc_subscribers::tenant_binding`). Until then neither was
+//! compared, and a worker key with one live dispatch reached any user's rows.
+//!
+//! ## Indexed slots
+//!
+//! Four generic indexed columns (`idx_str_1`, `idx_str_2`, `idx_ts_1`,
+//! `idx_int_1`) let integrations pick what to index at write time
+//! without needing install-time DDL. Each integration documents in its
+//! own codebase which slot maps to which logical field. Intentionally
+//! bounded to 4 slots: if you need more, that's the signal to graduate
+//! to a dedicated table with a migration.
+//!
+//! ## Limits
+//!
+//! - Value payload ≤ 64 KiB (mirrors [`super::persist_memory`] cap).
+//! - Keys ≤ 256 bytes, integration_name ≤ 64 bytes.
+//! - 10k rows per (integration, user) — controller rejects further writes
+//!   with [`IntegrationStateError::StorageFull`].
+//! - `list` results capped at [`MAX_RESULT_LIMIT`].
+
+use crate::dispatch_binding::{self, DispatchBinding};
+use crate::rpc_auth;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub const SUBJECT_INTEGRATION_STATE_OP: &str = "talos.integration_state.op";
+pub const SUBJECT_NAME: &str = "integration_state_rpc";
+
+pub const REQUEST_TIMEOUT_MS: u64 = 3_000;
+/// Controller-side concurrency cap — integration state is lower volume
+/// than memory ops, so a smaller semaphore is appropriate. Bumping
+/// beyond 8 mostly helps when many workflows wake up at once.
+pub const MAX_IN_FLIGHT: usize = 8;
+/// Maximum entries a single `List` request may ask for.
+pub const MAX_RESULT_LIMIT: u32 = 500;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IndexedSlots {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_str_1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_str_2: Option<String>,
+    /// epoch millis — the controller stores as TIMESTAMPTZ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_ts_1_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_int_1: Option<i64>,
+}
+
+impl IndexedSlots {
+    pub fn is_empty(&self) -> bool {
+        self.idx_str_1.is_none()
+            && self.idx_str_2.is_none()
+            && self.idx_ts_1_ms.is_none()
+            && self.idx_int_1.is_none()
+    }
+}
+
+/// Filter passed to `List`. Every field is an optional equality / range
+/// filter; unset fields are not enforced. `AND`-combined.
+///
+/// Wire-format note: the physical order of these fields matches the
+/// order they are emitted in [`sign_body_bytes`] for the
+/// `IntegrationOp::List` variant. New fields MUST be appended to the
+/// end of both places; reordering breaks every deployed signature.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListFilter {
+    /// Only return rows whose key starts with this prefix. Useful for
+    /// namespacing within an integration (e.g. `watch_channel/` for
+    /// gcal's watch channels vs `subscription/` for push subscriptions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_prefix: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_str_1_eq: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_str_2_eq: Option<String>,
+
+    /// Inclusive lower bound on idx_ts_1 (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_ts_1_gte_ms: Option<i64>,
+    /// Exclusive upper bound on idx_ts_1 (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_ts_1_lt_ms: Option<i64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idx_int_1_eq: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum IntegrationOp {
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        /// JSON-encoded opaque value. Parsed as JSON by the controller
+        /// (to catch malformed input early) but preserved verbatim.
+        value: serde_json::Value,
+        /// Optional TTL. If set, the row has `expires_at = now + ttl_seconds`.
+        /// None leaves expires_at NULL (no TTL).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "IndexedSlots::is_empty")]
+        slots: IndexedSlots,
+    },
+    Delete {
+        key: String,
+    },
+    List {
+        #[serde(default)]
+        filter: ListFilter,
+        /// Max rows to return. Clamped to MAX_RESULT_LIMIT.
+        limit: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrationStateRequest {
+    /// The module's compiled-in integration name. The controller refuses a
+    /// worker-key request whose name is not the bound job's
+    /// `modules.integration_name` (2026-11-06; until then this comment said
+    /// it validated it, and nothing did) — a module cannot claim to be a
+    /// different integration.
+    pub integration_name: String,
+    pub actor_id: Uuid,
+    /// The executing user. Must be the owner of `actor_id`; the controller
+    /// refuses any other (2026-11-06).
+    pub user_id: Uuid,
+    /// The whole op, wrapped so its signature covers the EXACT wire text
+    /// — `IntegrationOp::Set.value` (a `serde_json::Value`) is bound as
+    /// raw bytes with no re-derivation. See [`rpc_auth::RawSigned`] and
+    /// the memory-RPC twin `memory_rpc::MemoryRpcRequest::op`.
+    pub op: rpc_auth::RawSigned<IntegrationOp>,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: Vec<u8>,
+    /// RFC 0010 P2 inc.3 — signer identity (empty under HMAC, worker id under
+    /// Ed25519). See `MemoryRpcRequest::worker_id`.
+    #[serde(default)]
+    pub worker_id: String,
+    /// Unsigned scheme hint: 0 = HMAC, 1 = Ed25519. See
+    /// `MemoryRpcRequest::crypto_scheme`.
+    #[serde(default)]
+    pub crypto_scheme: u8,
+    /// The dispatch this call is made for (2026-10-29): the job's run and its
+    /// own `module_executions` row, signed. Absent only from a caller that
+    /// runs no dispatch — the controller's rehearsal runtime — and from a
+    /// worker older than the field. Absent, the wire and the signed body are
+    /// byte-identical to before the field. See [`crate::dispatch_binding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<DispatchBinding>,
+}
+
+impl IntegrationStateRequest {
+    /// An UNBOUND request — see `MemoryRpcRequest::new_signed`. A worker's
+    /// host call uses [`Self::new_signed_bound`].
+    pub fn new_signed(
+        integration_name: String,
+        actor_id: Uuid,
+        user_id: Uuid,
+        op: IntegrationOp,
+    ) -> Option<Self> {
+        Self::new_signed_bound(integration_name, actor_id, None, user_id, op)
+    }
+
+    pub fn new_signed_bound(
+        integration_name: String,
+        actor_id: Uuid,
+        dispatch: Option<DispatchBinding>,
+        user_id: Uuid,
+        op: IntegrationOp,
+    ) -> Option<Self> {
+        if !validate_integration_name(&integration_name) {
+            return None;
+        }
+        validate_op(&op)?;
+        let timestamp_ms = rpc_auth::now_ms();
+        let nonce = rpc_auth::random_nonce();
+        // Mint the exact wire text once (host/integration_state.rs already
+        // parsed the guest string to a `Value` before building the op).
+        let op = rpc_auth::RawSigned::from(op);
+        let body = sign_body_bytes(
+            &integration_name,
+            user_id,
+            &op,
+            timestamp_ms,
+            dispatch.as_ref(),
+        );
+        let (signature, worker_id, crypto_scheme) =
+            rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body)?;
+        Some(Self {
+            integration_name,
+            actor_id,
+            user_id,
+            op,
+            timestamp_ms,
+            nonce,
+            signature,
+            worker_id,
+            crypto_scheme,
+            dispatch,
+        })
+    }
+
+    /// See `memory_rpc::MemoryRpcRequest::verify` for the classification
+    /// contract: controller-side diagnosis only, gate order unchanged.
+    /// `integration_name` and the op's caps both classify as
+    /// `OversizedStructure` — they are the same cheap shape gate, and the
+    /// taxonomy deliberately stays coarse (one token per gate KIND, never one
+    /// per field, which would start describing the caller's bytes).
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
+        if !rpc_auth::verify_freshness(self.timestamp_ms) {
+            return Err(VerifyFailure::Stale);
+        }
+        if !validate_integration_name(&self.integration_name) {
+            return Err(VerifyFailure::OversizedStructure);
+        }
+        if validate_op(self.op.get()).is_none() {
+            return Err(VerifyFailure::OversizedStructure);
+        }
+        let body = sign_body_bytes(
+            &self.integration_name,
+            self.user_id,
+            &self.op,
+            self.timestamp_ms,
+            self.dispatch.as_ref(),
+        );
+        rpc_auth::verify_rpc(
+            SUBJECT_NAME,
+            self.actor_id,
+            &self.nonce,
+            &body,
+            &self.worker_id,
+            &self.signature,
+            self.crypto_scheme,
+        )
+    }
+}
+
+/// integration_name constraints mirror the DB CHECK: 1..=64 bytes,
+/// lowercase alphanumeric + hyphens + underscores. Tighter than the DB
+/// so clients fail at sign time with a clear error instead of at
+/// write time with a Postgres CHECK violation.
+fn validate_integration_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// Reject payloads that would be unsafe to sign or that violate the
+/// controller's known caps, BEFORE the signed bytes are generated.
+fn validate_op(op: &IntegrationOp) -> Option<()> {
+    // Slot strings are indexed — oversized values would bloat both the
+    // row AND the btree index, and a single misbehaving integration
+    // could poison shared disk. 512 bytes is generous for typical use
+    // (uuids, handles, short labels) and within Postgres's 2 KB btree
+    // entry limit. The 64 KiB value cap above only counts `value`, not
+    // slots, so slot strings need their own ceiling.
+    const MAX_SLOT_STR_LEN: usize = 512;
+    // chrono::DateTime<Utc> approximate safe range: years 0001..9999 in
+    // epoch ms. Out-of-range values get silently dropped by
+    // `timestamp_millis_opt(..).single()` inside the subscriber, which
+    // would leave the indexed column NULL even though the caller thinks
+    // they set it. Reject at sign time so the failure is loud.
+    const MIN_TS_MS: i64 = -62_167_219_200_000;
+    const MAX_TS_MS: i64 = 253_402_300_799_999;
+
+    let validate_slots = |s: &IndexedSlots| -> bool {
+        if let Some(v) = &s.idx_str_1 {
+            if v.len() > MAX_SLOT_STR_LEN {
+                return false;
+            }
+        }
+        if let Some(v) = &s.idx_str_2 {
+            if v.len() > MAX_SLOT_STR_LEN {
+                return false;
+            }
+        }
+        if let Some(ts) = s.idx_ts_1_ms {
+            if !(MIN_TS_MS..=MAX_TS_MS).contains(&ts) {
+                return false;
+            }
+        }
+        true
+    };
+
+    match op {
+        IntegrationOp::Get { key } | IntegrationOp::Delete { key } => {
+            if key.is_empty() || key.len() > 256 {
+                return None;
+            }
+        }
+        IntegrationOp::Set {
+            key,
+            value,
+            ttl_seconds,
+            slots,
+        } => {
+            if key.is_empty() || key.len() > 256 {
+                return None;
+            }
+            // Serialize once here to catch the 64 KiB cap at sign time
+            // rather than after the controller round-trip. Small waste
+            // of cycles, big gain in error clarity.
+            let approx = value.to_string().len();
+            if approx > 64 * 1024 {
+                return None;
+            }
+            if let Some(t) = ttl_seconds {
+                // Cap TTL at 10 years so an int-overflow bug in the
+                // caller can't poison the row with a ridiculous expiry.
+                if *t > 10 * 365 * 24 * 3600 {
+                    return None;
+                }
+            }
+            if !validate_slots(slots) {
+                return None;
+            }
+        }
+        IntegrationOp::List { filter, limit } => {
+            if *limit == 0 {
+                return None;
+            }
+            // Same caps on filter strings — a rogue integration shouldn't
+            // be able to submit a multi-MB idx_str_1_eq and force a
+            // full-table index scan with a huge bound.
+            if filter.key_prefix.as_ref().is_some_and(|s| s.len() > 256) {
+                return None;
+            }
+            if filter
+                .idx_str_1_eq
+                .as_ref()
+                .is_some_and(|s| s.len() > MAX_SLOT_STR_LEN)
+            {
+                return None;
+            }
+            if filter
+                .idx_str_2_eq
+                .as_ref()
+                .is_some_and(|s| s.len() > MAX_SLOT_STR_LEN)
+            {
+                return None;
+            }
+            if let Some(ts) = filter.idx_ts_1_gte_ms {
+                if !(MIN_TS_MS..=MAX_TS_MS).contains(&ts) {
+                    return None;
+                }
+            }
+            if let Some(ts) = filter.idx_ts_1_lt_ms {
+                if !(MIN_TS_MS..=MAX_TS_MS).contains(&ts) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// The signed body: the envelope fields (`integration_name`, `user_id`,
+/// freshness timestamp) followed by the EXACT wire bytes of the op.
+///
+/// Layout:
+///
+///   integration_name_len (u32 LE) || integration_name_bytes ||
+///   user_id (16 bytes) ||
+///   timestamp_ms (i64 LE) ||
+///   op.raw_bytes()
+///
+/// `integration_name` and `user_id` are envelope fields (NOT part of the
+/// op enum) so they keep their fixed length-prefixed / 16-byte encoding —
+/// binding them here is what makes a gcal signature unusable as a gmail
+/// one and blocks cross-user replay. `op.raw_bytes()` is the JSON text of
+/// the op as it appears on the wire: minted once at construction, captured
+/// verbatim on deserialise, never re-derived. That replaces the old
+/// hand-built body that re-serialised `IntegrationOp::Set.value` via
+/// `canonical_json_bytes`, where serde_json's non-idempotent float round
+/// trip made an honest sender and receiver disagree (#598). Because the
+/// receiver hashes the sender's exact bytes, this also removes the old
+/// dependence on key ordering and serde enum-tag stability.
+///
+/// WIRE-FORMAT STABILITY: the envelope prefix order is load-bearing and
+/// the op text is bound verbatim. Changing the prefix layout — or moving
+/// to/from raw-bytes op binding — invalidates every deployed signature and
+/// must be a coordinated controller+worker deploy.
+///
+/// A present dispatch binding is appended LAST (`dispatch_binding::append_signed`,
+/// 2026-10-29); absent, nothing is appended and the body is what it was.
+fn sign_body_bytes(
+    integration_name: &str,
+    user_id: Uuid,
+    op: &rpc_auth::RawSigned<IntegrationOp>,
+    timestamp_ms: i64,
+    dispatch: Option<&DispatchBinding>,
+) -> Vec<u8> {
+    let raw = op.raw_bytes();
+    let mut buf = Vec::with_capacity(
+        4 + integration_name.len() + 16 + 8 + raw.len() + dispatch_binding::SIGNED_LEN,
+    );
+    buf.extend_from_slice(&(integration_name.len() as u32).to_le_bytes());
+    buf.extend_from_slice(integration_name.as_bytes());
+    buf.extend_from_slice(user_id.as_bytes());
+    buf.extend_from_slice(&timestamp_ms.to_le_bytes());
+    buf.extend_from_slice(raw);
+    dispatch_binding::append_signed(&mut buf, dispatch);
+    buf
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrationStateReply {
+    pub result: Result<IntegrationOpResult, IntegrationStateError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntegrationOpResult {
+    Ok,
+    Entry { entry: StoredEntry },
+    Entries { entries: Vec<StoredEntry> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEntry {
+    pub key: String,
+    /// Value as JSON-encoded string (matches WIT `string` type).
+    pub value: String,
+    /// Epoch ms of last update (mirrors DB `updated_at`).
+    pub updated_at_ms: i64,
+    /// Epoch ms of scheduled expiry, None if no TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "IndexedSlots::is_empty")]
+    pub slots: IndexedSlots,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IntegrationStateError {
+    NotAvailable,
+    KeyNotFound,
+    InvalidInput(String),
+    Unauthorized,
+    /// Per-(integration, user) row cap exceeded.
+    StorageFull,
+    Internal(String),
+    Timeout,
+    /// The actor's `max_write_ceiling` refuses this mutation, or the ceiling
+    /// could not be read and the gate failed closed. Payload-free and
+    /// reason-blind for the caller — see
+    /// [`crate::memory_rpc::MemoryRpcError::WriteCeiling`], which carries the
+    /// full argument for both properties and the measured old-worker
+    /// behaviour. Appended last per the wire-format stability rule.
+    WriteCeiling,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn setup_key() {
+        rpc_auth::register_hmac_key(std::sync::Arc::new(vec![42u8; 32]));
+    }
+
+    #[test]
+    fn validates_integration_name() {
+        assert!(validate_integration_name("gcal"));
+        assert!(validate_integration_name("google-calendar"));
+        assert!(validate_integration_name("gmail_watches"));
+        assert!(validate_integration_name("a1"));
+        // Invalid cases
+        assert!(!validate_integration_name(""));
+        assert!(!validate_integration_name("GCal")); // uppercase
+        assert!(!validate_integration_name("g cal")); // space
+        assert!(!validate_integration_name("g/cal")); // slash
+        assert!(!validate_integration_name(&"x".repeat(65))); // too long
+    }
+
+    #[test]
+    fn rejects_oversized_value() {
+        setup_key();
+        let big = json!({ "blob": "x".repeat(70 * 1024) });
+        let op = IntegrationOp::Set {
+            key: "k".into(),
+            value: big,
+            ttl_seconds: None,
+            slots: IndexedSlots::default(),
+        };
+        let req = IntegrationStateRequest::new_signed("gcal".into(), Uuid::nil(), Uuid::nil(), op);
+        assert!(req.is_none(), "oversized value must fail at sign time");
+    }
+
+    #[test]
+    fn rejects_empty_key() {
+        setup_key();
+        let op = IntegrationOp::Get { key: "".into() };
+        let req = IntegrationStateRequest::new_signed("gcal".into(), Uuid::nil(), Uuid::nil(), op);
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn signature_binds_to_integration_name() {
+        setup_key();
+        // Same op + same user_id, different integration names must
+        // produce DIFFERENT signatures — otherwise a gcal module could
+        // replay a signature onto a gmail request.
+        let op_factory = || IntegrationOp::Get { key: "k".into() };
+        let actor = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        let a =
+            IntegrationStateRequest::new_signed("gcal".into(), actor, user, op_factory()).unwrap();
+        let b =
+            IntegrationStateRequest::new_signed("gmail".into(), actor, user, op_factory()).unwrap();
+
+        // Copy b's signature onto a's body — must fail verify.
+        let mut forged = a.clone();
+        forged.signature = b.signature.clone();
+        assert!(
+            forged.verify().is_err(),
+            "cross-integration replay must be rejected"
+        );
+    }
+
+    #[test]
+    fn signature_binds_to_user_id() {
+        setup_key();
+        let actor = Uuid::new_v4();
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        let op = IntegrationOp::Get { key: "k".into() };
+        let a = IntegrationStateRequest::new_signed("gcal".into(), actor, u1, op.clone()).unwrap();
+        let b = IntegrationStateRequest::new_signed("gcal".into(), actor, u2, op).unwrap();
+
+        let mut forged = a.clone();
+        forged.signature = b.signature.clone();
+        assert!(
+            forged.verify().is_err(),
+            "cross-user replay must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_slot_strings() {
+        setup_key();
+        let big = "x".repeat(1024);
+        let op = IntegrationOp::Set {
+            key: "k".into(),
+            value: serde_json::json!({}),
+            ttl_seconds: None,
+            slots: IndexedSlots {
+                idx_str_1: Some(big),
+                ..Default::default()
+            },
+        };
+        let req = IntegrationStateRequest::new_signed("gcal".into(), Uuid::nil(), Uuid::nil(), op);
+        assert!(req.is_none(), "oversized idx_str_1 must fail at sign time");
+    }
+
+    #[test]
+    fn rejects_out_of_range_idx_ts() {
+        setup_key();
+        let op = IntegrationOp::Set {
+            key: "k".into(),
+            value: serde_json::json!({}),
+            ttl_seconds: None,
+            slots: IndexedSlots {
+                idx_ts_1_ms: Some(i64::MAX),
+                ..Default::default()
+            },
+        };
+        let req = IntegrationStateRequest::new_signed("gcal".into(), Uuid::nil(), Uuid::nil(), op);
+        assert!(
+            req.is_none(),
+            "i64::MAX idx_ts_1_ms must fail at sign time (chrono out of range)"
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_filter_strings() {
+        setup_key();
+        let big = "x".repeat(1024);
+        let op = IntegrationOp::List {
+            filter: ListFilter {
+                idx_str_1_eq: Some(big),
+                ..Default::default()
+            },
+            limit: 10,
+        };
+        let req = IntegrationStateRequest::new_signed("gcal".into(), Uuid::nil(), Uuid::nil(), op);
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn set_value_key_order_does_not_affect_signed_bytes() {
+        // Build the same logical value two ways. `serde_json::Value::Object`
+        // is a BTreeMap (no `preserve_order` in this workspace), so both
+        // orderings serialise to the SAME wire text — and RawSigned binds
+        // that exact text, so the signed bodies are byte-identical. (Unlike
+        // the old canonical scheme this is a property of serde_json's Map,
+        // not of a re-sorting pass; if `preserve_order` were ever enabled
+        // the two would legitimately diverge, which is correct — the
+        // signature covers the literal wire bytes.)
+        setup_key();
+        let actor = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        let op1 = IntegrationOp::Set {
+            key: "k".into(),
+            value: json!({"a": 1, "b": 2}),
+            ttl_seconds: None,
+            slots: IndexedSlots::default(),
+        };
+        let op2 = IntegrationOp::Set {
+            key: "k".into(),
+            value: json!({"b": 2, "a": 1}),
+            ttl_seconds: None,
+            slots: IndexedSlots::default(),
+        };
+        let a = IntegrationStateRequest::new_signed("gcal".into(), actor, user, op1).unwrap();
+        let b = IntegrationStateRequest::new_signed("gcal".into(), actor, user, op2).unwrap();
+        // Timestamps will differ — compare only the signed bytes via
+        // reusing the sign_body_bytes helper with a shared timestamp.
+        let ts = 1_700_000_000_000i64;
+        let body_a = sign_body_bytes("gcal", user, &a.op, ts, None);
+        let body_b = sign_body_bytes("gcal", user, &b.op, ts, None);
+        assert_eq!(body_a, body_b, "key order must not affect signed bytes");
+    }
+}

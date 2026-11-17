@@ -1,0 +1,30 @@
+{
+    "name": "echo-debug",
+    "display_name": "Echo/Debug",
+    "version": "v1.0.0",
+    "category": "Development",
+    "description": "Prints incoming data to logs for debugging.",
+    "capability_world": "minimal-node",
+    "allowed_hosts": [],
+    "requires_secrets": [],
+    "config_schema": {
+        "type": "object",
+        "properties": {
+            "PREFIX": {
+                "type": "string",
+                "default": "",
+                "description": "Text put in front of the echoed input in the node's output."
+            },
+            "UPPERCASE": {
+                "type": "boolean",
+                "default": false,
+                "description": "Upper-case the output."
+            },
+            "LOG_TO_CONSOLE": {
+                "type": "boolean",
+                "default": true,
+                "description": "Write the input payload and the output to the execution log at INFO. Set false to echo without logging."
+            }
+        }
+    }
+}

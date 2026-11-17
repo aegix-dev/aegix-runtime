@@ -1,0 +1,451 @@
+//! # Execution state NATS-RPC (fire-and-forget)
+//!
+//! Worker `state::set` calls don't need a reply — they're best-effort
+//! write-through to the `execution_state` table so state survives
+//! worker crashes. The in-process HashMap remains the fast path; this
+//! just adds durability.
+//!
+//! Unlike `memory_rpc` / `graph_rpc` / `database_rpc` this uses a
+//! **publish** (no reply subject), so the guest never waits. Every
+//! payload is still HMAC-signed + nonce-bound via [`crate::rpc_auth`].
+//!
+//! The signature alone never stopped a write "for another execution": it
+//! proves a worker key, and the request's `actor_id` and `execution_id` are
+//! the sender's choice. Until 2026-11-09 the controller wrote for any live run
+//! a signed request named, another tenant's included. Since then the request
+//! carries the signed [`DispatchBinding`] the other data-plane subjects carry,
+//! and a worker key's write lands only in the run of a live dispatch of its
+//! signed actor (`docs/engineering-log/packages/2026-11-09-state-write-names-its-tenant.md`).
+//!
+//! ## Why not a synchronous RPC?
+//!
+//! `state::set` is a hot path in long workflows — state writes happen
+//! multiple times per node. A request/reply over NATS would add
+//! ~1 ms of latency to every call; fire-and-forget publishes are
+//! ~100 µs. Durability is eventually-consistent by design: if the
+//! worker crashes between the in-process write and the NATS
+//! publish, the key is lost — but the WIT `state` interface was
+//! already best-effort (state::set returned `Ok` even when the old
+//! in-process `db_pool` was `None`).
+
+use crate::dispatch_binding::{self, DispatchBinding};
+use crate::rpc_auth;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub const SUBJECT_STATE_WRITE: &str = "talos.state.write";
+pub const SUBJECT_NAME: &str = "state_rpc";
+/// Controller-side concurrency cap for state writes. Bigger than
+/// graph / memory because writes are cheap and chatty.
+pub const MAX_IN_FLIGHT: usize = 32;
+
+/// MCP-1024 (2026-05-15): structural caps lifted into `verify()`, sibling-
+/// pattern parity with `integration_state_rpc::verify()` which already
+/// calls `validate_op` inside its verify path. Pre-fix MCP-1006 the same
+/// caps lived only at the subscriber (`aegix-rpc-subscribers/src/lib.rs`
+/// around line 1322) — that's correct for the production runtime path
+/// but means any future cross-process consumer of `state_rpc` that
+/// trusts `verify()` to be a complete validation has to re-implement
+/// the structural checks. Folding them into `verify()` means there's
+/// exactly one definition of "well-formed signed state-write" — every
+/// consumer inherits the invariant without copy-paste discipline.
+///
+/// Limits mirror the worker-side `wit_state::set` checks so legitimate
+/// traffic is unaffected:
+///   key:   1-1024 chars
+///   value: ≤ 1 MiB
+pub const MAX_STATE_KEY_LEN: usize = 1024;
+pub const MAX_STATE_VALUE_BYTES: usize = 1024 * 1024;
+
+/// Most keys one execution may hold in `execution_state`, and the most value
+/// bytes across them (security review 2026-10-14, B-3). The per-message caps
+/// above bound one write; these bound the population, which a fleet-key
+/// holder could otherwise grow without limit under fresh keys. Enforced by
+/// the controller's one write statement, beside the requirement that the
+/// execution exists and is live.
+pub const MAX_STATE_KEYS_PER_EXECUTION: i64 = 1_000;
+pub const MAX_STATE_BYTES_PER_EXECUTION: i64 = 16 * 1024 * 1024;
+
+/// The execution statuses a durable state write is accepted for. A write for
+/// an execution that does not exist, or has ended, is refused: nothing reads
+/// `execution_state` back at runtime (the worker reads its own in-memory
+/// store), so such a row is only ever growth.
+pub const STATE_WRITABLE_STATUSES: &[&str] = &["running", "resuming", "waiting"];
+
+/// The run a dispatch's durable state belongs to: `execution_state.execution_id`
+/// IS the run (`workflow_executions.id`), which is what the controller's
+/// liveness check, the archival move and the orphan sweep all key on
+/// (security review 2026-10-15, B2-1). A workflow node's job names its run in
+/// `workflow_execution_id` and its own `module_executions` row in `job_id`; a
+/// module-bound dispatch (webhook, push channel) has no run and sends its own
+/// id in both, so it has no durable state — its `state` calls stay in the
+/// worker's memory for the execution. Until 2026-10-15 the worker sent
+/// `job_id`, which names no run, and every honest write was refused.
+pub fn durable_state_run(workflow_execution_id: &str, job_id: &str) -> Option<Uuid> {
+    let run = Uuid::parse_str(workflow_execution_id).ok()?;
+    let job = Uuid::parse_str(job_id).ok()?;
+    (run != job).then_some(run)
+}
+
+/// Why a dispatch's `state` call sent no durable write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateWriteNotSent {
+    /// The dispatch belongs to no run ([`durable_state_run`]).
+    NoRun,
+    /// The key or value is malformed, or no signing key is registered.
+    Unsigned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateWriteRequest {
+    pub execution_id: Uuid,
+    pub actor_id: Uuid,
+    pub key: String,
+    /// Value stored as a string blob — the WIT `state` interface has
+    /// no type beyond string.
+    pub value: String,
+    /// Whether this is a delete (true) or a set (false).
+    pub is_delete: bool,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: Vec<u8>,
+    /// RFC 0010 P2 inc.3 — signer identity (empty under HMAC, worker id under
+    /// Ed25519). See `MemoryRpcRequest::worker_id`.
+    #[serde(default)]
+    pub worker_id: String,
+    /// Unsigned scheme hint: 0 = HMAC, 1 = Ed25519. See
+    /// `MemoryRpcRequest::crypto_scheme`.
+    #[serde(default)]
+    pub crypto_scheme: u8,
+    /// The dispatch this write is made for (2026-11-09): the job's run and its
+    /// own `module_executions` row, signed. A worker always stamps it
+    /// ([`Self::for_dispatch`]); the controller serves a worker key's write
+    /// only when this names a live dispatch of the signed actor AND its run is
+    /// [`Self::execution_id`] (`aegix_rpc_subscribers::state_write_binding`).
+    /// Until then nothing tied the named run to the signer, and any worker key
+    /// could write durable state into another tenant's live run. Absent, the
+    /// wire and the signed body are byte-identical to before the field. See
+    /// [`crate::dispatch_binding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<DispatchBinding>,
+}
+
+/// Variant tag byte. Single-byte discriminant for the only operation
+/// this protocol carries today. Future operations get fresh bytes —
+/// add to the uniqueness guard below to detect collisions at build time.
+const TAG_STATE_WRITE: u8 = b'W';
+
+/// Compile-time uniqueness guard for state_rpc tag bytes (M-1).
+const _STATE_TAG_UNIQUENESS_GUARD: [u8; 1] = {
+    let tags = [TAG_STATE_WRITE];
+    let mut i = 0;
+    while i < tags.len() {
+        let mut j = i + 1;
+        while j < tags.len() {
+            assert!(tags[i] != tags[j], "state_rpc tag byte collision");
+            j += 1;
+        }
+        i += 1;
+    }
+    tags
+};
+
+/// Hand-built canonical byte form (M-1).
+///
+/// Pre-fix this protocol used `serde_json::to_vec(&StateSignBody { … })`
+/// which is safe today (only primitive fields) but vulnerable to a
+/// future field addition that introduces non-determinism.
+///
+/// Encoding:
+///   timestamp_ms (i64 LE) || TAG_STATE_WRITE (1B)
+///   || execution_id (16B BE — Uuid::as_bytes)
+///   || key_len (u32 LE) || key_bytes
+///   || value_len (u32 LE) || value_bytes
+///   || is_delete (1B: 0/1)
+///   [|| 'D' || dispatch.execution_id (16B) || dispatch.job_id (16B)]
+///
+/// The dispatch binding is appended LAST and only when present
+/// (`dispatch_binding::append_signed`, 2026-11-09), so an unbound request
+/// signs the bytes it always did.
+///
+/// `key` and `value` are length-prefixed (u32 LE) so neither field can
+/// be confused with the other regardless of byte content. Numeric
+/// fields use little-endian bytes; the Uuid uses its 16-byte big-endian
+/// representation (`Uuid::as_bytes`) which is the de-facto standard.
+fn sign_body_bytes(
+    execution_id: Uuid,
+    key: &str,
+    value: &str,
+    is_delete: bool,
+    timestamp_ms: i64,
+    dispatch: Option<&DispatchBinding>,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 + key.len() + value.len() + dispatch_binding::SIGNED_LEN);
+    buf.extend_from_slice(&timestamp_ms.to_le_bytes());
+    buf.push(TAG_STATE_WRITE);
+    buf.extend_from_slice(execution_id.as_bytes());
+    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    buf.extend_from_slice(key.as_bytes());
+    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+    buf.push(if is_delete { 1 } else { 0 });
+    dispatch_binding::append_signed(&mut buf, dispatch);
+    buf
+}
+
+impl StateWriteRequest {
+    /// THE durable write a dispatch's `state::set` (`value: Some`) or
+    /// `state::delete` (`value: None`) sends, from the two ids the worker's
+    /// execution context holds for the job: its `workflow_execution_id` and
+    /// its `job_id`. The request names the run ([`durable_state_run`]) and
+    /// carries the signed binding of the job those two ids are
+    /// ([`DispatchBinding::from_context`] reads the same pair), so the run it
+    /// names is always its binding's run.
+    pub fn for_dispatch(
+        workflow_execution_id: &str,
+        job_id: &str,
+        actor_id: Uuid,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<Self, StateWriteNotSent> {
+        let run =
+            durable_state_run(workflow_execution_id, job_id).ok_or(StateWriteNotSent::NoRun)?;
+        let (value, is_delete) = match value {
+            Some(v) => (v.to_string(), false),
+            None => (String::new(), true),
+        };
+        let binding = DispatchBinding::from_context(Some(workflow_execution_id), Some(job_id))
+            .ok_or(StateWriteNotSent::NoRun)?;
+        Self::new_signed_bound(
+            run,
+            actor_id,
+            Some(binding),
+            key.to_string(),
+            value,
+            is_delete,
+        )
+        .ok_or(StateWriteNotSent::Unsigned)
+    }
+
+    /// An UNBOUND request: what a caller that runs no dispatch would send. The
+    /// controller refuses one signed by a worker key, whatever
+    /// `AEGIX_RPC_REQUIRE_DISPATCH_BINDING` says. A worker uses
+    /// [`Self::for_dispatch`].
+    pub fn new_signed(
+        execution_id: Uuid,
+        actor_id: Uuid,
+        key: String,
+        value: String,
+        is_delete: bool,
+    ) -> Option<Self> {
+        Self::new_signed_bound(execution_id, actor_id, None, key, value, is_delete)
+    }
+
+    pub fn new_signed_bound(
+        execution_id: Uuid,
+        actor_id: Uuid,
+        dispatch: Option<DispatchBinding>,
+        key: String,
+        value: String,
+        is_delete: bool,
+    ) -> Option<Self> {
+        // MCP-1149 (2026-05-16): structural validation BEFORE signing.
+        // Cheap-gate-first parity with `verify()`. See memory_rpc /
+        // database_rpc / graph_rpc siblings for the rationale —
+        // `integration_state_rpc::new_signed` is the canonical pattern.
+        if !validate_structure(&key, &value, is_delete) {
+            return None;
+        }
+        let timestamp_ms = rpc_auth::now_ms();
+        let nonce = rpc_auth::random_nonce();
+        let body_bytes = sign_body_bytes(
+            execution_id,
+            &key,
+            &value,
+            is_delete,
+            timestamp_ms,
+            dispatch.as_ref(),
+        );
+        let (signature, worker_id, crypto_scheme) =
+            rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body_bytes)?;
+        Some(Self {
+            execution_id,
+            actor_id,
+            key,
+            value,
+            is_delete,
+            timestamp_ms,
+            nonce,
+            signature,
+            worker_id,
+            crypto_scheme,
+            dispatch,
+        })
+    }
+
+    /// See `memory_rpc::MemoryRpcRequest::verify` for the classification
+    /// contract: controller-side diagnosis only, gate order unchanged.
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
+        if !rpc_auth::verify_freshness(self.timestamp_ms) {
+            return Err(VerifyFailure::Stale);
+        }
+        // MCP-1024 (2026-05-15): structural caps inside verify() so any
+        // cross-process consumer that trusts verify() as "well-formed
+        // signed state-write" gets the size invariant for free. Same
+        // pattern integration_state_rpc::verify() already uses. The
+        // subscriber-side check at MCP-1006 still runs (defence in
+        // depth + metric tagging); a compromised worker that bypassed
+        // its own caps fails both gates.
+        if !validate_structure(&self.key, &self.value, self.is_delete) {
+            return Err(VerifyFailure::OversizedStructure);
+        }
+        let body_bytes = sign_body_bytes(
+            self.execution_id,
+            &self.key,
+            &self.value,
+            self.is_delete,
+            self.timestamp_ms,
+            self.dispatch.as_ref(),
+        );
+        rpc_auth::verify_rpc(
+            SUBJECT_NAME,
+            self.actor_id,
+            &self.nonce,
+            &body_bytes,
+            &self.worker_id,
+            &self.signature,
+            self.crypto_scheme,
+        )
+    }
+}
+
+/// MCP-1024: structural validation for signed `state_rpc` payloads.
+/// Used by `verify()` so every caller of state_rpc shares the same
+/// well-formed-message definition. The value cap only applies on
+/// set (not delete) — delete carries `value = ""` which is valid.
+fn validate_structure(key: &str, value: &str, is_delete: bool) -> bool {
+    if key.is_empty() || key.len() > MAX_STATE_KEY_LEN {
+        return false;
+    }
+    if !is_delete && value.len() > MAX_STATE_VALUE_BYTES {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod structural_tests {
+    //! MCP-1024: pins the structural-bounds half of `verify()` so a
+    //! future refactor can't quietly relax the well-formed-message
+    //! contract. The cap values mirror `wit_state::set`'s worker-side
+    //! checks so legitimate traffic is unaffected.
+    use super::*;
+
+    #[test]
+    fn accepts_canonical_set() {
+        assert!(validate_structure("foo", "bar", false));
+    }
+
+    #[test]
+    fn accepts_canonical_delete() {
+        assert!(validate_structure("foo", "", true));
+    }
+
+    #[test]
+    fn rejects_empty_key() {
+        assert!(!validate_structure("", "bar", false));
+        assert!(!validate_structure("", "", true));
+    }
+
+    #[test]
+    fn rejects_oversized_key() {
+        let big = "a".repeat(MAX_STATE_KEY_LEN + 1);
+        assert!(!validate_structure(&big, "bar", false));
+    }
+
+    #[test]
+    fn accepts_max_length_key() {
+        let at_cap = "a".repeat(MAX_STATE_KEY_LEN);
+        assert!(validate_structure(&at_cap, "bar", false));
+    }
+
+    #[test]
+    fn rejects_oversized_value_on_set() {
+        let big = "v".repeat(MAX_STATE_VALUE_BYTES + 1);
+        assert!(!validate_structure("foo", &big, false));
+    }
+
+    #[test]
+    fn ignores_value_size_on_delete() {
+        // Delete carries `value = ""` in real usage; the function
+        // should ignore the value cap on delete so a hypothetical
+        // future protocol change that lets delete carry a payload
+        // doesn't trip on size before verify() runs.
+        let big = "v".repeat(MAX_STATE_VALUE_BYTES + 100);
+        assert!(validate_structure("foo", &big, true));
+    }
+
+    #[test]
+    fn accepts_at_cap_value() {
+        let at_cap = "v".repeat(MAX_STATE_VALUE_BYTES);
+        assert!(validate_structure("foo", &at_cap, false));
+    }
+}
+
+#[cfg(test)]
+mod durable_state_run_tests {
+    use super::*;
+
+    #[test]
+    fn a_workflow_nodes_state_names_its_run_not_its_job() {
+        let run = Uuid::new_v4();
+        let job = Uuid::new_v4();
+        assert_eq!(
+            durable_state_run(&run.to_string(), &job.to_string()),
+            Some(run)
+        );
+    }
+
+    #[test]
+    fn a_workflow_nodes_write_carries_the_binding_of_its_own_job() {
+        crate::rpc_auth::register_hmac_key(std::sync::Arc::new(vec![0x5a; 32]));
+        let run = Uuid::new_v4();
+        let job = Uuid::new_v4();
+        let req = StateWriteRequest::for_dispatch(
+            &run.to_string(),
+            &job.to_string(),
+            Uuid::new_v4(),
+            "k",
+            Some("v"),
+        )
+        .expect("signed");
+        assert_eq!(req.execution_id, run);
+        assert_eq!(
+            req.dispatch,
+            Some(DispatchBinding {
+                execution_id: run,
+                job_id: job
+            })
+        );
+        req.verify().expect("the bound request verifies");
+    }
+
+    #[test]
+    fn a_module_bound_dispatch_has_no_durable_state() {
+        let own = Uuid::new_v4().to_string();
+        assert_eq!(durable_state_run(&own, &own), None);
+        assert_eq!(
+            StateWriteRequest::for_dispatch(&own, &own, Uuid::new_v4(), "k", Some("v"))
+                .unwrap_err(),
+            StateWriteNotSent::NoRun
+        );
+    }
+
+    #[test]
+    fn an_unparseable_id_names_no_run() {
+        let run = Uuid::new_v4().to_string();
+        assert_eq!(durable_state_run(&run, "exec-1"), None);
+        assert_eq!(durable_state_run("", &run), None);
+    }
+}

@@ -1,0 +1,2685 @@
+//! Module acquisition for job execution: inline `wasm_bytes`, OCI
+//! registry pull (with Sigstore signature verification, manifest size
+//! gates and layer-digest verification), digest-keyed Redis cache, and
+//! filesystem fallback — plus the Sigstore policy / cosign plumbing.
+//!
+//! Extracted verbatim from `main.rs::execute_job` (May-2026). All
+//! security ordering, log messages and error strings are preserved
+//! byte-for-byte; see [`fetch`].
+
+use crate::error_sanitize::sanitize_error_message;
+use crate::job_span::JobSpan;
+use crate::runtime::AegixRuntime;
+use aegix_workflow_job_protocol::JobRequest;
+#[cfg(feature = "oci")]
+use std::sync::OnceLock;
+
+/// A module acquired by [`fetch`], with its attestation provenance.
+pub struct FetchedModule {
+    /// The WASM component bytes to execute.
+    pub bytes: Vec<u8>,
+    /// Whether the bytes were cryptographically attested during THIS
+    /// worker run: inline `wasm_bytes` from the JobRequest (HMAC over
+    /// the job covers sha256(bytes)), a fresh OCI pull that completed
+    /// Sigstore + layer-digest checks, or a Redis OCI-cache hit that
+    /// re-verified against the manifest digest. When `false`
+    /// (`redis:wasm:` direct fetch, filesystem load), the controller's
+    /// `expected_wasm_hash` is the only integrity anchor — the caller's
+    /// hash-check block MUST refuse to execute without one.
+    pub attested_in_this_run: bool,
+}
+
+/// Module-acquisition failure. `message` is the exact operator-facing
+/// string the pre-extraction inline code placed in the failed
+/// `JobResult`'s `output_payload.error` and the job span's `end_error`.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct FetchError {
+    pub message: String,
+}
+
+/// Redis TTL for cached OCI layer pulls. 24h covers daily mutable-tag refresh
+/// while bounding cache growth — without a TTL, distinct module URIs (every
+/// new tag) accumulate forever. Digest-pinned URIs re-cache identical bytes
+/// on every miss, so the TTL is harmless there.
+#[cfg(feature = "oci")]
+const OCI_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// H-3: Maximum decompressed OCI layer size the worker will accept.
+///
+/// `oci_client::Client::pull` buffers each layer into a
+/// `Vec<u8>` AFTER gzip decompression. Without a cap, a hostile or
+/// compromised registry can serve a small gzipped layer that
+/// decompresses to many gigabytes and OOMs the worker (the pooling
+/// allocator's 128 MiB per-instance bound only protects memory
+/// inside wasmtime, not host-side `Vec` allocations).
+///
+/// M-1 (2026-05-22): tightened from 64 MiB → 32 MiB. The largest
+/// templates in the catalog are < 8 MiB AOT-compiled, < 1 MiB
+/// uncompiled, so 32 MiB is still ~4× headroom over realistic
+/// traffic. The pre-pull manifest check filters typical attacks
+/// using the manifest-declared (compressed) size, but a registry
+/// that lies about layer size — or serves a properly-signed
+/// compression-bomb payload (compressed << decompressed) — can
+/// drive the host allocator past the cap before the post-pull
+/// `data.len()` check at the call site sees it. Lowering the
+/// default ceiling reduces the OOM blast radius without affecting
+/// legitimate templates. Operators with bespoke large modules
+/// raise via `WORKER_MAX_OCI_LAYER_BYTES`; defense-in-depth
+/// check at both pre-pull (manifest's declared size) and
+/// post-pull (actual `data.len()`).
+const DEFAULT_MAX_OCI_LAYER_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Env-configurable override for [`DEFAULT_MAX_OCI_LAYER_BYTES`].
+/// `0` / unset / malformed → use the default. Loaded lazily on
+/// first OCI pull (cheap; not a hot path).
+fn max_oci_layer_bytes() -> u64 {
+    std::env::var("WORKER_MAX_OCI_LAYER_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_OCI_LAYER_BYTES)
+}
+
+/// Whether this build carries the OCI registry client (`oci-client`, `oci-spec`
+/// and what they bring): the crate's `oci` feature, off by default so the
+/// embeddable runtime links no registry client (structural check 109). Off,
+/// [`fetch`] refuses an `oci://` module URI with [`NoRegistryClientInThisBuild`]
+/// rather than fetching it by any other route, and
+/// [`enforce_production_sigstore_policy_explicit`] says so at boot when the
+/// environment configures registry verification or credentials anyway
+/// ([`registry_client_boot_notice`]). The worker binary turns the feature on;
+/// an embedder turns on `aegix-runtime/oci` (2026-11-02,
+/// `docs/engineering-log/packages/2026-11-02-oci-and-prometheus-below-the-runtime-boundary.md`).
+pub const HAS_OCI_REGISTRY_CLIENT: bool = cfg!(feature = "oci");
+
+/// The first token of the [`FetchError::message`] an `oci://` dispatch gets
+/// from a build without the registry client — stable, like the other `oci_*`
+/// reasons in this module, so a reader of `output_payload.error` can match it.
+pub const NO_REGISTRY_CLIENT_REASON: &str = "oci_fetch_unavailable_in_this_build";
+
+/// A dispatch named an `oci://` module URI, but this build has no OCI
+/// registry client: `aegix-worker-runtime` was built without its `oci`
+/// feature ([`HAS_OCI_REGISTRY_CLIENT`]). The refusal a build without the
+/// client gives instead of silently serving the module from somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoRegistryClientInThisBuild;
+
+impl std::fmt::Display for NoRegistryClientInThisBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{NO_REGISTRY_CLIENT_REASON}: the dispatch names an OCI registry artifact (an \
+             `oci://` module URI), but this build has no OCI registry client: \
+             aegix-worker-runtime was built without its `oci` feature, so the artifact is \
+             not fetched (an embedder turns on `aegix-runtime/oci`; the deployed worker \
+             binary has it on)"
+        )
+    }
+}
+
+impl std::error::Error for NoRegistryClientInThisBuild {}
+
+/// The line a build without the registry client prints at boot when the
+/// environment configures a registry anyway: a Sigstore policy other than
+/// `disabled`, or registry credentials (`OCI_REGISTRY_USERNAME` /
+/// `OCI_REGISTRY_PASSWORD`). Pure. `None` when there is nothing to say: the
+/// client is in this build, or nothing in the environment names a registry.
+/// The policy itself is unchanged — it is read, and an `oci://` dispatch is
+/// refused before it would be consulted.
+pub fn registry_client_boot_notice(
+    policy: SigstorePolicy,
+    credentials_set: bool,
+) -> Option<String> {
+    if HAS_OCI_REGISTRY_CLIENT {
+        return None;
+    }
+    let configured = match (policy != SigstorePolicy::Disabled, credentials_set) {
+        (false, false) => return None,
+        (true, false) => format!("AEGIX_SIGSTORE_REQUIRED names the {policy:?} policy"),
+        (false, true) => "OCI_REGISTRY_USERNAME / OCI_REGISTRY_PASSWORD are set".to_string(),
+        (true, true) => format!(
+            "AEGIX_SIGSTORE_REQUIRED names the {policy:?} policy and OCI_REGISTRY_USERNAME / \
+             OCI_REGISTRY_PASSWORD are set"
+        ),
+    };
+    Some(format!(
+        "[MODULES] ✗ {configured}, but this build has no OCI registry client: \
+         aegix-worker-runtime was built without its `oci` feature, so every oci:// dispatch \
+         is refused ({NO_REGISTRY_CLIENT_REASON}); an embedder turns on `aegix-runtime/oci`"
+    ))
+}
+
+/// Whether the environment holds a registry credential (either half, non-empty
+/// — the same filter the `oci://` arm applies before it builds `RegistryAuth`).
+fn registry_credentials_are_set() -> bool {
+    ["OCI_REGISTRY_USERNAME", "OCI_REGISTRY_PASSWORD"]
+        .iter()
+        .any(|name| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false))
+}
+
+/// Decision returned by [`check_manifest_layer_sizes`] — keeps the
+/// security-critical policy testable in isolation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManifestSizeVerdict {
+    /// All declared layer sizes are within bounds.
+    Ok,
+    /// At least one layer's declared `size` exceeds the cap. Carries
+    /// both the offending declared size and the cap for log lines.
+    Oversized { declared: i64, cap: u64 },
+}
+
+/// Pre-pull check: refuse to fetch an OCI artifact whose manifest
+/// declares any layer larger than `cap`. Pure function so the policy
+/// is unit-testable without a registry. Negative `size` values (the
+/// manifest spec allows i64 but values < 0 are nonsense) are treated
+/// as oversized so a forged manifest can't bypass the gate by claiming
+/// a negative size.
+pub fn check_manifest_layer_sizes(layer_sizes: &[i64], cap: u64) -> ManifestSizeVerdict {
+    for &size in layer_sizes {
+        if size < 0 || (size as u64) > cap {
+            return ManifestSizeVerdict::Oversized {
+                declared: size,
+                cap,
+            };
+        }
+    }
+    ManifestSizeVerdict::Ok
+}
+
+/// Sigstore enforcement modes for OCI artifact signature verification.
+/// The Sigstore verification policy, ONE home: `aegix_sigstore_policy`
+/// (shared with the controller's OCI catalog sync — the two copies this file
+/// and `aegix-registry::sync` carried were folded there 2026-09-13). Resolved
+/// once at process startup from `AEGIX_SIGSTORE_REQUIRED` via
+/// [`SigstorePolicy::from_env`]; the production gate below refuses to boot
+/// on the silent default.
+pub use aegix_sigstore_policy::SigstorePolicy;
+
+/// Production-only gate: refuse to boot when the operator hasn't made an
+/// explicit Sigstore choice.
+///
+/// Mirrors the `AEGIX_AOT_HMAC_KEY` startup discipline at
+/// [`runtime::aot_key_ring`]: in production, fail loud at boot rather than
+/// devolving to a "silent unverified" posture that looks identical to
+/// "verification ran and passed" from the operator's monitoring.
+///
+/// Returns `Ok(policy)` in three cases:
+///   1. We're not in production (dev/test) — the silent default is fine.
+///   2. Operator set an explicit recognised value — any of them is fine,
+///      including `disabled`, because operator chose it knowingly.
+///   3. Operator set `audit` or `required` — fine by definition.
+///
+/// Returns `Err` in production when the env var is unset / empty / set to
+/// an unrecognised value — the operator's intent is ambiguous, refuse to
+/// guess.
+///
+/// An UNRECOGNISED value is refused in EVERY environment (E-7, 2026-10-14):
+/// until then a misspelt `required` booted a dev or staging worker with
+/// verification silently off.
+pub fn enforce_production_sigstore_policy_explicit() -> anyhow::Result<SigstorePolicy> {
+    let raw = std::env::var("AEGIX_SIGSTORE_REQUIRED").unwrap_or_default();
+    let policy = SigstorePolicy::from_env_str(&raw)
+        .map_err(|e| anyhow::anyhow!("CRITICAL: refusing to boot: {e}"))?;
+    let policy = sigstore_policy_under_profile(
+        aegix_config::security_profile::profile(),
+        policy,
+        SigstorePolicy::raw_env_is_explicit(&raw),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    // A build without the registry client says so here, once, where the
+    // operator configured one (2026-11-02): the policy stands, and every
+    // `oci://` dispatch is refused before it would be consulted.
+    if let Some(line) = registry_client_boot_notice(policy, registry_credentials_are_set()) {
+        eprintln!("{line}");
+    }
+    Ok(policy)
+}
+
+/// The explicitness rule, pure (2026-10-29): where the security profile
+/// enforces (`hardened`, `transitional` — until then `is_production()`, which
+/// left a staging worker on the silent default), the policy must be named;
+/// under `hardened` the `audit` policy is refused too, because
+/// verify-and-continue is the migration window `transitional` exists for.
+/// `development` sees the silent default.
+pub fn sigstore_policy_under_profile(
+    profile: aegix_config::security_profile::SecurityProfile,
+    policy: SigstorePolicy,
+    explicit: bool,
+) -> Result<SigstorePolicy, String> {
+    use aegix_config::security_profile::SecurityProfile;
+    if !profile.enforces() {
+        return Ok(policy);
+    }
+    if !explicit {
+        return Err(format!(
+            "CRITICAL: AEGIX_SIGSTORE_REQUIRED must be set explicitly under \
+             AEGIX_SECURITY_PROFILE={}. Set to `required` for fail-closed signature \
+             verification (recommended), `audit` for warn-and-continue during a migration \
+             window (transitional profile only), or `disabled` to explicitly accept the \
+             security risk of running unsigned WASM artifacts. Refusing to boot rather than \
+             silently devolving to no-verification — see worker/src/main.rs::SigstorePolicy \
+             for rationale.",
+            profile.name()
+        ));
+    }
+    if profile == SecurityProfile::Hardened && policy == SigstorePolicy::Audit {
+        return Err("CRITICAL: AEGIX_SIGSTORE_REQUIRED=audit is refused under \
+             AEGIX_SECURITY_PROFILE=hardened: verify-and-continue is the migration window, \
+             which AEGIX_SECURITY_PROFILE=transitional names. Set `required`, or name the \
+             transitional profile while the window is open."
+            .to_string());
+    }
+    Ok(policy)
+}
+
+/// The cosign binary pin under the security profile, pure (2026-11-04).
+/// Under `required` the worker hashes the cosign binary at boot and refuses a
+/// mismatch (`AEGIX_COSIGN_SHA256`); with NO pin that check is skipped and a
+/// swapped-in wrapper that always exits 0 passes every other Sigstore gate.
+/// The worker image bakes the pin (the sum its cosign download was verified
+/// against, `worker/Dockerfile`), so a `required` worker with none is running
+/// outside the image or had the variable stripped: under `hardened` that is
+/// refused at boot, in the shape of the `audit` refusal above; under
+/// `transitional` and `development` the boot WARN stands, the posture every
+/// deployment ran before this date. A pin that IS set is verified under every
+/// profile by the caller; this function decides only whether its absence is
+/// allowed. `pinned` is whether the variable is set and non-empty.
+pub fn cosign_pin_under_profile(
+    profile: aegix_config::security_profile::SecurityProfile,
+    policy: SigstorePolicy,
+    pinned: bool,
+) -> Result<(), String> {
+    use aegix_config::security_profile::SecurityProfile;
+    if pinned || policy != SigstorePolicy::Required || profile != SecurityProfile::Hardened {
+        return Ok(());
+    }
+    Err(
+        "CRITICAL: AEGIX_COSIGN_SHA256 is not set under AEGIX_SIGSTORE_REQUIRED=required \
+         and AEGIX_SECURITY_PROFILE=hardened: the cosign binary would run unverified, and a \
+         swapped-in binary that always exits 0 passes every other Sigstore gate. The worker \
+         image bakes the pin (worker/Dockerfile, ENV AEGIX_COSIGN_SHA256 from the arch's \
+         COSIGN_SHA256_*); a worker run outside the image sets it to the sha256 of its cosign \
+         binary, or names the transitional profile to boot with the gap logged."
+            .to_string(),
+    )
+}
+
+/// Sigstore identity-regexp policy — the validator + rejection enum now
+/// live in the shared `aegix-sigstore-policy` crate so the worker and the
+/// controller's OCI catalog-sync enforce IDENTICAL identity pinning (security
+/// review 2026-07-19, P4). Re-exported here to keep existing worker call
+/// sites and tests (`validate_sigstore_identity_regexp`, `SigstoreRegexpRejection`,
+/// `.human_reason()`) unchanged.
+pub use aegix_sigstore_policy::{
+    validate_sigstore_identity_regexp, validate_sigstore_identity_regexp_for_policy,
+    SigstoreRegexpRejection,
+};
+
+/// What the Sigstore step established about one OCI pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigstoreCheck {
+    /// The policy is `disabled`: nothing was asked, by the operator's choice.
+    NotRequested,
+    /// Verification could not run: `AEGIX_SIGSTORE_IDENTITY_REGEXP` is empty.
+    NoIdentity,
+    /// `cosign verify` accepted the signature for the configured identity.
+    Verified,
+    /// `cosign verify` ran and refused, or could not be run.
+    Failed(String),
+}
+
+/// What a pull does after its Sigstore step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigstoreVerdict {
+    /// Execute, and the bytes may seed the Redis OCI cache.
+    Cacheable,
+    /// Execute (audit), but never cache: the bytes are digest-checked only.
+    ExecuteUncached,
+    /// Refuse the pull, with this message.
+    Refuse(String),
+}
+
+/// The Sigstore step's decision — ONE home, pure, so the table is tested
+/// without cosign or Redis.
+///
+/// | policy   | Verified  | NoIdentity / Failed |
+/// |----------|-----------|---------------------|
+/// | disabled | —         | — (`NotRequested` → `Cacheable`) |
+/// | audit    | Cacheable | ExecuteUncached     |
+/// | required | Cacheable | Refuse              |
+///
+/// Only a VERIFIED pull (or one under the operator's explicit `disabled`)
+/// may seed the cache: a cache hit skips this step, so caching anything else
+/// would let a later pull — after a flip to `required` — run bytes nobody
+/// verified. `audit` with no identity regexp ran no verification and is NOT
+/// attested (E-7, 2026-10-14; until then it was cached as if verified).
+#[must_use]
+pub fn sigstore_verdict(policy: SigstorePolicy, check: &SigstoreCheck) -> SigstoreVerdict {
+    match (policy, check) {
+        (SigstorePolicy::Disabled, _) => SigstoreVerdict::Cacheable,
+        (_, SigstoreCheck::Verified) => SigstoreVerdict::Cacheable,
+        (SigstorePolicy::Audit, _) => SigstoreVerdict::ExecuteUncached,
+        (SigstorePolicy::Required, SigstoreCheck::Failed(reason)) => {
+            SigstoreVerdict::Refuse(format!("sigstore_required: {reason}"))
+        }
+        (SigstorePolicy::Required, SigstoreCheck::NoIdentity | SigstoreCheck::NotRequested) => {
+            SigstoreVerdict::Refuse(
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP must be set when AEGIX_SIGSTORE_REQUIRED is enabled"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// Build the `cosign verify` argv for a given OCI reference. Pure
+/// (no env reads, no I/O) so the security-critical command construction
+/// is unit-tested without invoking cosign.
+///
+/// Cert identity + OIDC issuer come from configuration:
+/// - `identity_regexp`: regex matched against the SAN URI of the Fulcio
+///   cert. Pin to the workflow URL pattern, e.g.
+///   `^https://github\.com/OWNER/talos/\.github/workflows/template-publish\.yml@refs/heads/main$`
+/// - `oidc_issuer`: GitHub Actions = `https://token.actions.githubusercontent.com`
+pub fn cosign_verify_argv(
+    reference: &str,
+    identity_regexp: &str,
+    oidc_issuer: &str,
+) -> Vec<String> {
+    vec![
+        "verify".to_string(),
+        "--certificate-identity-regexp".to_string(),
+        identity_regexp.to_string(),
+        "--certificate-oidc-issuer".to_string(),
+        oidc_issuer.to_string(),
+        // Output to stderr keeps stdout free for structured signal — we don't
+        // currently parse stdout, but reserving the channel makes future
+        // "extract Rekor entry ID" upgrades non-breaking.
+        "--output".to_string(),
+        "json".to_string(),
+        reference.to_string(),
+    ]
+}
+
+/// One `cosign verify` at a time in a worker process (2026-11-16,
+/// `docs/engineering-log/packages/2026-11-16-one-cosign-at-a-time.md`).
+///
+/// cosign keeps its trust-root metadata in a store under `TUF_ROOT` that one
+/// process at a time may open. A second `cosign verify` started while the
+/// first still holds it exits 1 with `creating cached local store: resource
+/// temporarily unavailable`, the worker reads that as a failed signature and
+/// refuses the job, and a signature refusal is not retried. A registry
+/// reference is verified on every dispatch, so two jobs that reach a worker
+/// in the same second were enough: three refusals in the first ten minutes
+/// after the reference deployment's catalog copies all became references.
+///
+/// The store is the worker process's own (`TUF_ROOT` under its `/tmp`), so a
+/// gate in the process is the whole of it. The wait is on the job's own
+/// clock. The gate is released when the call returns or is dropped.
+static COSIGN_VERIFY_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How long one `cosign verify` may run before it is killed and the job
+/// refused. A verification takes a few seconds, the first one after a boot
+/// longer while the store is filled. Until 2026-11-16 nothing bounded it;
+/// behind a gate, an unbounded one would hold every later job of the worker.
+const COSIGN_VERIFY_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `cosign verify` against an OCI reference. Returns `Ok(())` if the
+/// signature is valid AND the cert identity / OIDC issuer match. Errors
+/// carry a sanitised message safe to surface in JobResult; the unsanitised
+/// reason is on tracing::warn for operators.
+pub async fn verify_oci_signature(
+    reference: &str,
+    identity_regexp: &str,
+    oidc_issuer: &str,
+) -> Result<(), String> {
+    let argv = cosign_verify_argv(reference, identity_regexp, oidc_issuer);
+    // Prefer the absolute path pinned at startup so this invocation
+    // targets the SAME binary that the M5 `AEGIX_COSIGN_SHA256` gate
+    // just hashed. When unpinned (tests, audit-mode without a hash
+    // pin, pre-startup), fall back to PATH lookup — the operator-
+    // visible warning at startup already covers that posture.
+    //
+    // M (2026-05-23, wasm-security review): in production, refuse the
+    // PATH-lookup fallback. A successful M5 hash check at startup that
+    // failed to set the OnceLock would silently degrade every
+    // subsequent verification — operator-visible warning at boot is
+    // not sufficient guarantee that the production verification path
+    // uses the hashed binary. Fail-closed here makes the binary-pin
+    // invariant hold for every call, not just the happy path.
+    let mut command = match cosign_pinned_path() {
+        Some(path) => tokio::process::Command::new(path),
+        None => {
+            if aegix_config::is_production() {
+                ::tracing::error!(
+                    reference = %reference,
+                    "SECURITY: cosign binary path was not pinned at startup; \
+                     refusing to fall back to PATH lookup in production. The \
+                     M5 AEGIX_COSIGN_SHA256 hash check requires the same \
+                     binary across boot-time hashing and per-call execution. \
+                     Confirm cosign is on PATH at worker boot."
+                );
+                return Err("cosign_unpinned".to_string());
+            }
+            ::tracing::warn!(
+                reference = %reference,
+                "cosign path not pinned (dev mode) — falling back to PATH lookup"
+            );
+            tokio::process::Command::new("cosign")
+        }
+    };
+    // A private registry: cosign reads its login from COSIGN_REGISTRY_*,
+    // derived from the OCI_REGISTRY_* pair the pull itself uses (the one
+    // mapping, `aegix_sigstore_policy::cosign_registry_credentials_env`).
+    command
+        .args(&argv)
+        .envs(aegix_sigstore_policy::cosign_registry_credentials_env_from_process());
+    run_cosign_one_at_a_time(command, reference, COSIGN_VERIFY_LIMIT).await
+}
+
+/// Run a prepared `cosign verify` command behind [`COSIGN_VERIFY_GATE`],
+/// for at most `limit`. The one place the worker starts cosign to verify.
+///
+/// A command that outlives `limit` is killed (`kill_on_drop`), so it does
+/// not go on holding cosign's store after the gate is released, and the job
+/// is refused: a verification that did not finish is not a pass.
+async fn run_cosign_one_at_a_time(
+    mut command: tokio::process::Command,
+    reference: &str,
+    limit: std::time::Duration,
+) -> Result<(), String> {
+    command.kill_on_drop(true);
+    let _one_at_a_time = COSIGN_VERIFY_GATE.lock().await;
+    let output = match tokio::time::timeout(limit, command.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            // ENOENT (cosign missing) is operator misconfig — surface it
+            // distinctly so it isn't mistaken for a verification failure.
+            ::tracing::error!(
+                error = %e,
+                "cosign binary not found or unexecutable — install cosign in the worker image"
+            );
+            return Err("cosign_unavailable".to_string());
+        }
+        Err(_) => {
+            ::tracing::warn!(
+                reference = %reference,
+                limit_secs = limit.as_secs(),
+                "cosign verify did not finish within its limit and was killed"
+            );
+            return Err("signature_verification_timed_out".to_string());
+        }
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ::tracing::warn!(
+        reference = %reference,
+        exit_code = output.status.code().unwrap_or(-1),
+        stderr = %stderr,
+        "cosign verify failed"
+    );
+    Err("signature_verification_failed".to_string())
+}
+
+#[cfg(all(test, unix))]
+mod cosign_gate_tests {
+    use super::run_cosign_one_at_a_time;
+    use std::time::Duration;
+
+    /// A stand-in for cosign's store: `mkdir` takes it or fails, as the
+    /// second opener of cosign's store fails, with cosign's own words.
+    const ONE_HOLDER_AT_A_TIME: &str = r#"
+        if ! mkdir "$STORE/held" 2>/dev/null; then
+            echo "Error: getting Rekor public keys: creating cached local store: resource temporarily unavailable" >&2
+            exit 1
+        fi
+        sleep 0.2
+        rmdir "$STORE/held"
+    "#;
+
+    fn stand_in(script: &str, store: &std::path::Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(script).env("STORE", store);
+        command
+    }
+
+    /// The defect: verifications started together, and all but the first
+    /// refused. Without the gate this fails on the second.
+    #[tokio::test]
+    async fn verifications_started_together_all_pass() {
+        let store = tempfile::tempdir().unwrap();
+        let mut started = Vec::new();
+        for _ in 0..6 {
+            let command = stand_in(ONE_HOLDER_AT_A_TIME, store.path());
+            started.push(tokio::spawn(async move {
+                run_cosign_one_at_a_time(
+                    command,
+                    "registry.test/t@sha256:00",
+                    Duration::from_secs(30),
+                )
+                .await
+            }));
+        }
+        for (n, one) in started.into_iter().enumerate() {
+            assert_eq!(one.await.unwrap(), Ok(()), "verification {n} was refused");
+        }
+    }
+
+    /// A verification that does not finish is refused as a signature
+    /// failure, is killed, and leaves the gate free for the next.
+    #[tokio::test]
+    async fn one_that_outlives_its_limit_is_refused_killed_and_frees_the_gate() {
+        let store = tempfile::tempdir().unwrap();
+        let hangs = stand_in(r#"echo $$ > "$STORE/pid"; exec sleep 600"#, store.path());
+        let began = std::time::Instant::now();
+        let refused = run_cosign_one_at_a_time(
+            hangs,
+            "registry.test/t@sha256:00",
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(refused, Err("signature_verification_timed_out".to_string()));
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "the limit did not bound the wait"
+        );
+        // The retry classifier reads "signature" as a failure it never retries.
+        assert!(refused.unwrap_err().contains("signature"));
+        // Killed, not left holding cosign's store: the process is gone.
+        let pid = std::fs::read_to_string(store.path().join("pid")).unwrap();
+        let mut gone = false;
+        for _ in 0..50 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(gone, "the timed-out verification was left running");
+
+        let next = stand_in("exit 0", store.path());
+        let passed = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_cosign_one_at_a_time(next, "registry.test/t@sha256:00", Duration::from_secs(5)),
+        )
+        .await
+        .expect("the gate was still held after a timed-out verification");
+        assert_eq!(passed, Ok(()));
+    }
+
+    /// A refusal by cosign itself is still a refusal.
+    #[tokio::test]
+    async fn a_refused_signature_is_refused() {
+        let store = tempfile::tempdir().unwrap();
+        let refuses = stand_in("echo 'no matching signatures' >&2; exit 1", store.path());
+        assert_eq!(
+            run_cosign_one_at_a_time(refuses, "registry.test/t@sha256:00", Duration::from_secs(5))
+                .await,
+            Err("signature_verification_failed".to_string())
+        );
+    }
+}
+
+/// Parse a `MAJOR.MINOR.PATCH` semver triple out of an arbitrary string.
+/// Pure function so the M5 cosign-version-pin policy is unit-testable.
+/// Returns `None` when no dotted triple of integers is found. The first
+/// triple encountered wins — cosign's `version` output puts the binary's
+/// own version on a line preceded by `GitVersion:` or the bare semver,
+/// and we don't want to over-fit on the exact format because it has
+/// shifted across cosign releases.
+pub fn parse_cosign_version(stdout: &str) -> Option<(u32, u32, u32)> {
+    // Scan for any token shaped like `vX.Y.Z` or `X.Y.Z` (with an
+    // optional `-suffix` we ignore).
+    for token in stdout.split(|c: char| !c.is_ascii_digit() && c != '.') {
+        if let Some(triple) = parse_semver_triple(token) {
+            return Some(triple);
+        }
+    }
+    None
+}
+
+/// Parse a strict `MAJOR.MINOR.PATCH` triple. Pure; companion to
+/// `parse_cosign_version`.
+pub fn parse_semver_triple(s: &str) -> Option<(u32, u32, u32)> {
+    let trimmed = s.trim().trim_start_matches('v');
+    let mut parts = trimmed.split('.');
+    let maj: u32 = parts.next()?.parse().ok()?;
+    let min: u32 = parts.next()?.parse().ok()?;
+    // PATCH may carry a `-suffix`; truncate at the first non-digit.
+    let patch_raw = parts.next()?;
+    let patch_str: String = patch_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if patch_str.is_empty() {
+        return None;
+    }
+    let patch: u32 = patch_str.parse().ok()?;
+    Some((maj, min, patch))
+}
+
+/// Process-wide pinned absolute path to the `cosign` binary, resolved
+/// once at startup and reused for every verification call.
+///
+/// L-3 follow-up: every `tokio::process::Command::new("cosign")` re-walks
+/// `PATH`, so the M5 `AEGIX_COSIGN_SHA256` startup check (which hashes the
+/// binary at the path returned by `which cosign` at boot) could be
+/// circumvented by a later `PATH` mutation — the verify call would resolve
+/// a different binary than the one that was hashed. Pinning the absolute
+/// path at startup and reusing it makes the M5 hash check apply to every
+/// subsequent invocation. Defense-in-depth in the immutable-container
+/// happy path; correctness in any environment where `PATH` is mutable.
+static COSIGN_BINARY_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Read the pinned cosign path if startup resolution succeeded. Callers
+/// in `verify_oci_signature` use this; when `None` (e.g. tests or a
+/// pre-startup call), fall back to invoking `cosign` by name — the
+/// behavioural difference is only the loss of the PATH-pin guarantee.
+pub fn cosign_pinned_path() -> Option<&'static std::path::Path> {
+    COSIGN_BINARY_PATH.get().map(|p| p.as_path())
+}
+
+/// Resolve the `cosign` binary on PATH, pin its absolute path for the
+/// process lifetime, and compute its SHA-256.
+///
+/// The path pin is set as a side-effect of a successful resolve so the
+/// M5 hash pin gate at startup and the per-invocation execution path
+/// agree on which binary is being checked.
+pub async fn resolve_and_hash_cosign_binary() -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("which")
+        .arg("cosign")
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to invoke `which cosign`: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!("`which cosign` exited non-zero — binary not on PATH");
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        anyhow::bail!("`which cosign` produced empty output");
+    }
+    let path_buf = std::path::PathBuf::from(&path);
+    let bytes = tokio::fs::read(&path_buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read cosign at {path}: {e}"))?;
+    use sha2::Digest as _;
+    let hash = hex::encode(sha2::Sha256::digest(&bytes)).to_string();
+    // Pin the resolved absolute path for the process lifetime so every
+    // `verify_oci_signature` invocation targets the same binary the M5
+    // startup gate just hashed. `set` is idempotent on success — a later
+    // resolve (e.g. in a test) is silently ignored.
+    let _ = COSIGN_BINARY_PATH.set(path_buf);
+    Ok(hash)
+}
+
+/// Manifest media types the worker accepts: single-arch image manifests
+/// only. A multi-arch index is refused (Wasm artifacts are single-arch).
+#[cfg(feature = "oci")]
+const OCI_IMAGE_MANIFEST_MEDIA_TYPES: &[&str] = &[
+    oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+    oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+];
+#[cfg(feature = "oci")]
+const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
+
+/// A manifest resolved ONCE and bound by its content digest.
+#[cfg(feature = "oci")]
+#[derive(Debug)]
+pub struct PinnedManifest {
+    /// `sha256:<hex>` of the manifest bytes as received.
+    pub manifest_digest: String,
+    /// `registry/repository@<manifest_digest>` — what cosign verifies.
+    pub pinned_ref: String,
+    /// The Wasm layer to fetch, with foreign `urls` stripped.
+    pub layer: oci_client::manifest::OciDescriptor,
+}
+
+/// Bind an OCI reference to the manifest body the registry returned. Pure:
+/// computes the manifest digest from the BODY (never the registry header),
+/// refuses a body that contradicts a digest the reference already names,
+/// refuses an index / non-Wasm / empty / oversized manifest, and builds the
+/// digest-pinned reference cosign must verify.
+#[cfg(feature = "oci")]
+pub fn pin_oci_manifest(
+    reference: &oci_client::Reference,
+    manifest_body: &[u8],
+    layer_cap: u64,
+) -> Result<PinnedManifest, String> {
+    use oci_client::manifest::OciManifest;
+    use sha2::Digest as _;
+    use subtle::ConstantTimeEq as _;
+    let manifest_digest = format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(manifest_body))
+    );
+    if let Some(requested) = reference.digest() {
+        let same: bool = requested
+            .as_bytes()
+            .ct_eq(manifest_digest.as_bytes())
+            .into();
+        if !same {
+            return Err(format!(
+                "oci_manifest_digest_mismatch: reference pins {requested}, registry served {manifest_digest}"
+            ));
+        }
+    }
+    let manifest: OciManifest = serde_json::from_slice(manifest_body)
+        .map_err(|_| "oci_manifest_unparseable".to_string())?;
+    let image = match manifest {
+        OciManifest::Image(img) => img,
+        OciManifest::ImageIndex(_) => {
+            return Err(
+                "oci_manifest_is_index: multi-arch image index is not supported \
+                        for Wasm modules"
+                    .to_string(),
+            )
+        }
+    };
+    let sizes: Vec<i64> = image.layers.iter().map(|d| d.size).collect();
+    if let ManifestSizeVerdict::Oversized { declared, cap } =
+        check_manifest_layer_sizes(&sizes, layer_cap)
+    {
+        return Err(format!(
+            "oci_layer_too_large: manifest declares layer of {declared} bytes, \
+             cap is {cap} (set WORKER_MAX_OCI_LAYER_BYTES to override)"
+        ));
+    }
+    if let Some(bad) = image
+        .layers
+        .iter()
+        .find(|l| l.media_type != WASM_LAYER_MEDIA_TYPE)
+    {
+        return Err(format!(
+            "oci_layer_media_type_rejected: {}",
+            sanitize_error_message(&bad.media_type)
+        ));
+    }
+    let mut layer = image
+        .layers
+        .into_iter()
+        .next()
+        .ok_or_else(|| "oci_manifest_missing_layer_descriptor".to_string())?;
+    // A descriptor's foreign `urls` would let a registry send the worker to
+    // an arbitrary host; the blob is fetched from the registry only.
+    layer.urls = None;
+    let pinned_ref = format!(
+        "{}/{}@{}",
+        reference.registry(),
+        reference.repository(),
+        manifest_digest
+    );
+    Ok(PinnedManifest {
+        manifest_digest,
+        pinned_ref,
+        layer,
+    })
+}
+
+#[cfg(feature = "oci")]
+#[derive(Debug)]
+enum BlobFetchError {
+    /// The stream exceeded the cap; carries the bytes seen when it stopped.
+    TooLarge(u64),
+    Transport(String),
+}
+
+/// Stream a layer blob by digest, refusing once it exceeds `cap` (so a
+/// registry cannot grow host memory past the cap before any check runs).
+#[cfg(feature = "oci")]
+async fn fetch_capped_blob(
+    client: &oci_client::Client,
+    image: &oci_client::Reference,
+    layer: &oci_client::manifest::OciDescriptor,
+    cap: u64,
+) -> Result<Vec<u8>, BlobFetchError> {
+    use futures_util::StreamExt as _;
+    let mut stream = client
+        .pull_blob_stream(image, layer)
+        .await
+        .map_err(|e| BlobFetchError::Transport(e.to_string()))?;
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| BlobFetchError::Transport(e.to_string()))?;
+        let next = out.len() as u64 + chunk.len() as u64;
+        if next > cap {
+            return Err(BlobFetchError::TooLarge(next));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// Read a filesystem module: regular files only (not a device, FIFO or
+/// directory), size-checked from metadata BEFORE reading, and the read itself
+/// bounded at `cap + 1` so a file that grows mid-read is still refused.
+/// Blocking — call from `spawn_blocking`.
+pub(crate) fn read_module_file_capped(path: &str, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| format!("failed to read wasm module: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("failed to read wasm module: {e}"))?;
+    if !meta.is_file() {
+        return Err("failed to read wasm module: not a regular file".to_string());
+    }
+    if meta.len() > cap {
+        return Err(format!(
+            "wasm_module_too_large: filesystem file is {} bytes, cap is {cap}",
+            meta.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(meta.len() as usize);
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| format!("failed to read wasm module: {e}"))?;
+    if out.len() as u64 > cap {
+        return Err(format!(
+            "wasm_module_too_large: filesystem file exceeds cap {cap}"
+        ));
+    }
+    Ok(out)
+}
+
+/// Decision returned by `verify_oci_layer` — small enum to make the security-
+/// critical "should we trust these bytes?" decision testable in isolation.
+#[derive(Debug, PartialEq)]
+pub enum LayerVerdict<'a> {
+    /// Manifest declared a digest and the layer's recomputed sha256 matches.
+    /// Safe to execute and cache.
+    Verified { digest: &'a str },
+    /// Manifest had no layer descriptor — registry returned a malformed
+    /// manifest. Accept with a warning (legacy behaviour) but flag it.
+    AcceptedUnverified,
+    /// Manifest digest != recomputed digest. Refuse to execute. Returned
+    /// with both digests so the caller can log structured fields.
+    DigestMismatch { expected: &'a str, computed: String },
+}
+
+/// Verify a pulled OCI layer's bytes against its manifest digest. Pure
+/// function — no I/O, no allocations beyond the sha256 itself — so it can be
+/// unit-tested without a registry. Called from the worker's OCI fetch path
+/// before the bytes are cached or executed.
+///
+/// L-2 (2026-05-22): comparison is constant-time via
+/// `subtle::ConstantTimeEq`. Neither input is secret here (manifest digest
+/// is public; the computed digest is recomputable from public bytes), so
+/// the timing-leak threat model doesn't strictly apply — but keeping the
+/// comparison constant-time matches the rest of the workspace's
+/// crypto-equality discipline (`aegix_rpc_protocol::rpc_auth`, AOT HMAC,
+/// `AEGIX_COSIGN_SHA256`) and removes a sharp edge if this code is ever
+/// pasted into a key-dependent path.
+pub fn verify_oci_layer<'a>(
+    layer_data: &[u8],
+    manifest_digest: Option<&'a str>,
+) -> LayerVerdict<'a> {
+    use sha2::Digest as _;
+    use subtle::ConstantTimeEq as _;
+    let computed = format!("sha256:{}", hex::encode(sha2::Sha256::digest(layer_data)));
+    match manifest_digest {
+        Some(expected) => {
+            let eq: bool = expected.as_bytes().ct_eq(computed.as_bytes()).into();
+            if eq {
+                LayerVerdict::Verified { digest: expected }
+            } else {
+                LayerVerdict::DigestMismatch { expected, computed }
+            }
+        }
+        None => LayerVerdict::AcceptedUnverified,
+    }
+}
+
+// MCP-913 (2026-05-14): bare OnceLock<Client>, no outer Mutex.
+// `oci_client::Client::pull` takes `&self` (verified against
+// the 0.11 source — internal `auth_store: Arc<RwLock<HashMap<...>>>`
+// handles the token cache concurrency). Pre-fix `OnceLock<Mutex<Client>>`
+// + `client_mutex.lock().await` SERIALIZED every concurrent OCI pull
+// through one lock. The critical section held across:
+//   - sigstore `cosign verify` subprocess (network + fork, ~1-3s)
+//   - OCI registry pull (network + blob transfer, ~1-10s)
+//   - layer digest verify (fast)
+//   - Redis cache SET (network, fast)
+// So under worker concurrency, a second module pull waited for the
+// first to FULLY complete the chain. With 5–15s per pull, this
+// capped worker module-load throughput at one-at-a-time per scheme
+// (HTTPS / HTTP separately). The two schemes don't share locks but
+// neither do they handle hostname-level isolation.
+#[cfg(feature = "oci")]
+static OCI_CLIENT_HTTPS: OnceLock<oci_client::Client> = OnceLock::new();
+#[cfg(feature = "oci")]
+static OCI_CLIENT_HTTP: OnceLock<oci_client::Client> = OnceLock::new();
+
+#[cfg(feature = "oci")]
+fn get_oci_client(is_http: bool) -> &'static oci_client::Client {
+    if is_http {
+        OCI_CLIENT_HTTP.get_or_init(|| {
+            let client_config = oci_client::client::ClientConfig {
+                protocol: oci_client::client::ClientProtocol::Http,
+                ..Default::default()
+            };
+            oci_client::Client::new(client_config)
+        })
+    } else {
+        OCI_CLIENT_HTTPS.get_or_init(|| {
+            let client_config = oci_client::client::ClientConfig::default();
+            oci_client::Client::new(client_config)
+        })
+    }
+}
+
+/// Is `host` a cloud-metadata service hostname or IP literal?
+///
+/// These hosts MUST NEVER appear as an OCI registry — they exist only
+/// to serve short-lived credentials to the workload running on that
+/// VM. A worker that issues an OCI pull against one of these
+/// addresses is being SSRF'd into leaking the controller pod's
+/// IMDS/STS token (or whatever the cloud's metadata service hands out
+/// to authenticated callers).
+///
+/// `host` is the registry component of a parsed `oci_client::Reference`,
+/// which is the hostname-with-optional-port (e.g. `"169.254.169.254:5000"`).
+/// The port is stripped before comparison so `169.254.169.254:5000` still
+/// matches the IPv4 literal.
+///
+/// **Cases covered:**
+/// * IMDS v1/v2 (AWS, Azure, OpenStack, DigitalOcean): `169.254.169.254`
+/// * GCE: `metadata.google.internal` (DNS), `metadata` (short-form),
+///   `169.254.169.254` (same IP as AWS)
+/// * AWS EC2 IMDSv2 IPv6: `fd00:ec2::254`
+/// * Oracle Cloud: `169.254.169.254` (same)
+/// * Alibaba Cloud: `100.100.100.200`
+///
+/// Comparison is case-insensitive for DNS names; IP literals are
+/// compared by parsing both sides as `IpAddr` so spelling tricks
+/// (`169.254.169.0254`, `0xa9.0xfe.0xa9.0xfe`, `2852039166`) don't
+/// bypass — `Ipv4Addr::from_str` accepts only canonical dotted-quad
+/// form, but a future hostile encoding could be added here as the
+/// threat landscape evolves.
+pub fn is_metadata_service_host(host: &str) -> bool {
+    // Strip port. The OCI registry component is one of:
+    //   1. `host` — bare DNS / IPv4
+    //   2. `host:port` — DNS / IPv4 with port
+    //   3. `[v6addr]:port` — IPv6 literal with port (bracketed)
+    //   4. `v6addr` — bare IPv6 literal (e.g. `fd00:ec2::254`)
+    //
+    // The ambiguity is case 4 vs case 2: `fd00:ec2::254` has a final
+    // `:254` that looks like a port to a naive `rsplit_once(':')`.
+    // We disambiguate by trying to parse the whole string as an
+    // IpAddr first — if it parses, no port stripping needed.
+    let host_no_port: &str = if host.parse::<std::net::IpAddr>().is_ok() {
+        // Bare IPv4 or bare IPv6 — use as-is.
+        host
+    } else if let Some(end) = host.strip_prefix('[') {
+        // `[v6addr]` or `[v6addr]:port` — strip brackets, drop suffix.
+        match end.split_once(']') {
+            Some((v6, _after_bracket)) => v6,
+            None => host, // malformed — let `parse::<IpAddr>` fail below
+        }
+    } else if let Some((before, after)) = host.rsplit_once(':') {
+        // `host:port`. The port suffix must be ASCII digits; otherwise
+        // the colon is part of an unbracketed IPv6 (already handled
+        // above by the IpAddr parse) and we shouldn't strip.
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            before
+        } else {
+            host
+        }
+    } else {
+        host
+    };
+
+    // DNS-name matches (case-insensitive).
+    let dns_matches = [
+        "metadata.google.internal",
+        "metadata",
+        "metadata.aws.amazon.com",
+    ];
+    for name in dns_matches {
+        if host_no_port.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+
+    // IP-literal matches.
+    if let Ok(ip) = host_no_port.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                // 169.254.169.254 — AWS/Azure/GCP/Oracle/DO IMDS.
+                if v4.octets() == [169, 254, 169, 254] {
+                    return true;
+                }
+                // 100.100.100.200 — Alibaba Cloud metadata.
+                if v4.octets() == [100, 100, 100, 200] {
+                    return true;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                // fd00:ec2::254 — AWS IMDSv2 IPv6.
+                // Decompresses to `fd00:0ec2:0:0:0:0:0:0254`, so the
+                // segment layout is `[0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]`.
+                let segs = v6.segments();
+                if segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254] {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod is_metadata_service_host_tests {
+    use super::is_metadata_service_host;
+
+    #[test]
+    fn aws_imds_v4_blocked() {
+        assert!(is_metadata_service_host("169.254.169.254"));
+        assert!(is_metadata_service_host("169.254.169.254:80"));
+        assert!(is_metadata_service_host("169.254.169.254:5000"));
+    }
+
+    #[test]
+    fn alibaba_metadata_blocked() {
+        assert!(is_metadata_service_host("100.100.100.200"));
+        assert!(is_metadata_service_host("100.100.100.200:80"));
+    }
+
+    #[test]
+    fn aws_imds_v6_blocked() {
+        // fd00:ec2::254 (unbracketed)
+        assert!(is_metadata_service_host("fd00:ec2::254"));
+        // bracketed with port
+        assert!(is_metadata_service_host("[fd00:ec2::254]:443"));
+    }
+
+    #[test]
+    fn gce_metadata_dns_blocked() {
+        assert!(is_metadata_service_host("metadata.google.internal"));
+        assert!(is_metadata_service_host("METADATA.GOOGLE.INTERNAL"));
+        assert!(is_metadata_service_host("metadata"));
+        assert!(is_metadata_service_host("Metadata"));
+        assert!(is_metadata_service_host("metadata.google.internal:80"));
+    }
+
+    #[test]
+    fn legitimate_registries_allowed() {
+        // Local-cluster setups must not be blocked.
+        assert!(!is_metadata_service_host("ghcr.io"));
+        assert!(!is_metadata_service_host("registry:5000"));
+        assert!(!is_metadata_service_host("localhost:5000"));
+        assert!(!is_metadata_service_host("127.0.0.1:5000"));
+        assert!(!is_metadata_service_host("registry.svc.cluster.local"));
+        // Public registries.
+        assert!(!is_metadata_service_host("docker.io"));
+        assert!(!is_metadata_service_host("quay.io"));
+        assert!(!is_metadata_service_host("us-docker.pkg.dev"));
+    }
+
+    #[test]
+    fn near_misses_allowed() {
+        // Unicode lookalikes — host_no_port comparison is byte-exact for IPs.
+        // The host parser would have rejected non-ASCII anyway, but defense in depth.
+        assert!(!is_metadata_service_host("169.254.169.253"));
+        assert!(!is_metadata_service_host("169.254.169.255"));
+        // Different but related private ranges.
+        assert!(!is_metadata_service_host("169.254.0.1"));
+        // Not a registry name pattern.
+        assert!(!is_metadata_service_host("registry-metadata.example.com"));
+    }
+}
+
+/// Acquire the WASM module bytes for a job.
+///
+/// Sources, in order of preference (behaviour unchanged from the
+/// pre-extraction `execute_job` inline block):
+/// * inline `req.wasm_bytes` (HMAC over the job covers sha256(bytes));
+/// * `oci://` pull — metadata-service host gate, HTTP-downgrade gate,
+///   Sigstore verification, pre-pull manifest size gate, digest-keyed
+///   Redis cache (re-verified on hit), post-pull size + layer-digest
+///   verification, cache write only after full attestation — in a build
+///   with the crate's `oci` feature ([`HAS_OCI_REGISTRY_CLIENT`]); without
+///   it the dispatch is refused with [`NoRegistryClientInThisBuild`] and
+///   no other source is tried;
+/// * `redis:wasm:` direct fetch (size-capped);
+/// * filesystem fallback (size-capped).
+///
+/// On failure, [`FetchError::message`] carries — byte-for-byte — the
+/// string the caller must place in the failed `JobResult`'s
+/// `output_payload.error` AND pass to `span.end_error` (exactly what
+/// the pre-extraction inline code emitted). All other span
+/// attributes/events and log lines are emitted here.
+pub async fn fetch(
+    req: &JobRequest,
+    runtime: &AegixRuntime,
+    span: &mut JobSpan,
+) -> Result<FetchedModule, FetchError> {
+    // Load the Wasm module bytes.
+    //
+    // SECURITY: track whether the bytes we end up executing were
+    // cryptographically attested during THIS worker run:
+    // * inline `wasm_bytes` from a JobRequest — HMAC over the job covers
+    //   sha256(bytes), so attested by the signing key.
+    // * Fresh OCI pull that completed Sigstore + layer-digest checks.
+    // The opposite (NOT attested in this run): a Redis cache hit used as
+    // OCI fallback, a `redis:wasm:` direct fetch, or a filesystem load.
+    // For unattested bytes, `expected_wasm_hash` from the controller is
+    // the only thing standing between us and a Redis-write attacker
+    // substituting malicious WASM. The verification block downstream
+    // refuses to execute unattested bytes when no hash is supplied.
+    let mut bytes_attested_in_this_run = false;
+    span.add_event("loading_module");
+    let wasm_bytes = if let Some(bytes) = &req.wasm_bytes {
+        // PERFORMANCE: Use bytes provided in job request (avoids file I/O)
+        // HMAC over the JobRequest covers sha256(bytes) — attested.
+        span.set_attribute_int("module_size_bytes", bytes.len() as i64);
+        span.set_attribute("module_source", "job_request");
+        bytes_attested_in_this_run = true;
+        bytes.clone()
+    } else if req.module_uri.starts_with("oci://") {
+        fetch_from_registry(req, runtime, span, &mut bytes_attested_in_this_run).await?
+    } else if req.module_uri.starts_with("redis:wasm:") {
+        // Fetch from Redis via AegixRuntime's redis client
+        span.add_event("fetching_from_redis");
+
+        let mut found_bytes: Option<Vec<u8>> = None;
+        if let Some(redis_client) = runtime.redis_client() {
+            if let Ok(mut conn) = aegix_redis::multiplexed(&redis_client).await {
+                // remove "redis:" prefix to get the actual key: "wasm:{user_id}:{module_id}"
+                let key = req
+                    .module_uri
+                    .strip_prefix("redis:")
+                    .unwrap_or(&req.module_uri);
+                if let Ok(Some(b)) = redis::cmd("GET")
+                    .arg(key)
+                    .query_async::<Option<Vec<u8>>>(&mut conn)
+                    .await
+                {
+                    found_bytes = Some(b);
+                }
+            }
+        }
+
+        if let Some(b) = found_bytes {
+            // H-3: cap also applies to the direct `redis:wasm:` path —
+            // an attacker with Redis write access could plant an
+            // oversized WASM blob here too. Reject before the bytes
+            // reach wasmtime so the OOM defense applies uniformly
+            // across all load sources.
+            let layer_cap = max_oci_layer_bytes();
+            if (b.len() as u64) > layer_cap {
+                let err = format!(
+                    "wasm_module_too_large: redis:wasm: blob is {} bytes, cap is {layer_cap}",
+                    b.len()
+                );
+                ::tracing::error!(
+                    module_uri = %req.module_uri,
+                    blob_size = b.len(),
+                    cap_bytes = layer_cap,
+                    "redis:wasm: blob exceeds cap — refusing to execute"
+                );
+                return Err(FetchError { message: err });
+            }
+            span.set_attribute_int("module_size_bytes", b.len() as i64);
+            span.set_attribute("module_source", "redis");
+            b
+        } else {
+            let error_msg =
+                "failed to fetch wasm module from redis (not found or redis unavailable)";
+            span.set_attribute("error", error_msg);
+            return Err(FetchError {
+                message: error_msg.to_string(),
+            });
+        }
+    } else {
+        // FALLBACK: filesystem. W13 (2026-09-25): any signed `module_uri`
+        // that is neither `oci://` nor `redis:wasm:` used to reach
+        // `std::fs::read` — blocking, reading the WHOLE file before the size
+        // cap (`/dev/zero` → OOM). Production has no legitimate filesystem
+        // module source, so it is refused there; elsewhere the read is
+        // stat-first, regular-files-only, capped and off the runtime thread.
+        if aegix_config::is_production() {
+            ::tracing::error!(
+                module_uri = %req.module_uri,
+                "module_uri is neither oci:// nor redis:wasm: — filesystem modules are \
+                 refused in production"
+            );
+            return Err(FetchError {
+                message: "unsupported_module_uri_scheme: filesystem module paths are refused \
+                          in production"
+                    .to_string(),
+            });
+        }
+        let layer_cap = max_oci_layer_bytes();
+        let path = req.module_uri.clone();
+        let read = tokio::task::spawn_blocking(move || read_module_file_capped(&path, layer_cap))
+            .await
+            .unwrap_or_else(|_| Err("failed to read wasm module: reader task failed".to_string()));
+        match read {
+            Ok(b) => {
+                span.set_attribute_int("module_size_bytes", b.len() as i64);
+                span.set_attribute("module_source", "filesystem");
+                b
+            }
+            Err(error_msg) => {
+                ::tracing::error!(module_uri = %req.module_uri, reason = %error_msg, "filesystem WASM load refused");
+                let sanitized_error = sanitize_error_message(&error_msg);
+                span.set_attribute("error", &sanitized_error);
+                return Err(FetchError {
+                    message: sanitized_error,
+                });
+            }
+        }
+    };
+
+    Ok(FetchedModule {
+        bytes: wasm_bytes,
+        attested_in_this_run: bytes_attested_in_this_run,
+    })
+}
+
+/// The `oci://` arm of [`fetch`]: resolve the reference, refuse a metadata
+/// host and a production HTTP downgrade, fetch and pin the manifest, verify
+/// the Sigstore signature under the policy, serve a digest-keyed cache hit or
+/// stream the layer under the cap, verify the layer digest, and cache only an
+/// attested pull. The body is the pre-2026-11-02 inline branch, moved here
+/// verbatim so the registry client can be a build feature (`oci`); every
+/// message and log line is unchanged.
+#[cfg(feature = "oci")]
+async fn fetch_from_registry(
+    req: &JobRequest,
+    runtime: &AegixRuntime,
+    span: &mut JobSpan,
+    attested_in_this_run: &mut bool,
+) -> Result<Vec<u8>, FetchError> {
+    // Fetch from OCI Registry (e.g. GitHub Container Registry, AWS ECR, JFrog)
+    span.add_event("fetching_from_oci_registry");
+    span.set_attribute("oci_url", &req.module_uri);
+
+    // Strip the "oci://" prefix
+    let mut image_ref = req
+        .module_uri
+        .strip_prefix("oci://")
+        .unwrap_or(&req.module_uri)
+        .to_string();
+
+    if image_ref.starts_with("localhost:5001") {
+        image_ref = image_ref.replace("localhost:5001", "registry:5000");
+    }
+
+    // H1 (2026-05-22): cache lookup is digest-keyed, not URI-keyed.
+    // Pre-fix the cache used `oci_cache:{module_uri}` which, for
+    // mutable tags like `…:latest`, served whatever bytes the
+    // previous pull stored — even if the registry had since
+    // repointed the tag to different bytes. With the digest in the
+    // key, a tag repoint produces a fresh cache entry under the
+    // new digest; the old entry expires naturally on its TTL.
+    //
+    // The lookup itself is deferred until AFTER we've fetched the
+    // manifest below — only then do we know the canonical layer
+    // digest for THIS tag at THIS moment. Manifest fetch is small
+    // (a few KB of JSON, no decompression); for high-throughput
+    // workloads this adds one round-trip per execution but
+    // eliminates the cache-poisoning window.
+    let mut found_bytes: Option<Vec<u8>> = None;
+
+    use oci_client::secrets::RegistryAuth;
+    use oci_client::Reference;
+
+    if let Ok(reference) = image_ref.parse::<Reference>() {
+        // SECURITY: registry-host SSRF gate.
+        //
+        // The module_uri is HMAC-bound in the JobRequest, so an
+        // on-wire attacker can't redirect us to a different
+        // registry. But a compromised controller — or a stored
+        // module record pointing at the wrong host — could try to
+        // point the worker at a metadata-service endpoint and
+        // exfiltrate cloud creds. We refuse to make ANY OCI
+        // request against a known metadata-service hostname / IP
+        // regardless of other gates.
+        //
+        // NOT a blanket RFC-1918 block: legitimate setups use
+        // localhost:5000 / registry:5000 / kube DNS like
+        // registry.svc.cluster.local. We only refuse hosts that
+        // are NEVER legitimate registries. Sigstore verification
+        // would catch unsigned bytes from any host anyway, but
+        // the metadata-service exposure is the worst-case (token
+        // leak via HTTP body / headers / error message); fail
+        // closed BEFORE making the network round-trip.
+        if is_metadata_service_host(reference.registry()) {
+            let err = "registry_host_denied: cloud metadata service host \
+                 is never a legitimate OCI registry"
+                .to_string();
+            ::tracing::error!(
+                module_uri = %req.module_uri,
+                registry = %reference.registry(),
+                "OCI fetch attempted against cloud metadata host — refusing"
+            );
+            return Err(FetchError { message: err });
+        }
+
+        // In a development environment with a local registry, we need to allow HTTP.
+        // SECURITY: Ensure HTTP downgrade is never allowed in production.
+        // MCP-668 (2026-05-13): route through `aegix_config::is_production()`
+        // so an empty `RUST_ENV=""` from a helm placeholder doesn't
+        // bypass the production gate. Raw `unwrap_or_default()` would
+        // compare `"" == "production"` → false → fail OPEN.
+        let is_prod = aegix_config::is_production();
+        let is_local_registry = image_ref.starts_with("registry:5000")
+            || image_ref.starts_with("localhost:")
+            || image_ref.starts_with("127.0.0.1:");
+
+        let is_http = if is_local_registry && !is_prod {
+            true
+        } else if is_local_registry && is_prod {
+            let err_msg = "SECURITY: Denied HTTP downgrade for OCI fetch in production environment"
+                .to_string();
+            ::tracing::error!("{}", err_msg);
+            return Err(FetchError { message: err_msg });
+        } else {
+            false
+        };
+
+        // MCP-913: direct &Client — see OCI_CLIENT_HTTPS/HTTP comment for
+        // why the prior `client_mutex.lock().await` was a concurrency
+        // bottleneck. `Client::pull` is `&self` and thread-safe.
+        let client = get_oci_client(is_http);
+
+        // In a production enterprise setting, these would be loaded from HashiCorp Vault or mounted Secrets.
+        // MCP-762 (2026-05-13): match the sibling helper
+        // `aegix-registry::sync::registry_auth_from_env` (sync.rs:547)
+        // by filtering empty strings before constructing
+        // RegistryAuth::Basic. Pre-fix, `OCI_REGISTRY_USERNAME=""`
+        // (helm placeholder pattern) yielded `Ok("")` from
+        // std::env::var, took the `if let (Ok, Ok)` branch, and
+        // produced `RegistryAuth::Basic("", "")` — sent as
+        // `Authorization: Basic Og==` (base64 of `:`). The registry
+        // rejects with 401 instead of falling back to the
+        // documented anonymous-for-public-artifacts path. Same
+        // empty-env-var class as MCP-590/591/653/710/752/753; the
+        // controller-side `registry_auth_from_env` had the right
+        // shape but the worker-side resolver was the drift.
+        let user_opt = std::env::var("OCI_REGISTRY_USERNAME")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let pass_opt = std::env::var("OCI_REGISTRY_PASSWORD")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let auth = match (user_opt, pass_opt) {
+            (Some(user), Some(password)) => RegistryAuth::Basic(user, password),
+            _ => RegistryAuth::Anonymous,
+        };
+
+        let layer_cap = max_oci_layer_bytes();
+
+        // W13 (2026-09-25): resolve tag → manifest ONCE, from bytes WE
+        // hash. Pre-fix cosign verified the TAG, `pull_manifest` then
+        // re-resolved it (discarding the digest) and `pull` resolved it a
+        // THIRD time, so the executed-and-cached bytes were never bound to
+        // the manifest the signature covered — a registry could repoint
+        // the tag between the calls. Now one manifest fetch fixes the
+        // digest (computed from the body; the registry's
+        // `Docker-Content-Digest` header is not trusted), cosign verifies
+        // `repo@<that digest>`, and the layer blob is fetched by digest
+        // from that same manifest.
+        let (manifest_body, header_digest) = match client
+            .pull_manifest_raw(&reference, &auth, OCI_IMAGE_MANIFEST_MEDIA_TYPES)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                ::tracing::warn!(
+                    module_uri = %req.module_uri,
+                    error = %e,
+                    "Failed to fetch OCI manifest"
+                );
+                return Err(FetchError {
+                    message: sanitize_error_message(&format!("oci_manifest_fetch_failed: {e}")),
+                });
+            }
+        };
+        let pinned = match pin_oci_manifest(&reference, &manifest_body, layer_cap) {
+            Ok(p) => p,
+            Err(message) => {
+                ::tracing::error!(
+                    module_uri = %req.module_uri,
+                    reason = %message,
+                    "OCI manifest refused"
+                );
+                return Err(FetchError { message });
+            }
+        };
+        if header_digest != pinned.manifest_digest {
+            ::tracing::warn!(
+                module_uri = %req.module_uri,
+                header_digest = %header_digest,
+                computed_digest = %pinned.manifest_digest,
+                "registry Docker-Content-Digest disagrees with the manifest body — \
+                 using the computed digest"
+            );
+        }
+        span.set_attribute("oci_manifest_digest", &pinned.manifest_digest);
+
+        // Sigstore signature verification — runs against the DIGEST-PINNED
+        // reference resolved above (never the mutable tag), BEFORE any
+        // layer byte is fetched, so an unsigned or tampered artifact never
+        // gets executed OR cached. Policy is process-wide (resolved
+        // once from env at startup); enforcement happens per-pull so
+        // operators can flip from Audit → Required without restarting.
+        //
+        // SECURITY: this is the runtime trust boundary. Disabled mode
+        // is for dev only — production deploys MUST set
+        // AEGIX_SIGSTORE_REQUIRED=true.
+        //
+        // `sigstore_pass_in_this_run` is whether this pull's bytes may be
+        // written to the Redis OCI cache: a future pull served from the
+        // cache skips this step, so only a pull that was VERIFIED (or ran
+        // under the operator's explicit `disabled`) may seed it. The
+        // decision is `sigstore_verdict`'s; see its doc for the table.
+        // Until 2026-10-14 the flag started `true` and an `audit` pull with
+        // no identity regexp — which ran no verification at all — kept it,
+        // so unverified bytes were executed AND cached as attested (E-7).
+        let sigstore_policy = match SigstorePolicy::from_env() {
+            Ok(p) => p,
+            Err(e) => {
+                // The boot gate refuses this value; reaching here means the
+                // variable changed under a running process. Fail closed.
+                ::tracing::error!(module_uri = %req.module_uri, "{e}");
+                return Err(FetchError {
+                    message: format!("sigstore_policy_unrecognised: {e}"),
+                });
+            }
+        };
+        let sigstore_check = if sigstore_policy == SigstorePolicy::Disabled {
+            SigstoreCheck::NotRequested
+        } else {
+            let identity_regexp =
+                std::env::var("AEGIX_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
+            // MCP-752 (2026-05-13): filter empty so a helm-rendered
+            // `AEGIX_SIGSTORE_OIDC_ISSUER=""` doesn't bypass the default.
+            // Pre-fix, `unwrap_or_else(|_| default)` only fired on the
+            // env-unset path — `Ok("")` from a placeholder helm value
+            // passed `""` verbatim into `cosign verify
+            // --certificate-oidc-issuer ""`, weakening the documented
+            // defense-in-depth that pins certificates to GitHub Actions
+            // OIDC tokens specifically (per CLAUDE.md "Sigstore identity
+            // regexp pins to the workflow URL ... The OIDC issuer pin
+            // restricts to GitHub Actions tokens specifically. Without
+            // ... either omission lets a valid Sigstore signature from
+            // any other workflow on any other repo pass verification.").
+            // Same empty-env class as MCP-590/591/653/710.
+            let oidc_issuer = std::env::var("AEGIX_SIGSTORE_OIDC_ISSUER")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "https://token.actions.githubusercontent.com".to_string());
+            if identity_regexp.is_empty() {
+                SigstoreCheck::NoIdentity
+            } else {
+                match verify_oci_signature(&pinned.pinned_ref, &identity_regexp, &oidc_issuer).await
+                {
+                    Ok(()) => {
+                        span.add_event("sigstore_verify_ok");
+                        SigstoreCheck::Verified
+                    }
+                    Err(reason) => SigstoreCheck::Failed(reason),
+                }
+            }
+        };
+        let sigstore_pass_in_this_run = match sigstore_verdict(sigstore_policy, &sigstore_check) {
+            SigstoreVerdict::Cacheable => true,
+            SigstoreVerdict::ExecuteUncached => {
+                ::tracing::warn!(
+                    module_uri = %req.module_uri,
+                    check = ?sigstore_check,
+                    "Sigstore verification did not pass and policy is audit — \
+                     continuing execution but NOT caching bytes"
+                );
+                span.add_event("sigstore_unverified_audit");
+                false
+            }
+            SigstoreVerdict::Refuse(message) => {
+                ::tracing::error!(
+                    module_uri = %req.module_uri,
+                    reason = %message,
+                    "Sigstore verification did not pass and policy is required — \
+                     refusing to execute"
+                );
+                return Err(FetchError { message });
+            }
+        };
+
+        // H1: digest-keyed cache lookup, keyed on the layer digest named
+        // by the manifest whose OWN digest we computed and (per policy)
+        // signature-verified above.
+        //
+        // Cache hit re-verifies the cached bytes against the
+        // expected digest before serving (defense in depth against
+        // a Redis-write attacker). The cache is ONLY written below
+        // after both sigstore + digest checks pass in this run, so
+        // a hit implies prior attestation; we mark
+        // `bytes_attested_in_this_run` accordingly so the
+        // downstream `expected_wasm_hash` fallback doesn't kick in
+        // and re-fail for cached-but-no-hash-provided jobs.
+        let redis_key = Some(format!("oci_cache:{}", pinned.layer.digest));
+        if let (Some(digest), Some(key)) = (Some(&pinned.layer.digest), &redis_key) {
+            if let Some(redis_client) = runtime.redis_client() {
+                if let Ok(mut conn) = aegix_redis::multiplexed(&redis_client).await {
+                    if let Ok(Some(b)) = redis::cmd("GET")
+                        .arg(key)
+                        .query_async::<Option<Vec<u8>>>(&mut conn)
+                        .await
+                    {
+                        if (b.len() as u64) > layer_cap {
+                            ::tracing::error!(
+                                module_uri = %req.module_uri,
+                                cached_size = b.len(),
+                                cap_bytes = layer_cap,
+                                "Redis OCI cache hit exceeds layer cap — discarding cache entry, will refetch from registry"
+                            );
+                            let _: Result<(), _> = redis::cmd("DEL")
+                                .arg(key)
+                                .query_async::<()>(&mut conn)
+                                .await;
+                        } else {
+                            // Re-verify cached bytes against the
+                            // declared digest. A Redis-write
+                            // attacker who replaced the value but
+                            // not the key would fail here.
+                            match verify_oci_layer(&b, Some(digest.as_str())) {
+                                LayerVerdict::Verified { .. } => {
+                                    span.add_event("oci_cache_hit");
+                                    span.set_attribute("module_source", "redis_oci_cache");
+                                    *attested_in_this_run = true;
+                                    found_bytes = Some(b);
+                                }
+                                LayerVerdict::DigestMismatch { expected, computed } => {
+                                    ::tracing::error!(
+                                        module_uri = %req.module_uri,
+                                        expected = %expected,
+                                        computed = %computed,
+                                        "Redis OCI cache hit failed digest re-verification — evicting and refetching"
+                                    );
+                                    let _: Result<(), _> = redis::cmd("DEL")
+                                        .arg(key)
+                                        .query_async::<()>(&mut conn)
+                                        .await;
+                                }
+                                LayerVerdict::AcceptedUnverified => {
+                                    // Unreachable: we passed
+                                    // Some(digest) above so the
+                                    // None arm doesn't fire. Belt-
+                                    // and-braces: evict to force a
+                                    // fresh pull rather than serving
+                                    // unverified bytes.
+                                    let _: Result<(), _> = redis::cmd("DEL")
+                                        .arg(key)
+                                        .query_async::<()>(&mut conn)
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only fetch the layer on cache miss — by DIGEST, from the
+        // pinned manifest, streamed under the layer cap.
+        if found_bytes.is_none() {
+            let blob_ref = Reference::with_digest(
+                reference.registry().to_string(),
+                reference.repository().to_string(),
+                pinned.manifest_digest.clone(),
+            );
+            match fetch_capped_blob(client, &blob_ref, &pinned.layer, layer_cap).await {
+                Err(BlobFetchError::TooLarge(actual)) => {
+                    let err = format!(
+                        "oci_layer_too_large_post_pull: actual layer is at least {actual} \
+                         bytes, cap is {layer_cap} (manifest may have lied about declared size)"
+                    );
+                    ::tracing::error!(
+                        module_uri = %req.module_uri,
+                        actual_size = actual,
+                        cap_bytes = layer_cap,
+                        "OCI layer exceeds cap post-pull — refusing to execute or cache"
+                    );
+                    return Err(FetchError { message: err });
+                }
+                Err(BlobFetchError::Transport(e)) => {
+                    ::tracing::warn!(module_uri = %req.module_uri, error = %e, "Failed to pull WASM artifact from OCI registry");
+                    let err_msg = format!("oci_pull_error: {}", e);
+                    let sanitized_error = sanitize_error_message(&err_msg);
+                    span.add_event(&sanitized_error);
+                }
+                Ok(data) => match verify_oci_layer(&data, Some(pinned.layer.digest.as_str())) {
+                    LayerVerdict::Verified { digest } => {
+                        span.set_attribute("oci_layer_digest", digest);
+                        span.add_event("oci_pull_success");
+                        // SECURITY: only cache when both layers of
+                        // attestation passed in THIS pull — sigstore (per
+                        // policy) AND the layer digest. Caching on a
+                        // sigstore-Audit failure would let future pulls
+                        // bypass verification (cache hits short-circuit).
+                        if sigstore_pass_in_this_run {
+                            if let Some(key) = redis_key.as_deref() {
+                                if let Some(redis_client) = runtime.redis_client() {
+                                    if let Ok(mut conn) =
+                                        aegix_redis::multiplexed(&redis_client).await
+                                    {
+                                        let _: Result<(), _> = redis::cmd("SET")
+                                            .arg(key)
+                                            .arg(&data)
+                                            .arg("EX")
+                                            .arg(OCI_CACHE_TTL_SECS)
+                                            .query_async(&mut conn)
+                                            .await;
+                                    }
+                                }
+                            }
+                        } else {
+                            ::tracing::info!(
+                                module_uri = %req.module_uri,
+                                "OCI bytes attested by digest only \
+                                 (sigstore failed in audit mode) — \
+                                 skipping cache write so future pulls \
+                                 re-verify against the registry"
+                            );
+                        }
+                        *attested_in_this_run = true;
+                        found_bytes = Some(data);
+                    }
+                    LayerVerdict::DigestMismatch { expected, computed } => {
+                        let err = format!(
+                            "oci_digest_mismatch: manifest declared {}, computed {}",
+                            expected, computed
+                        );
+                        ::tracing::error!(
+                            module_uri = %req.module_uri,
+                            expected = %expected,
+                            computed = %computed,
+                            "OCI layer digest mismatch — refusing to execute"
+                        );
+                        return Err(FetchError { message: err });
+                    }
+                    // Unreachable: a digest was always supplied.
+                    LayerVerdict::AcceptedUnverified => {
+                        return Err(FetchError {
+                            message: "oci_manifest_missing_layer_descriptor".to_string(),
+                        });
+                    }
+                },
+            }
+        } // end `if found_bytes.is_none()` cache-miss block
+    }
+
+    match found_bytes {
+        Some(b) => Ok(b),
+        None => Err(FetchError {
+            message: "WASM payload not found in OCI registry".to_string(),
+        }),
+    }
+}
+
+/// The `oci://` arm of [`fetch`] in a build without the registry client
+/// ([`HAS_OCI_REGISTRY_CLIENT`] is `false`): refused with
+/// [`NoRegistryClientInThisBuild`], logged for the dispatch, and never served
+/// from the Redis OCI cache or the filesystem instead — a cache entry is keyed
+/// by a layer digest only a manifest fetch can name, and a dispatch that names
+/// a registry is not a dispatch that names a file. The refusal is the
+/// dispatch's failed `JobResult`, which the controller records and retries or
+/// routes as any other module-acquisition failure.
+#[cfg(not(feature = "oci"))]
+async fn fetch_from_registry(
+    req: &JobRequest,
+    _runtime: &AegixRuntime,
+    span: &mut JobSpan,
+    _attested_in_this_run: &mut bool,
+) -> Result<Vec<u8>, FetchError> {
+    span.add_event("fetching_from_oci_registry");
+    span.set_attribute("oci_url", &req.module_uri);
+    let refusal = NoRegistryClientInThisBuild;
+    ::tracing::error!(
+        target: "talos_worker",
+        module_uri = %req.module_uri,
+        reason = NO_REGISTRY_CLIENT_REASON,
+        "{refusal}"
+    );
+    let message = refusal.to_string();
+    span.set_attribute("error", &message);
+    Err(FetchError { message })
+}
+
+#[cfg(test)]
+mod oci_layer_tests {
+    use super::*;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    #[test]
+    fn verified_when_digest_matches() {
+        let payload = b"\0asm\x01\x00\x00\x00";
+        let expected = sha256_hex(payload);
+        let v = verify_oci_layer(payload, Some(&expected));
+        assert!(matches!(v, LayerVerdict::Verified { .. }));
+    }
+
+    #[test]
+    fn mismatch_when_bytes_differ_from_manifest() {
+        let payload = b"original wasm bytes";
+        // What the registry CLAIMED — but the bytes we pulled are different.
+        let lying_digest = sha256_hex(b"different bytes from what was pulled");
+        let v = verify_oci_layer(payload, Some(&lying_digest));
+        match v {
+            LayerVerdict::DigestMismatch { expected, computed } => {
+                assert_eq!(expected, lying_digest);
+                assert_eq!(computed, sha256_hex(payload));
+                assert_ne!(expected, computed);
+            }
+            other => panic!("expected DigestMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepted_unverified_when_manifest_omits_layer() {
+        // Some malformed registries return a manifest with no layer
+        // descriptor. We accept-with-warning rather than fail closed —
+        // matches legacy behaviour and avoids breaking pulls from
+        // not-quite-spec-compliant registries.
+        let v = verify_oci_layer(b"anything", None);
+        assert_eq!(v, LayerVerdict::AcceptedUnverified);
+    }
+
+    #[test]
+    fn empty_layer_still_verifies_against_correct_digest() {
+        // Empty bytes have a known sha256:e3b0c4...
+        let expected = sha256_hex(&[]);
+        assert!(matches!(
+            verify_oci_layer(&[], Some(&expected)),
+            LayerVerdict::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn digest_format_includes_sha256_prefix() {
+        // sanity-check: the helper produces the same `sha256:HEX` format
+        // that `OciDescriptor.digest` declares — string compare must work.
+        let payload = b"x";
+        let expected = sha256_hex(payload);
+        assert!(expected.starts_with("sha256:"));
+        assert_eq!(expected.len(), "sha256:".len() + 64);
+    }
+
+    // ---- SigstorePolicy + cosign_verify_argv ----
+
+    #[test]
+    fn sigstore_policy_default_is_disabled() {
+        // Use a serial scope guard so concurrent tests don't race on env.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AEGIX_SIGSTORE_REQUIRED");
+        assert_eq!(SigstorePolicy::from_env(), Ok(SigstorePolicy::Disabled));
+    }
+
+    #[test]
+    fn sigstore_policy_parses_required_aliases() {
+        let _g = ENV_LOCK.lock().unwrap();
+        for v in ["true", "1", "required"] {
+            std::env::set_var("AEGIX_SIGSTORE_REQUIRED", v);
+            assert_eq!(
+                SigstorePolicy::from_env(),
+                Ok(SigstorePolicy::Required),
+                "value `{v}` should map to Required"
+            );
+        }
+        std::env::remove_var("AEGIX_SIGSTORE_REQUIRED");
+    }
+
+    #[test]
+    fn sigstore_policy_parses_audit_aliases() {
+        let _g = ENV_LOCK.lock().unwrap();
+        for v in ["audit", "warn"] {
+            std::env::set_var("AEGIX_SIGSTORE_REQUIRED", v);
+            assert_eq!(SigstorePolicy::from_env(), Ok(SigstorePolicy::Audit));
+        }
+        std::env::remove_var("AEGIX_SIGSTORE_REQUIRED");
+    }
+
+    #[test]
+    fn sigstore_policy_unknown_value_is_refused_by_the_boot_gate() {
+        // E-7 (2026-10-14): an unrecognised value is NOT `Disabled` — the
+        // parser errs and the boot gate refuses it outside production too.
+        // Until then `yes-please` (or a misspelt `required`) booted a dev or
+        // staging worker with verification silently off.
+        let _g = ENV_LOCK.lock().unwrap();
+        for v in ["yes-please", "requried"] {
+            std::env::set_var("AEGIX_SIGSTORE_REQUIRED", v);
+            assert!(SigstorePolicy::from_env().is_err(), "{v}");
+            let refused = enforce_production_sigstore_policy_explicit()
+                .expect_err("an unrecognised policy refuses boot outside production");
+            assert!(
+                refused.to_string().contains("not a Sigstore policy"),
+                "{refused}"
+            );
+        }
+        std::env::remove_var("AEGIX_SIGSTORE_REQUIRED");
+    }
+
+    /// 2026-10-29: the explicitness rule under each security profile.
+    #[test]
+    fn the_sigstore_policy_follows_the_security_profile() {
+        use aegix_config::security_profile::SecurityProfile::{
+            Development, Hardened, Transitional,
+        };
+        // development: the silent default stands.
+        assert_eq!(
+            sigstore_policy_under_profile(Development, SigstorePolicy::Disabled, false),
+            Ok(SigstorePolicy::Disabled)
+        );
+        // transitional and hardened: an explicit value is required.
+        for p in [Transitional, Hardened] {
+            let err =
+                sigstore_policy_under_profile(p, SigstorePolicy::Disabled, false).unwrap_err();
+            assert!(err.contains(p.name()), "{err}");
+            assert_eq!(
+                sigstore_policy_under_profile(p, SigstorePolicy::Required, true),
+                Ok(SigstorePolicy::Required)
+            );
+            assert_eq!(
+                sigstore_policy_under_profile(p, SigstorePolicy::Disabled, true),
+                Ok(SigstorePolicy::Disabled)
+            );
+        }
+        // audit: the transitional window, refused under hardened.
+        assert_eq!(
+            sigstore_policy_under_profile(Transitional, SigstorePolicy::Audit, true),
+            Ok(SigstorePolicy::Audit)
+        );
+        let err = sigstore_policy_under_profile(Hardened, SigstorePolicy::Audit, true).unwrap_err();
+        assert!(err.contains("transitional"), "{err}");
+    }
+
+    /// 2026-11-04: a `required` worker with no cosign pin is refused under
+    /// `hardened` only; a set pin, another policy or another profile passes.
+    #[test]
+    fn a_missing_cosign_pin_is_refused_under_hardened_required_only() {
+        use aegix_config::security_profile::SecurityProfile::{
+            Development, Hardened, Transitional,
+        };
+        let err = cosign_pin_under_profile(Hardened, SigstorePolicy::Required, false).unwrap_err();
+        assert!(err.contains("AEGIX_COSIGN_SHA256"), "{err}");
+        assert!(err.contains("hardened"), "{err}");
+        assert!(err.contains("worker/Dockerfile"), "{err}");
+        // A pin that is set is never refused here (its VALUE is checked by the caller).
+        assert_eq!(
+            cosign_pin_under_profile(Hardened, SigstorePolicy::Required, true),
+            Ok(())
+        );
+        // Another policy under hardened: nothing to pin (disabled) or not this gate (audit,
+        // which `sigstore_policy_under_profile` refuses before this runs).
+        for policy in [SigstorePolicy::Audit, SigstorePolicy::Disabled] {
+            assert_eq!(cosign_pin_under_profile(Hardened, policy, false), Ok(()));
+        }
+        // Transitional and development keep the pre-2026-11-04 posture: a WARN, no refusal.
+        for profile in [Transitional, Development] {
+            for policy in [
+                SigstorePolicy::Required,
+                SigstorePolicy::Audit,
+                SigstorePolicy::Disabled,
+            ] {
+                assert_eq!(cosign_pin_under_profile(profile, policy, false), Ok(()));
+            }
+        }
+    }
+
+    /// E-7 (2026-10-14): the cache-or-not decision. An `audit` pull that ran
+    /// no verification (no identity regexp) executes but is NOT cached — the
+    /// flag that gates the Redis `SET` is false, so no `SET` is sent.
+    #[test]
+    fn audit_without_an_identity_regexp_is_never_cached() {
+        assert_eq!(
+            sigstore_verdict(SigstorePolicy::Audit, &SigstoreCheck::NoIdentity),
+            SigstoreVerdict::ExecuteUncached
+        );
+        assert_eq!(
+            sigstore_verdict(
+                SigstorePolicy::Audit,
+                &SigstoreCheck::Failed("bad sig".into())
+            ),
+            SigstoreVerdict::ExecuteUncached
+        );
+        // Required refuses both, with the messages the pull returns.
+        assert_eq!(
+            sigstore_verdict(SigstorePolicy::Required, &SigstoreCheck::NoIdentity),
+            SigstoreVerdict::Refuse(
+                "AEGIX_SIGSTORE_IDENTITY_REGEXP must be set when AEGIX_SIGSTORE_REQUIRED is enabled"
+                    .into()
+            )
+        );
+        assert_eq!(
+            sigstore_verdict(
+                SigstorePolicy::Required,
+                &SigstoreCheck::Failed("bad sig".into())
+            ),
+            SigstoreVerdict::Refuse("sigstore_required: bad sig".into())
+        );
+        // CONTROL: a verified pull is cacheable under either policy, and the
+        // operator's explicit `disabled` keeps its meaning (trust the
+        // registry; the cache is digest-keyed and re-verified on a hit).
+        for p in [SigstorePolicy::Audit, SigstorePolicy::Required] {
+            assert_eq!(
+                sigstore_verdict(p, &SigstoreCheck::Verified),
+                SigstoreVerdict::Cacheable
+            );
+        }
+        assert_eq!(
+            sigstore_verdict(SigstorePolicy::Disabled, &SigstoreCheck::NotRequested),
+            SigstoreVerdict::Cacheable
+        );
+    }
+
+    /// TEXTUAL pin: the flag the OCI cache `SET` reads is the verdict's and is
+    /// assigned exactly once, so the pull cannot cache on any other path.
+    #[test]
+    fn the_oci_cache_write_is_gated_on_the_verdict() {
+        let src = include_str!("module_fetcher.rs");
+        let body = &src[src.find("pub async fn fetch(").unwrap()
+            ..src.find("#[cfg(test)]\nmod oci_layer_tests").unwrap()];
+        assert_eq!(body.matches("sigstore_pass_in_this_run =").count(), 1);
+        assert!(body.contains(
+            "let sigstore_pass_in_this_run = match sigstore_verdict(sigstore_policy, &sigstore_check)"
+        ));
+        assert!(body.contains("if sigstore_pass_in_this_run {"));
+    }
+
+    // ---- Wasm-security review 2026-05-22 (MEDIUM-4) ----
+    //
+    // Production-gate the silent-Disabled fallthrough. The pure parser
+    // (`from_env_str`) keeps the lenient default; the production gate
+    // (`enforce_production_sigstore_policy_explicit`) refuses to boot
+    // when the operator hasn't made an explicit choice. Mirrors the
+    // `AEGIX_AOT_HMAC_KEY` boot discipline. Tests below pin both the
+    // parse contract and the explicit-vs-silent distinction; the
+    // production-gate function itself is tested indirectly via the
+    // `raw_env_is_explicit` predicate (the gate just composes parser
+    // + predicate + production flag). The parser + predicate tests moved
+    // to `aegix-sigstore-policy` with the enum (2026-09-13).
+
+    #[test]
+    fn sigstore_production_gate_admits_when_not_in_production() {
+        // Sanity: the production gate is a no-op on dev/test hosts.
+        // Tests run with `is_production() == false` by default; if
+        // this ever stops being true, the assertion below will fail
+        // loudly and we'll know to revisit.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AEGIX_SIGSTORE_REQUIRED");
+        // No env var set; in dev this MUST be Ok(Disabled).
+        let result = enforce_production_sigstore_policy_explicit();
+        assert!(
+            result.is_ok(),
+            "production gate must admit silent-default on dev hosts — got {result:?}"
+        );
+        assert_eq!(result.unwrap(), SigstorePolicy::Disabled);
+    }
+
+    #[test]
+    fn sigstore_production_gate_admits_every_explicit_value_on_dev() {
+        // Operator-recognised values pass the gate in any environment.
+        let _g = ENV_LOCK.lock().unwrap();
+        for v in ["required", "audit", "disabled"] {
+            std::env::set_var("AEGIX_SIGSTORE_REQUIRED", v);
+            let result = enforce_production_sigstore_policy_explicit();
+            assert!(
+                result.is_ok(),
+                "explicit `{v}` must pass the gate — got {result:?}"
+            );
+        }
+        std::env::remove_var("AEGIX_SIGSTORE_REQUIRED");
+    }
+
+    #[test]
+    fn sigstore_production_gate_refuses_silent_default_in_production() {
+        // The point of the gate. With `RUST_ENV=production` AND
+        // `AEGIX_SIGSTORE_REQUIRED` unset / empty / garbage, the boot
+        // path must return Err — refusing to start rather than
+        // silently devolving to no-verification.
+        let _g = ENV_LOCK.lock().unwrap();
+        let prior_rust_env = std::env::var("RUST_ENV").ok();
+        let prior_sigstore = std::env::var("AEGIX_SIGSTORE_REQUIRED").ok();
+
+        std::env::set_var("RUST_ENV", "production");
+
+        for ambiguous in ["", "  ", "yes-please", "true-ish"] {
+            if ambiguous.is_empty() {
+                std::env::remove_var("AEGIX_SIGSTORE_REQUIRED");
+            } else {
+                std::env::set_var("AEGIX_SIGSTORE_REQUIRED", ambiguous);
+            }
+            let result = enforce_production_sigstore_policy_explicit();
+            assert!(
+                result.is_err(),
+                "production gate must refuse silent / unrecognised value `{ambiguous:?}` — got {result:?}"
+            );
+            let err_msg = format!("{}", result.unwrap_err());
+            assert!(
+                err_msg.contains("AEGIX_SIGSTORE_REQUIRED"),
+                "error message must name the env var so operators find the fix — got `{err_msg}`"
+            );
+            // Actionable error: must mention all three remediation paths.
+            assert!(
+                err_msg.contains("required"),
+                "error must mention `required` option"
+            );
+            assert!(
+                err_msg.contains("audit"),
+                "error must mention `audit` option"
+            );
+            assert!(
+                err_msg.contains("disabled"),
+                "error must mention `disabled` option"
+            );
+        }
+
+        // And the converse: setting an explicit value in production
+        // passes the gate — `audit` only under the transitional profile
+        // (2026-10-29: the default profile where hardening holds is
+        // `hardened`, which refuses verify-and-continue).
+        for explicit in ["required", "disabled"] {
+            std::env::set_var("AEGIX_SIGSTORE_REQUIRED", explicit);
+            let result = enforce_production_sigstore_policy_explicit();
+            assert!(
+                result.is_ok(),
+                "production gate must admit explicit `{explicit}` — got {result:?}"
+            );
+        }
+        std::env::set_var("AEGIX_SIGSTORE_REQUIRED", "audit");
+        let hardened = enforce_production_sigstore_policy_explicit();
+        assert!(
+            hardened.is_err(),
+            "hardened refuses audit — got {hardened:?}"
+        );
+        std::env::set_var("AEGIX_SECURITY_PROFILE", "transitional");
+        let transitional = enforce_production_sigstore_policy_explicit();
+        assert!(
+            transitional.is_ok(),
+            "transitional admits audit — got {transitional:?}"
+        );
+        std::env::remove_var("AEGIX_SECURITY_PROFILE");
+
+        // Restore prior env state so we don't poison other tests
+        // sharing ENV_LOCK.
+        match prior_rust_env {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
+        }
+        match prior_sigstore {
+            Some(v) => std::env::set_var("AEGIX_SIGSTORE_REQUIRED", v),
+            None => std::env::remove_var("AEGIX_SIGSTORE_REQUIRED"),
+        }
+    }
+
+    #[test]
+    fn cosign_argv_includes_identity_and_issuer_pinning() {
+        // SECURITY: this test guards against well-meaning "simplifications"
+        // of cosign_verify_argv that drop the identity or issuer check —
+        // either omission would let a valid Sigstore signature from ANY
+        // workflow on ANY repo pass verification.
+        let argv = cosign_verify_argv(
+            "ghcr.io/owner/talos-tools/foo:v1",
+            "^https://github\\.com/owner/talos/.+",
+            "https://token.actions.githubusercontent.com",
+        );
+        assert_eq!(argv[0], "verify");
+        assert!(
+            argv.iter().any(|a| a == "--certificate-identity-regexp"),
+            "must pin certificate identity"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--certificate-oidc-issuer"),
+            "must pin OIDC issuer"
+        );
+        // Reference is always last so cosign treats it as the positional arg.
+        assert_eq!(argv.last().unwrap(), "ghcr.io/owner/talos-tools/foo:v1");
+    }
+
+    #[test]
+    fn cosign_argv_propagates_identity_verbatim() {
+        // No string mangling: the regex passed by config must reach cosign
+        // unchanged, otherwise operator-curated identity patterns silently
+        // become broader than intended.
+        let identity = "^https://github\\.com/MY_ORG/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$";
+        let argv = cosign_verify_argv("ref", identity, "issuer");
+        let pos = argv
+            .iter()
+            .position(|a| a == "--certificate-identity-regexp")
+            .unwrap();
+        assert_eq!(argv[pos + 1], identity);
+    }
+
+    // Serial guard for env-mutating tests in this module. Without it,
+    // cargo's parallel test runner can race on the global env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ─── M-1: Sigstore identity regexp validator ───────────────────────────
+    //
+    // The validator is the only thing standing between a footgun like
+    // `AEGIX_SIGSTORE_IDENTITY_REGEXP=".*"` and a Required-mode
+    // production deploy that silently accepts any Fulcio cert. These
+    // tests cover the rejection classes and the happy path so a
+    // future refactor can't relax the policy without explicit intent.
+
+    #[test]
+    fn sigstore_regexp_empty_is_rejected() {
+        assert_eq!(
+            validate_sigstore_identity_regexp(""),
+            Err(SigstoreRegexpRejection::Empty)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_catchall_patterns_are_rejected() {
+        for pattern in [".*", ".+", ".", "^.*$", "^.+$", "^.$", "^.*", ".*$"] {
+            assert_eq!(
+                validate_sigstore_identity_regexp(pattern),
+                Err(SigstoreRegexpRejection::TooBroad),
+                "pattern {pattern:?} should be rejected as too broad"
+            );
+        }
+    }
+
+    #[test]
+    fn sigstore_regexp_catchall_with_whitespace_is_rejected() {
+        // Operators sometimes paste env vars with leading/trailing
+        // spaces. Without trim, " .* " would slip through.
+        assert_eq!(
+            validate_sigstore_identity_regexp(" .* "),
+            Err(SigstoreRegexpRejection::TooBroad)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_invalid_regex_is_rejected() {
+        // Unclosed bracket: cosign would fail at runtime with an opaque
+        // upstream error. Fail closed at startup instead.
+        assert_eq!(
+            validate_sigstore_identity_regexp("^https://github\\.com/owner/talos/["),
+            Err(SigstoreRegexpRejection::InvalidRegex)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_workflow_pattern_without_at_anchor_is_rejected() {
+        // The CLAUDE.md guidance is explicit: a workflow-URL pattern
+        // missing the trailing `@` is spoofable via a fork repo named
+        // `workflow.yml-evil.yml`. This test guards that policy.
+        let pattern =
+            "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingWorkflowAnchor)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_workflow_pattern_with_at_anchor_is_accepted() {
+        let pattern =
+            "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml@";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "well-formed workflow pattern with @ anchor should pass: got {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_workflow_pattern_anchored_to_ref_is_accepted() {
+        // Patterns sometimes also pin the ref name after the `@`:
+        // `…/foo.yml@refs/heads/main$`. The `$` anchor is fine — we
+        // just need the `@` somewhere before any final `$`.
+        let pattern = "^https://github\\.com/owner/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "workflow pattern with @refs/...$ tail should pass"
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_non_github_pattern_is_accepted() {
+        // We only enforce the @-anchor convention on github.com
+        // workflow URLs. Operators using GitLab CI, custom OIDC
+        // providers, or other identity formats are out of scope for
+        // that specific check — they get the regex-validity and
+        // catchall checks only.
+        assert!(validate_sigstore_identity_regexp("^https://gitlab\\.com/owner/talos/").is_ok());
+    }
+
+    // ─── L-14: github.com permissive-pattern anchoring ─────────────────────
+
+    #[test]
+    fn sigstore_regexp_github_without_workflow_path_is_rejected() {
+        // The simplest permissive pattern: matches every OIDC identity
+        // from github.com regardless of repo or workflow.
+        let pattern = "^https://github\\.com/.*";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingGithubWorkflowPath),
+            "github.com pattern without workflows path must be rejected"
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_github_owner_wildcarded_is_rejected() {
+        // The classical "any owner, any repo, my workflow file" attack
+        // surface — a forked repo with the same workflow filename
+        // could sign as us.
+        for pattern in [
+            "^https://github\\.com/.*/\\.github/workflows/publish\\.yml@",
+            "^https://github\\.com/.+/talos/\\.github/workflows/publish\\.yml@",
+            "^https://github\\.com/[^/]+/talos/\\.github/workflows/publish\\.yml@",
+        ] {
+            assert_eq!(
+                validate_sigstore_identity_regexp(pattern),
+                Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo),
+                "unpinned owner/repo pattern must be rejected: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn sigstore_regexp_github_repo_wildcarded_is_rejected() {
+        // Wildcard in the REPO position is still unpinned — `talos.*`
+        // (any-character then any-suffix) matches any repo name
+        // starting with `talos`.
+        let pattern = "^https://github\\.com/myorg/talos.*/\\.github/workflows/publish\\.yml@";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::UnpinnedGithubOwnerRepo)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_github_dot_in_owner_or_repo_is_literal_when_escaped() {
+        // Some orgs/repos legitimately contain `.` — `my.org` or
+        // `my-tool.io`. Escaped `\.` is a literal dot and should NOT
+        // trip the unpinned-wildcard check.
+        let pattern = "^https://github\\.com/my\\.org/my\\.repo/\\.github/workflows/publish\\.yml@";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "escaped literal dot in owner/repo should pass: {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_github_pinned_owner_repo_is_accepted() {
+        // The canonical correct form, per CLAUDE.md guidance.
+        let pattern =
+            "^https://github\\.com/example-org/talos/\\.github/workflows/template-publish\\.yml@";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "pinned owner/repo with @-anchor must pass: {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_unescaped_github_host_is_handled() {
+        // Some operators write `github.com` without the regex-escape
+        // for `.` (technically broader — `.` matches any char — but
+        // we don't reject it here because it's a separate issue).
+        // The path-presence check should still fire on the raw form.
+        let pattern = "^https://github.com/.*";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingGithubWorkflowPath)
+        );
+    }
+
+    // Wasm-security review 2026-05-23: `^` start-anchor enforcement on
+    // any pattern that begins with `https://`. Without `^`, the
+    // `https://...` substring could match anywhere inside the SAN URI;
+    // all the documented operator examples in human_reason() already
+    // use the anchor, so this is purely closing a documentation/code
+    // drift hole.
+    #[test]
+    fn sigstore_regexp_unanchored_https_pattern_is_rejected() {
+        let pattern = "https://github\\.com/owner/talos/\\.github/workflows/publish\\.yml@";
+        assert_eq!(
+            validate_sigstore_identity_regexp(pattern),
+            Err(SigstoreRegexpRejection::MissingStartAnchor),
+            "unanchored https:// pattern must be rejected"
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_anchored_https_pattern_is_accepted() {
+        // Confirm the canonical form still passes after the new check.
+        let pattern = "^https://github\\.com/owner/talos/\\.github/workflows/publish\\.yml@";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "anchored https:// pattern must pass: {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    #[test]
+    fn sigstore_regexp_non_https_pattern_does_not_require_anchor() {
+        // SAN-email patterns / custom-OIDC patterns shouldn't be forced
+        // to start with `^`. Only `https://`-prefixed patterns are
+        // affected by the new rule.
+        let pattern = "ci@example\\.com$";
+        assert!(
+            validate_sigstore_identity_regexp(pattern).is_ok(),
+            "non-https pattern without ^ should pass: {:?}",
+            validate_sigstore_identity_regexp(pattern)
+        );
+    }
+
+    // ─── H-3: OCI manifest size gate ──────────────────────────────────────
+
+    #[test]
+    fn manifest_size_under_cap_is_accepted() {
+        // The realistic case — a normal-sized WASM artifact.
+        assert_eq!(
+            check_manifest_layer_sizes(&[5 * 1024 * 1024], 64 * 1024 * 1024),
+            ManifestSizeVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn manifest_size_exactly_at_cap_is_accepted() {
+        // Boundary: equal to cap is OK (off-by-one guard).
+        assert_eq!(
+            check_manifest_layer_sizes(&[64 * 1024 * 1024], 64 * 1024 * 1024),
+            ManifestSizeVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn manifest_size_one_byte_over_cap_is_rejected() {
+        let verdict = check_manifest_layer_sizes(&[64 * 1024 * 1024 + 1], 64 * 1024 * 1024);
+        assert!(
+            matches!(verdict, ManifestSizeVerdict::Oversized { .. }),
+            "should reject when 1 byte over cap; got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_negative_size_is_rejected() {
+        // A forged manifest could try to bypass the gate by claiming
+        // a negative size (`size: i64` allows it per spec). Treat any
+        // negative value as oversized — fail closed.
+        assert!(matches!(
+            check_manifest_layer_sizes(&[-1], 64 * 1024 * 1024),
+            ManifestSizeVerdict::Oversized { declared: -1, .. }
+        ));
+    }
+
+    #[test]
+    fn manifest_with_one_oversized_layer_among_many_is_rejected() {
+        // Multi-layer artifacts: if ANY layer is oversized, refuse.
+        let layers = [1024, 2048, 1_000_000_000_000];
+        assert!(matches!(
+            check_manifest_layer_sizes(&layers, 64 * 1024 * 1024),
+            ManifestSizeVerdict::Oversized { .. }
+        ));
+    }
+
+    #[test]
+    fn manifest_empty_layers_is_accepted() {
+        // A manifest with no layers is OK at the size-gate level —
+        // downstream code will report "WASM payload not found".
+        assert_eq!(
+            check_manifest_layer_sizes(&[], 64 * 1024 * 1024),
+            ManifestSizeVerdict::Ok
+        );
+    }
+
+    #[test]
+    fn max_oci_layer_bytes_uses_default_when_env_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+        assert_eq!(max_oci_layer_bytes(), DEFAULT_MAX_OCI_LAYER_BYTES);
+    }
+
+    #[test]
+    fn max_oci_layer_bytes_uses_default_when_env_is_zero() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WORKER_MAX_OCI_LAYER_BYTES", "0");
+        // 0 means "use default" — same convention as the rest of the
+        // worker's nonzero-or-default env helpers (see
+        // `nonzero_env_or_default` in runtime.rs).
+        assert_eq!(max_oci_layer_bytes(), DEFAULT_MAX_OCI_LAYER_BYTES);
+        std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+    }
+
+    #[test]
+    fn max_oci_layer_bytes_uses_default_when_env_malformed() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WORKER_MAX_OCI_LAYER_BYTES", "not-a-number");
+        assert_eq!(max_oci_layer_bytes(), DEFAULT_MAX_OCI_LAYER_BYTES);
+        std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+    }
+
+    #[test]
+    fn max_oci_layer_bytes_respects_valid_env_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("WORKER_MAX_OCI_LAYER_BYTES", "33554432"); // 32 MiB
+        assert_eq!(max_oci_layer_bytes(), 33_554_432);
+        std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+    }
+}
+
+#[cfg(all(test, feature = "oci"))]
+mod w13_pinning_tests {
+    use super::*;
+    use oci_client::Reference;
+
+    fn manifest(layers: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.wasm.config.v1+json","digest":"sha256:{c}","size":2}},"layers":[{layers}]}}"#,
+            c = "0".repeat(64)
+        )
+        .into_bytes()
+    }
+
+    fn wasm_layer(size: i64) -> String {
+        format!(
+            r#"{{"mediaType":"application/vnd.wasm.content.layer.v1+wasm","digest":"sha256:{}","size":{size},"urls":["http://169.254.169.254/x"]}}"#,
+            "a".repeat(64)
+        )
+    }
+
+    fn sha(b: &[u8]) -> String {
+        use sha2::Digest as _;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(b)))
+    }
+
+    #[test]
+    fn cosign_verifies_the_digest_computed_from_the_body_not_the_tag() {
+        let body = manifest(&wasm_layer(10));
+        let r: Reference = "ghcr.io/acme/talos-tools/echo:latest".parse().unwrap();
+        let p = pin_oci_manifest(&r, &body, 1 << 20).unwrap();
+        assert_eq!(p.manifest_digest, sha(&body));
+        assert_eq!(
+            p.pinned_ref,
+            format!("ghcr.io/acme/talos-tools/echo@{}", sha(&body))
+        );
+        assert!(!p.pinned_ref.contains(":latest"));
+        assert!(p.layer.urls.is_none(), "foreign blob urls must be stripped");
+        // The argv cosign runs carries the pinned reference and both pins.
+        let argv = cosign_verify_argv(&p.pinned_ref, "^https://x@", "https://issuer");
+        assert_eq!(argv.last().unwrap(), &p.pinned_ref);
+        assert!(argv.contains(&"--certificate-identity-regexp".to_string()));
+        assert!(argv.contains(&"--certificate-oidc-issuer".to_string()));
+    }
+
+    #[test]
+    fn a_body_that_contradicts_a_pinned_reference_is_refused() {
+        let body = manifest(&wasm_layer(10));
+        let other = format!("sha256:{}", "b".repeat(64));
+        let r: Reference = format!("ghcr.io/acme/echo@{other}").parse().unwrap();
+        assert!(pin_oci_manifest(&r, &body, 1 << 20)
+            .unwrap_err()
+            .starts_with("oci_manifest_digest_mismatch"));
+        let ok: Reference = format!("ghcr.io/acme/echo@{}", sha(&body)).parse().unwrap();
+        assert!(pin_oci_manifest(&ok, &body, 1 << 20).is_ok());
+    }
+
+    #[test]
+    fn index_empty_foreign_and_oversized_manifests_are_refused() {
+        let r: Reference = "ghcr.io/acme/echo:1".parse().unwrap();
+        let index = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+        assert!(pin_oci_manifest(&r, index, 1 << 20)
+            .unwrap_err()
+            .starts_with("oci_manifest_is_index"));
+        assert!(pin_oci_manifest(&r, &manifest(""), 1 << 20)
+            .unwrap_err()
+            .starts_with("oci_manifest_missing_layer_descriptor"));
+        let tar = format!(
+            r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:{}","size":1}}"#,
+            "c".repeat(64)
+        );
+        assert!(pin_oci_manifest(&r, &manifest(&tar), 1 << 20)
+            .unwrap_err()
+            .starts_with("oci_layer_media_type_rejected"));
+        assert!(pin_oci_manifest(&r, &manifest(&wasm_layer(100)), 50)
+            .unwrap_err()
+            .starts_with("oci_layer_too_large"));
+    }
+
+    #[test]
+    fn filesystem_reader_refuses_non_regular_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.wasm");
+        std::fs::write(&f, b"0123456789").unwrap();
+        let p = f.to_str().unwrap();
+        assert_eq!(read_module_file_capped(p, 10).unwrap().len(), 10);
+        assert!(read_module_file_capped(p, 9)
+            .unwrap_err()
+            .starts_with("wasm_module_too_large"));
+        assert!(
+            read_module_file_capped(dir.path().to_str().unwrap(), 1 << 20)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        #[cfg(target_os = "linux")]
+        assert!(read_module_file_capped("/dev/zero", 1 << 20)
+            .unwrap_err()
+            .contains("not a regular file"));
+    }
+
+    /// TEXTUAL pin: the fetch path verifies the pinned reference and never
+    /// re-resolves the tag (`pull` / `pull_manifest` by the tag reference).
+    #[test]
+    fn source_pin_no_tag_re_resolution() {
+        let src = include_str!("module_fetcher.rs");
+        let body = &src[src.find("pub async fn fetch(").unwrap()
+            ..src.find("#[cfg(test)]\nmod oci_layer_tests").unwrap()];
+        assert!(body.contains("verify_oci_signature(&pinned.pinned_ref,"));
+        assert!(!body.contains("verify_oci_signature(&image_ref"));
+        assert!(!body.contains("client.pull(&reference"));
+        assert!(!body.contains("client.pull_manifest(&reference"));
+        assert!(body.contains("fetch_capped_blob(client, &blob_ref"));
+    }
+}
+
+/// The registry client is a build feature (2026-11-02): which build this is,
+/// what a build without the client says at boot, and — in that build — that
+/// an `oci://` dispatch is refused through [`fetch`] itself, with the reason
+/// a reader of `output_payload.error` can match and no other source tried.
+#[cfg(test)]
+mod registry_client_build_tests {
+    use super::*;
+
+    #[test]
+    fn the_constant_says_which_build_this_is() {
+        assert_eq!(HAS_OCI_REGISTRY_CLIENT, cfg!(feature = "oci"));
+    }
+
+    #[test]
+    fn the_refusal_names_the_reason_and_the_feature() {
+        let text = NoRegistryClientInThisBuild.to_string();
+        assert!(text.starts_with(NO_REGISTRY_CLIENT_REASON), "{text}");
+        assert!(text.contains("`oci` feature"), "names the feature: {text}");
+        assert!(
+            text.contains("aegix-runtime/oci"),
+            "names what to turn on: {text}"
+        );
+    }
+
+    #[test]
+    fn the_boot_notice_speaks_only_without_the_client_and_only_when_configured() {
+        if HAS_OCI_REGISTRY_CLIENT {
+            for policy in [
+                SigstorePolicy::Disabled,
+                SigstorePolicy::Audit,
+                SigstorePolicy::Required,
+            ] {
+                assert_eq!(registry_client_boot_notice(policy, true), None);
+                assert_eq!(registry_client_boot_notice(policy, false), None);
+            }
+            return;
+        }
+        assert_eq!(
+            registry_client_boot_notice(SigstorePolicy::Disabled, false),
+            None,
+            "nothing configured, nothing said"
+        );
+        let required = registry_client_boot_notice(SigstorePolicy::Required, false)
+            .expect("a policy other than disabled is a configured registry");
+        assert!(required.starts_with("[MODULES] ✗"), "{required}");
+        assert!(required.contains("AEGIX_SIGSTORE_REQUIRED"), "{required}");
+        assert!(required.contains("Required"), "{required}");
+        assert!(required.contains(NO_REGISTRY_CLIENT_REASON), "{required}");
+        assert!(required.contains("`oci` feature"), "{required}");
+        let creds = registry_client_boot_notice(SigstorePolicy::Disabled, true)
+            .expect("credentials are a configured registry");
+        assert!(creds.contains("OCI_REGISTRY_USERNAME"), "{creds}");
+        assert!(!creds.contains("AEGIX_SIGSTORE_REQUIRED"), "{creds}");
+        let both = registry_client_boot_notice(SigstorePolicy::Audit, true).expect("both");
+        assert!(
+            both.contains("Audit") && both.contains("OCI_REGISTRY_USERNAME"),
+            "{both}"
+        );
+    }
+
+    /// Through `fetch` itself, with a real runtime and span: the `oci://` arm
+    /// refuses before any network, cache or filesystem read, and the message
+    /// is the typed refusal's.
+    #[cfg(not(feature = "oci"))]
+    #[tokio::test]
+    async fn an_oci_dispatch_is_refused_through_fetch() {
+        let req: JobRequest = serde_json::from_value(serde_json::json!({
+            "job_id": uuid::Uuid::new_v4(),
+            "workflow_execution_id": uuid::Uuid::new_v4(),
+            "module_uri": "oci://ghcr.io/acme/talos-tools/echo:latest",
+            "input_payload": {},
+            "timeout_ms": 1000,
+            "allowed_hosts": [],
+            "signature": [],
+            "job_nonce": "n",
+            "wasm_bytes": null,
+        }))
+        .expect("a minimal JobRequest deserialises");
+        assert!(
+            req.wasm_bytes.is_none(),
+            "the inline-bytes arm must not be the one taken"
+        );
+        let runtime = AegixRuntime::new().expect("runtime");
+        let mut span = JobSpan::current_with_parent(&opentelemetry::Context::new());
+        let Err(err) = fetch(&req, &runtime, &mut span).await else {
+            panic!("a build without the client refuses an oci:// dispatch");
+        };
+        assert_eq!(err.message, NoRegistryClientInThisBuild.to_string());
+        assert!(err.message.starts_with(NO_REGISTRY_CLIENT_REASON));
+    }
+}

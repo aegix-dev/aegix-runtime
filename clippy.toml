@@ -1,0 +1,42 @@
+# Clippy configuration for the whole workspace.
+#
+# ── disallowed-methods ──────────────────────────────────────────────────
+# "Never call X outside Y" rules that used to be grep checks in
+# scripts/lint-structural.sh. Clippy resolves the call by TYPE, so it also
+# catches what a grep cannot: a `use … as Alias`, a re-export under another
+# path, and the method called in UFCS form (`Type::method(&mut x, …)`).
+#
+# A sanctioned call site carries
+#     // disallowed-method: <path> — <reason>
+#     #[allow(clippy::disallowed_methods)]
+# on the smallest enclosing item. The structural check that owns each rule
+# (its number is in the reason below) verifies that every such allow names a
+# path from this file and sits in a file the rule sanctions
+# (scripts/lint-clippy-disallowed.py holds that table).
+#
+# Two limits of this mechanism, both measured on clippy 0.1.95:
+#   * a path that does not resolve is only a WARNING ("does not refer to a
+#     reachable function"), which `-D warnings` does NOT turn into an error —
+#     so a renamed method would silently drop its rule. quality.yml's clippy
+#     job fails on that warning text, and the owning structural check pins
+#     the workspace-owned methods to their definitions.
+#   * a trait-impl method (`<rhai::Engine as Default>::default`) cannot be
+#     named at all, silently. Check 63 keeps a textual leg for that spelling.
+disallowed-methods = [
+  { path = "aegix_workflow_engine::ParallelWorkflowEngine::set_actor_id", reason = "check 29: stamps actor_id without the actor's ceilings — use aegix_engine::actor_binding::apply_actor_to_engine (fail-closed to Tier-1) or the builder's with_actor_id(..) + for_workflow(..)" },
+  { path = "wasmtime::component::Component::new", reason = "check 53: Cranelift can PANIC on guest input — route through AegixRuntime::compile_component_guarded so a codegen panic is a per-job error, not a dead process" },
+  { path = "rhai::Engine::new", reason = "check 63: rhai's default engine println!s to stdout and has no op/depth/size caps — use aegix_rhai_sandbox::sandboxed_engine(SandboxProfile::…); a compile-only syntax check may use Engine::new_raw()" },
+  { path = "aegix_workflow_engine_nats::NatsNodeDispatcher::new", reason = "check 78: a hand-built dispatcher bypasses the production signing-key gate — build it with aegix_engine::nats_run::build_nats_dispatcher" },
+  { path = "rand::rng", reason = "check 100: bytes for a key, nonce, salt or token come from aegix_random::bytes / aegix_random::fill (the operating system's source, panicking rather than returning an unfilled buffer) — a non-secret use (jitter) carries the sanctioned allow" },
+  { path = "rand::random", reason = "check 100: bytes for a key, nonce, salt or token come from aegix_random::bytes / aegix_random::fill (the operating system's source, panicking rather than returning an unfilled buffer) — a non-secret use (jitter) carries the sanctioned allow" },
+  { path = "redis::Client::get_multiplexed_async_connection", reason = "redis rule: the library puts its own default deadlines (500 ms per response, 1 s to connect) on a connection opened here — open it with aegix_redis::multiplexed / aegix_redis::manager, which state the workspace's" },
+  { path = "redis::Client::get_multiplexed_async_connection_with_config", reason = "redis rule: the library puts its own default deadlines (500 ms per response, 1 s to connect) on a connection opened here — open it with aegix_redis::multiplexed / aegix_redis::manager, which state the workspace's" },
+  { path = "redis::Client::get_connection_manager", reason = "redis rule: the library puts its own default deadlines (500 ms per response, 1 s to connect) on a connection opened here — open it with aegix_redis::multiplexed / aegix_redis::manager, which state the workspace's" },
+  { path = "redis::Client::get_connection_manager_with_config", reason = "redis rule: the library puts its own default deadlines (500 ms per response, 1 s to connect) on a connection opened here — open it with aegix_redis::multiplexed / aegix_redis::manager, which state the workspace's" },
+  { path = "redis::Client::get_connection_manager_lazy", reason = "redis rule: the library puts its own default deadlines (500 ms per response, 1 s to connect) on a connection opened here — open it with aegix_redis::multiplexed / aegix_redis::manager, which state the workspace's" },
+  { path = "redis::aio::ConnectionManager::new", reason = "redis rule: the library puts its own default deadlines (500 ms per response, 1 s to connect) on a connection opened here — open it with aegix_redis::multiplexed / aegix_redis::manager, which state the workspace's" },
+  { path = "redis::aio::ConnectionManager::new_with_config", reason = "redis rule: the library puts its own default deadlines (500 ms per response, 1 s to connect) on a connection opened here — open it with aegix_redis::multiplexed / aegix_redis::manager, which state the workspace's" },
+  { path = "redis::aio::ConnectionManager::new_lazy_with_config", reason = "redis rule: the library puts its own default deadlines (500 ms per response, 1 s to connect) on a connection opened here — open it with aegix_redis::multiplexed / aegix_redis::manager, which state the workspace's" },
+  { path = "redis::Client::open", reason = "redis rule: a client made here trusts only the public CAs and ignores AEGIX_REDIS_CA_FILE — make it with aegix_redis::client, which reads it" },
+  { path = "redis::Client::build_with_tls", reason = "redis rule: the trust store of a TLS client is decided in one place — make it with aegix_redis::client" },
+]

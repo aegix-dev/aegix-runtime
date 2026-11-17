@@ -1,0 +1,794 @@
+//! Compute-bound cancellation: preempting a guest that makes no host calls.
+//!
+//! # The gap this closes
+//!
+//! PR #690 wired operator cancellation end-to-end: the controller broadcasts a
+//! signed `CancelCommand`, the worker resolves it through
+//! [`crate::cancel_registry`] and flips the job-scoped `Arc<AtomicBool>` that
+//! every `AegixContext::is_cancelled()` guard reads. That reaches ~20 call
+//! sites — and every one of them sits on a **host-call boundary**.
+//!
+//! A guest doing pure computation crosses no such boundary. It ignored
+//! cancellation entirely and burned a worker slot until its fuel ran out or
+//! its wall-clock timeout fired. `tokio::time::timeout` cannot help either: a
+//! non-yielding sync loop inside `call_async` never returns to the executor.
+//!
+//! # The mechanism
+//!
+//! `Config::epoch_interruption(true)` is already on (see the engine-config
+//! block in [`crate::runtime`]), and Cranelift therefore emits an epoch check
+//! at **every loop back-edge and every function entry** — see
+//! `wasmtime-internal-cranelift`'s `translate_loop_header` /
+//! `epoch_function_entry`. Those checks need no host call, which is exactly
+//! the property the compute-bound case needs.
+//!
+//! Before this module the store used wasmtime's DEFAULT deadline behaviour:
+//! arm `set_epoch_deadline(total)` once, trap when it trips. The deadline was
+//! therefore consulted exactly once per job, at the very end of its budget.
+//!
+//! Here the same total budget is handed out in small slices through
+//! [`wasmtime::Store::epoch_deadline_callback`], so the runtime re-enters host
+//! code roughly every [`CANCEL_CHECK_SLICE_TICKS`] ticks of guest execution and
+//! can read the cancel flag. Cancelled ⇒ trap immediately. Not cancelled ⇒
+//! extend by the next slice.
+//!
+//! `epoch_deadline_callback` is a **`Store`-level** setting. Nothing about
+//! `Config` changes, so the AOT cache fingerprint (`TALOSV3`) is untouched and
+//! no compiled blob in the fleet needs recompiling.
+//!
+//! # Why the budget cannot grow
+//!
+//! [`EpochBudget`] owns a `remaining` tick count that is **only ever
+//! decremented, by exactly the amount granted**. There is no method that
+//! raises it and the field is private, so "the extensions sum to more than the
+//! original budget" is not a rule a future editor can break by accident — it
+//! is the only arithmetic the type permits. `first_slice + Σ Continue(d) ==
+//! total` is asserted directly by
+//! `slices_sum_to_exactly_the_original_budget`.
+//!
+//! # Why a wall-clock bound as well
+//!
+//! Ticks measure the ENGINE epoch, which advances on a background ticker
+//! whether or not the guest is running. A guest suspended in a long host call
+//! accumulates overshoot: under the single-shot default it traps the instant it
+//! resumes, whereas a naive slicing scheme would hand it a fresh slice measured
+//! from *now* and could stretch the job far past its configured timeout. The
+//! `wall_clock_expired` input closes that: the effective deadline is
+//! `min(tick budget, armed_at + timeout)`, which reproduces the single-shot
+//! behaviour for a suspended guest and is identical for a compute-bound one.
+//! It costs one `Instant::now()` per callback — no allocation, no lock, no
+//! logging — at most ten per second of guest execution.
+//!
+//! # Why every extension YIELDS (2026-09-25)
+//!
+//! A `Continue` extension keeps the guest running on the executor thread
+//! without ever returning to it. `call_async` is only a *potentially* yielding
+//! future: a guest that makes no host call never returns `Pending`, so the
+//! `tokio::time::timeout` wrapped around it cannot fire, a dropped request
+//! cannot cancel it, and the tokio worker thread it occupies is lost to every
+//! other task until the epoch budget runs out. In the controller — which runs
+//! `run_sandbox` / `test_module` / module replay on its own request-serving
+//! runtime — that is a caller-supplied module holding a request thread for its
+//! whole budget. [`UpdateDeadline::Yield`] grants the same ticks AFTER one
+//! trip through the executor, so the future is `Pending` at least once per tick
+//! of guest execution: an outer timeout or a drop now takes effect within one
+//! tick, and other tasks on the thread get scheduled. The budget arithmetic is
+//! unchanged — `Yield(n)` extends by exactly the `n` a `Continue(n)` would.
+//!
+//! `Yield` traps if the guest was entered with a SYNCHRONOUS call. Every store
+//! this module arms is entered with `instantiate_async` / `call_async` (the
+//! four `Store::try_new` sites in [`crate::runtime`]); a future synchronous
+//! entry point must not reuse [`arm_epoch_deadline`].
+//!
+//! # Cost on the non-cancelled path
+//!
+//! An `Ordering::Relaxed` atomic load, one `Instant` comparison, one
+//! subtraction, and one executor round trip per tick (at most ten per second of
+//! guest execution). The callback body allocates nothing and logs nothing; the
+//! only allocation in this module is the abort message, built once, on the path
+//! that is about to trap the guest anyway.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use wasmtime::{Store, UpdateDeadline};
+
+use crate::context::AegixContext;
+
+/// Epoch ticks handed out per slice.
+///
+/// One tick is [`crate::runtime::EPOCH_TICK_INTERVAL_MS`] (100 ms), so the
+/// worst-case latency between an operator's cancel landing on the flag and the
+/// guest being trapped is one tick of guest execution plus the ticker's own
+/// granularity. Raising this trades cancellation promptness for fewer
+/// (already negligible) cold-path libcalls; it can never change the TOTAL
+/// budget, only how finely it is subdivided.
+pub(crate) const CANCEL_CHECK_SLICE_TICKS: u64 = 1;
+
+/// Stable marker stamped into the abort error the callback raises.
+///
+/// The single-node trap handler in [`crate::runtime`] deliberately collapses
+/// unrecognised traps to the opaque `"WASM trap encountered"` (a wasmtime error
+/// can carry guest backtrace addresses, which must not reach a caller). Without
+/// a marker to match on, an operator-requested abort would arrive looking
+/// exactly like a random guest trap. This is matched against BOTH the `Display`
+/// and `Debug` renderings of the error, the same way the fuel check next to it
+/// is, because wasmtime attaches the wasm backtrace as error CONTEXT and the
+/// original message can end up in the chain rather than at the top.
+///
+/// It is not guest-influenceable: the value compared against is wasmtime's own
+/// error for the `call_async` that failed. Guest-authored text arrives on a
+/// different channel (captured WASI stderr) and is never matched here.
+pub(crate) const CANCEL_PREEMPT_MARKER: &str = "talos:cancel-preempt";
+
+/// The operator-facing message for a job aborted mid-computation by a cancel.
+///
+/// Two properties are load-bearing:
+///
+/// * It carries `[reason_class=cancelled]`, which
+///   [`crate::runtime::is_transient_error_text`] and
+///   `aegix_retry_intelligence::classify_error` both already treat as
+///   NON-transient (see [`crate::reason_class::NON_TRANSIENT`]). A cancelled
+///   job must not be retried in-worker or re-dispatched by the controller.
+/// * It contains neither `"timed out"` nor `"timeout"` nor `"fuel"`, so it can
+///   never be read — by an operator or by either classifier — as the genuine
+///   wall-clock timeout or a fuel exhaustion. "We killed this" and "this ran
+///   too long" are distinguishable from the message alone.
+pub const CANCEL_PREEMPT_MESSAGE: &str =
+    "WASM execution aborted mid-computation: the execution was cancelled by an operator \
+     (talos:cancel-preempt) [reason_class=cancelled]";
+
+/// The message a guest is stopped with when its sandbox directory — the WASI
+/// preopen of a `filesystem` / `automation` world — grows past the
+/// per-execution file-system cap, or the worker's sandbox budget (security
+/// review 2026-10-15, E2-2). Writes through `wasi:filesystem` bypass the
+/// `aegix:core/files` counters, so the directory itself is measured.
+pub const FS_PREOPEN_OVER_CAP_MESSAGE: &str =
+    "WASM execution stopped: the sandbox file system grew past its write quota \
+     (talos:fs-cap) — the per-execution limit or the worker's sandbox budget";
+
+/// How often, in epoch callbacks (ticks of guest execution), a preopen
+/// sandbox is measured: every half second.
+pub(crate) const FS_PREOPEN_CHECK_EVERY_TICKS: u32 = 5;
+
+/// Most directory entries one measurement visits. A sandbox holding more is
+/// treated as over its quota: a guest cannot make the check itself expensive.
+pub(crate) const FS_PREOPEN_MAX_ENTRIES: usize = 50_000;
+
+/// The apparent size of everything under `dir`, stopping early: `None` when it
+/// passes `stop_above` bytes or [`FS_PREOPEN_MAX_ENTRIES`] entries, or cannot be
+/// read. Symlinks are not followed (a WASI guest cannot create one that leaves
+/// the preopen, and following none keeps the walk inside it regardless).
+pub(crate) fn sandbox_bytes(dir: &std::path::Path, stop_above: u64) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut entries = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).ok()? {
+            let entry = entry.ok()?;
+            entries += 1;
+            if entries > FS_PREOPEN_MAX_ENTRIES {
+                return None;
+            }
+            let meta = entry.path().symlink_metadata().ok()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+                if total > stop_above {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(total)
+}
+
+/// One preopen sandbox's share of the worker's process-wide sandbox budget:
+/// what its directory holds beyond the bytes `aegix:core/files` already
+/// reserved. Returned to the budget when the store (and this guard, owned by
+/// its epoch callback) is dropped.
+struct PreopenReservation {
+    reserved: u64,
+    ticks: u32,
+}
+
+impl Drop for PreopenReservation {
+    fn drop(&mut self) {
+        crate::host::limits::release_process_fs_bytes(self.reserved);
+    }
+}
+
+/// The preopen check, one measurement: `Err` with
+/// [`FS_PREOPEN_OVER_CAP_MESSAGE`] when the sandbox is over the per-execution
+/// cap, unreadable or too large to walk, or its growth does not fit the
+/// process budget.
+fn check_preopen(
+    reservation: &mut PreopenReservation,
+    sandbox: &std::path::Path,
+    host_written: u64,
+) -> Result<(), ()> {
+    use crate::host::limits::{reserve_process_fs_bytes, MAX_FS_BYTES_PER_EXECUTION};
+    let size = sandbox_bytes(sandbox, MAX_FS_BYTES_PER_EXECUTION).ok_or(())?;
+    // Bytes written through `aegix:core/files` are already reserved by that
+    // host function; the rest arrived through the preopen.
+    let wanted = size.saturating_sub(host_written);
+    if wanted > reservation.reserved {
+        if !reserve_process_fs_bytes(wanted - reservation.reserved) {
+            return Err(());
+        }
+        reservation.reserved = wanted;
+    }
+    Ok(())
+}
+
+/// What the epoch-deadline callback decided. Split from the callback itself so
+/// the policy is unit-testable without a wasm runtime, an engine, or a clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpochDecision {
+    /// The job's cancel flag is set — trap NOW with [`CANCEL_PREEMPT_MESSAGE`].
+    AbortCancelled,
+    /// The budget is spent — trap exactly as wasmtime's default
+    /// (`epoch_deadline_trap`) behaviour would have.
+    AbortExhausted,
+    /// Extend the deadline by this many ticks and keep running — after one
+    /// trip through the async executor (see "Why every extension YIELDS").
+    Continue(u64),
+}
+
+/// A strictly-decreasing epoch-tick budget.
+///
+/// Constructed with the job's whole budget; hands back a first slice to arm on
+/// the `Store` and keeps the remainder. See the module docs for why the
+/// non-growth property is structural rather than conventional.
+#[derive(Debug)]
+pub(crate) struct EpochBudget {
+    /// Ticks not yet granted. Monotonically non-increasing; nothing in this
+    /// type raises it.
+    remaining: u64,
+    /// Ticks handed out per slice.
+    slice: u64,
+}
+
+impl EpochBudget {
+    /// Split `total` into `(first_slice, budget)`.
+    ///
+    /// `first_slice` is what the caller arms on the `Store`; `budget` holds
+    /// everything left. `total` comes from
+    /// [`crate::runtime::epoch_ticks_for_timeout`], which never returns 0.
+    /// A `total` of 0 would arm a deadline that trips at the first check, so
+    /// it is floored at one tick — matching the pre-callback behaviour, where
+    /// `set_epoch_deadline(0)` was likewise never passed.
+    pub(crate) fn new(total: u64) -> (u64, Self) {
+        Self::with_slice(total, CANCEL_CHECK_SLICE_TICKS)
+    }
+
+    /// [`Self::new`] with an explicit slice size, so tests can exercise
+    /// multi-tick slices and remainder handling without depending on the
+    /// production constant.
+    pub(crate) fn with_slice(total: u64, slice: u64) -> (u64, Self) {
+        let slice = slice.max(1);
+        let total = total.max(1);
+        let first = total.min(slice);
+        (
+            first,
+            Self {
+                remaining: total - first,
+                slice,
+            },
+        )
+    }
+
+    /// Ticks not yet granted. Test-facing view of the invariant.
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// Grant the next slice, shrinking the budget by exactly what is granted.
+    /// Returns 0 once the budget is spent.
+    fn take(&mut self) -> u64 {
+        let granted = self.remaining.min(self.slice);
+        self.remaining -= granted;
+        granted
+    }
+
+    /// The whole policy, as a pure function of the two observations the
+    /// callback makes.
+    ///
+    /// Precedence is deliberate: **cancellation wins over exhaustion**. When an
+    /// operator's cancel lands in the same slice that spends the last tick, the
+    /// job must be reported as killed, not as having run too long — the two are
+    /// different operational facts and the report is the only place they are
+    /// distinguishable.
+    pub(crate) fn decide(&mut self, cancelled: bool, wall_clock_expired: bool) -> EpochDecision {
+        if cancelled {
+            return EpochDecision::AbortCancelled;
+        }
+        if wall_clock_expired {
+            return EpochDecision::AbortExhausted;
+        }
+        match self.take() {
+            0 => EpochDecision::AbortExhausted,
+            granted => EpochDecision::Continue(granted),
+        }
+    }
+}
+
+/// Arm `store`'s epoch deadline for `timeout`, with cancellation preemption.
+///
+/// **The single chokepoint.** Every `Store` the runtime executes a guest on is
+/// armed here, so no dispatch shape can drift into being un-preemptible. That
+/// matters concretely: #690 was widened to pipelines precisely so cancellation
+/// would not be PROTOCOL-DEPENDENT, and arming only the single-node stores
+/// would have reintroduced that asymmetry one layer down.
+///
+/// The flag the callback reads is `store.data().cancelled` — read out of the
+/// context the store already owns rather than passed in alongside it. That is
+/// deliberate: it is by construction the SAME `Arc<AtomicBool>` the job
+/// registered with [`crate::cancel_registry`], so no call site can hand this
+/// function a second, unreachable flag. (#689 was a lifetime mismatch of
+/// exactly that shape — a flag whose lifetime did not match the job's.)
+///
+/// For stores whose context is not registered with the cancel registry
+/// (`run_sandbox` / `test_module` / the AOT path all pass no execution id), the
+/// flag simply stays `false` for the life of the job and the behaviour is the
+/// pre-callback behaviour, tick for tick.
+pub(crate) fn arm_epoch_deadline(store: &mut Store<AegixContext>, timeout: Duration) {
+    let total = crate::runtime::epoch_ticks_for_timeout(timeout);
+    // Same Arc as the registry's — see the doc comment above.
+    let cancelled: Arc<AtomicBool> = store.data().cancelled.clone();
+    let metrics = store.data().metrics.clone();
+    // RFC 0014 P2: time queued for the local-inference slot is not charged to
+    // this bound either (the tick budget is untouched — ticks only burn while the
+    // guest runs, one slice per callback, so a wait costs one slice at most).
+    let inference_wait = store.data().inference_wait.clone();
+    let wall_clock_deadline = Instant::now() + timeout;
+
+    let (first_slice, mut budget) = EpochBudget::new(total);
+    store.set_epoch_deadline(first_slice);
+    // E2-2 (2026-10-15): a world with a WASI preopen writes through
+    // `wasi:filesystem`, outside `aegix:core/files`' counters; its sandbox is
+    // measured here, every `FS_PREOPEN_CHECK_EVERY_TICKS` ticks of guest
+    // execution, against the same per-execution cap and process budget.
+    let mut preopen = crate::context::capability_world_has_fs_preopen(
+        &store.data().capability_world,
+    )
+    .then_some(PreopenReservation {
+        reserved: 0,
+        ticks: 0,
+    });
+
+    store.epoch_deadline_callback(move |ctx| {
+        if let Some(reservation) = preopen.as_mut() {
+            reservation.ticks = reservation.ticks.wrapping_add(1);
+            if reservation.ticks % FS_PREOPEN_CHECK_EVERY_TICKS == 0 {
+                let data = ctx.data();
+                let host_written = data.fs_bytes_written.load(Ordering::Relaxed);
+                if check_preopen(reservation, data.sandbox_dir(), host_written).is_err() {
+                    if let Some(m) = &data.metrics {
+                        m.record_rate_limit_exceeded("fs");
+                    }
+                    return Err(wasmtime::Error::msg(FS_PREOPEN_OVER_CAP_MESSAGE));
+                }
+            }
+        }
+        // Hot path: one relaxed atomic load, one Instant compare, one
+        // subtraction. No allocation, no lock, no logging.
+        let decision = budget.decide(
+            cancelled.load(Ordering::Relaxed),
+            wall_clock_expired(
+                Instant::now(),
+                wall_clock_deadline,
+                inference_wait.as_deref(),
+            ),
+        );
+        match decision {
+            // `Yield`, never `Continue`: see the module docs. The ticks
+            // granted are identical, so the budget invariant is untouched.
+            EpochDecision::Continue(ticks) => Ok(update_for_continue(ticks)),
+            // Byte-for-byte what wasmtime's default (no-callback) behaviour
+            // returns for an expired deadline: `Trap::Interrupt`.
+            EpochDecision::AbortExhausted => Ok(UpdateDeadline::Interrupt),
+            EpochDecision::AbortCancelled => {
+                // Cold path — fires at most once per job, immediately before
+                // the guest is trapped.
+                if let Some(m) = &metrics {
+                    m.record_execution_preempted();
+                }
+                // `Error::msg` over a `&'static str`: the wasmtime-native
+                // error type, no allocation, no formatting.
+                Err(wasmtime::Error::msg(CANCEL_PREEMPT_MESSAGE))
+            }
+        }
+    });
+}
+
+/// Whether the job's wall-clock bound has passed at `now`.
+///
+/// The fixed deadline is checked first and the ledger ONLY when it has passed,
+/// so the hot path — every tick of guest execution — stays one `Instant`
+/// comparison with no lock. Past the fixed deadline, time the job spent queued
+/// for the local-inference slot (RFC 0014 P2) pushes it back.
+fn wall_clock_expired(
+    now: Instant,
+    deadline: Instant,
+    inference_wait: Option<&crate::inference_wait::InferenceWaitLedger>,
+) -> bool {
+    if now < deadline {
+        return false;
+    }
+    match inference_wait {
+        Some(w) => now >= deadline + w.excluded(),
+        None => true,
+    }
+}
+
+/// The wasmtime deadline update for a [`EpochDecision::Continue`] grant.
+///
+/// One home so the choice is testable without a store: it MUST be a yielding
+/// extension (see the module docs), and it must extend by exactly the ticks
+/// the budget granted.
+fn update_for_continue(ticks: u64) -> UpdateDeadline {
+    UpdateDeadline::Yield(ticks)
+}
+
+/// Whether an error is the abort this module raised.
+///
+/// Checks both renderings for the reason given on [`CANCEL_PREEMPT_MARKER`].
+/// `wasmtime::Error`'s plain `Display` prints only the OUTERMOST message (the
+/// source chain needs `{:#}` or `Debug`), and wasmtime attaches the wasm
+/// backtrace as context — so matching only on `Display` would miss the abort
+/// exactly when a backtrace was captured. `Debug` renders the full `Caused by`
+/// chain and closes that.
+///
+/// Generic over the two error types the runtime holds at the four trap arms:
+/// `wasmtime::Error` (what `call_async` returns in wasmtime 47) and
+/// `anyhow::Error` (what the surrounding runtime code uses). One recogniser so
+/// the two cannot drift.
+pub(crate) fn is_fs_cap_error<E>(err: &E) -> bool
+where
+    E: std::fmt::Display + std::fmt::Debug + ?Sized,
+{
+    format!("{err}").contains(FS_CAP_MARKER) || format!("{err:?}").contains(FS_CAP_MARKER)
+}
+
+/// Stable marker in [`FS_PREOPEN_OVER_CAP_MESSAGE`], recognised by the trap
+/// arm as the cancel marker is (same reasoning: an unrecognised trap is
+/// collapsed to an opaque message).
+pub(crate) const FS_CAP_MARKER: &str = "talos:fs-cap";
+
+/// [`is_cancel_preempt_error`]'s twin for the preopen quota stop (E2-2).
+#[allow(dead_code)]
+const _FS_CAP_MARKER_IS_IN_THE_MESSAGE: () =
+    assert!(const_contains(FS_PREOPEN_OVER_CAP_MESSAGE, FS_CAP_MARKER));
+
+const fn const_contains(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        let mut j = 0;
+        while j < n.len() && h[i + j] == n[j] {
+            j += 1;
+        }
+        if j == n.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+pub(crate) fn is_cancel_preempt_error<E>(err: &E) -> bool
+where
+    E: std::fmt::Display + std::fmt::Debug + ?Sized,
+{
+    format!("{err}").contains(CANCEL_PREEMPT_MARKER)
+        || format!("{err:?}").contains(CANCEL_PREEMPT_MARKER)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// E2-2 (2026-10-15): the sandbox is measured by apparent size, and a
+    /// sandbox past the per-execution cap is refused — a 65 MiB sparse file
+    /// (no disk used) stands in for a guest's `wasi:filesystem` write.
+    #[test]
+    fn a_preopen_sandbox_past_the_cap_is_refused() {
+        use crate::host::limits::MAX_FS_BYTES_PER_EXECUTION;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/a"), vec![0u8; 1024]).unwrap();
+        assert_eq!(
+            sandbox_bytes(dir.path(), MAX_FS_BYTES_PER_EXECUTION),
+            Some(1024)
+        );
+        let mut reservation = PreopenReservation {
+            reserved: 0,
+            ticks: 0,
+        };
+        assert!(check_preopen(&mut reservation, dir.path(), 0).is_ok());
+        assert_eq!(
+            reservation.reserved, 1024,
+            "the preopen's bytes are reserved"
+        );
+        // Bytes the host function already reserved are not reserved twice.
+        let mut host = PreopenReservation {
+            reserved: 0,
+            ticks: 0,
+        };
+        assert!(check_preopen(&mut host, dir.path(), 1024).is_ok());
+        assert_eq!(host.reserved, 0);
+
+        let big = std::fs::File::create(dir.path().join("big")).unwrap();
+        big.set_len(MAX_FS_BYTES_PER_EXECUTION + 1).unwrap();
+        assert_eq!(sandbox_bytes(dir.path(), MAX_FS_BYTES_PER_EXECUTION), None);
+        let mut past = PreopenReservation {
+            reserved: 0,
+            ticks: 0,
+        };
+        assert!(check_preopen(&mut past, dir.path(), 0).is_err());
+    }
+
+    /// RFC 0014 P2: the wall-clock bound stands still while the job waits for
+    /// the local-inference slot, and only then.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_wait_pushes_the_wall_clock_bound_back() {
+        let ledger = crate::inference_wait::InferenceWaitLedger::new(None);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let t = |secs| tokio::time::Instant::now().into_std() + Duration::from_secs(secs);
+        assert!(!wall_clock_expired(t(10), deadline, Some(&ledger)));
+        assert!(
+            wall_clock_expired(t(31), deadline, Some(&ledger)),
+            "no wait: expires on time"
+        );
+        ledger.begin_wait().await;
+        tokio::time::advance(Duration::from_secs(45)).await;
+        ledger.end_wait().await;
+        // 45 s were spent waiting, so the bound now sits at 75 s.
+        let now = tokio::time::Instant::now().into_std();
+        assert!(
+            !wall_clock_expired(now, deadline, Some(&ledger)),
+            "t=45 < 75"
+        );
+        assert!(
+            wall_clock_expired(now + Duration::from_secs(31), deadline, Some(&ledger)),
+            "t=76 > 75"
+        );
+        assert!(
+            wall_clock_expired(now, deadline, None),
+            "without a ledger it expired at 30"
+        );
+    }
+
+    /// THE budget invariant. Every slice the type ever grants, summed with the
+    /// slice armed on the store, must equal the original budget exactly — not
+    /// "about", not "at most". A bug in the other direction lets a guest run
+    /// forever, which is strictly worse than the status quo this change
+    /// replaces.
+    #[test]
+    fn slices_sum_to_exactly_the_original_budget() {
+        for (total, slice) in [
+            (1u64, 1u64),
+            (2, 1),
+            (10, 1),
+            (1200, 1),
+            (7, 3),
+            (9, 3),
+            (100, 7),
+            (1, 5),
+            (6_048_000, 1),
+        ] {
+            let (first, mut budget) = EpochBudget::with_slice(total, slice);
+            let mut granted = first;
+            loop {
+                match budget.decide(false, false) {
+                    EpochDecision::Continue(d) => {
+                        assert!(d > 0, "a Continue must advance the deadline");
+                        granted += d;
+                    }
+                    EpochDecision::AbortExhausted => break,
+                    EpochDecision::AbortCancelled => unreachable!("not cancelled"),
+                }
+                assert!(
+                    granted <= total,
+                    "budget overrun at total={total} slice={slice}: granted {granted}"
+                );
+            }
+            assert_eq!(
+                granted, total,
+                "slices must sum to exactly the original budget (total={total}, slice={slice})"
+            );
+            assert_eq!(budget.remaining(), 0);
+        }
+    }
+
+    /// The counter only ever decreases. Asserted over the whole life of a
+    /// budget rather than at the endpoints, so a "top up on some condition"
+    /// regression cannot hide in the middle.
+    #[test]
+    fn remaining_never_increases() {
+        let (_first, mut budget) = EpochBudget::with_slice(50, 3);
+        let mut prev = budget.remaining();
+        for _ in 0..100 {
+            let _ = budget.decide(false, false);
+            let now = budget.remaining();
+            assert!(now <= prev, "remaining rose from {prev} to {now}");
+            prev = now;
+        }
+    }
+
+    /// An exhausted budget stays exhausted. Calling the callback again after
+    /// the trap decision must not resurrect the job.
+    #[test]
+    fn an_exhausted_budget_never_grants_again() {
+        let (_first, mut budget) = EpochBudget::with_slice(3, 1);
+        while budget.decide(false, false) != EpochDecision::AbortExhausted {}
+        for _ in 0..10 {
+            assert_eq!(budget.decide(false, false), EpochDecision::AbortExhausted);
+        }
+    }
+
+    /// A one-tick budget is fully consumed by the slice armed on the store, so
+    /// the first callback trips the trap. This is the shortest job the runtime
+    /// can express (`epoch_ticks_for_timeout` floors at 1).
+    #[test]
+    fn a_one_tick_budget_arms_everything_and_traps_on_first_callback() {
+        let (first, mut budget) = EpochBudget::new(1);
+        assert_eq!(first, 1);
+        assert_eq!(budget.remaining(), 0);
+        assert_eq!(budget.decide(false, false), EpochDecision::AbortExhausted);
+    }
+
+    /// `epoch_ticks_for_timeout` never returns 0, but the floor is asserted
+    /// here anyway: arming `set_epoch_deadline(0)` would trap at the first
+    /// check point, killing every job instantly.
+    #[test]
+    fn a_zero_total_is_floored_to_one_tick_not_armed_at_zero() {
+        let (first, _budget) = EpochBudget::new(0);
+        assert_eq!(first, 1, "arming 0 ticks would trap at the first check");
+    }
+
+    /// Cancellation aborts on the very next callback regardless of how much
+    /// budget is left — that is the whole point of the change.
+    #[test]
+    fn cancellation_aborts_immediately_with_budget_remaining() {
+        let (_first, mut budget) = EpochBudget::with_slice(1_000_000, 1);
+        assert_eq!(budget.decide(false, false), EpochDecision::Continue(1));
+        assert_eq!(budget.decide(true, false), EpochDecision::AbortCancelled);
+        assert!(
+            budget.remaining() > 900_000,
+            "abort must not spend the budget"
+        );
+    }
+
+    /// Cancellation outranks exhaustion. A cancel landing in the same slice
+    /// that spends the last tick must be REPORTED as a cancellation: "we
+    /// killed this" and "this ran too long" are different operational facts.
+    #[test]
+    fn cancellation_outranks_exhaustion_and_wall_clock() {
+        let (_first, mut budget) = EpochBudget::with_slice(1, 1);
+        assert_eq!(budget.remaining(), 0, "budget is already spent");
+        assert_eq!(budget.decide(true, true), EpochDecision::AbortCancelled);
+    }
+
+    /// The wall-clock bound is what keeps a guest suspended in a long host call
+    /// from being handed fresh slices measured from its resume point. Without
+    /// it the sliced scheme would run such a job far past its configured
+    /// timeout — a behaviour change for uncancelled jobs, which this change
+    /// must not have.
+    #[test]
+    fn an_expired_wall_clock_traps_even_with_ticks_remaining() {
+        let (_first, mut budget) = EpochBudget::with_slice(1_000_000, 1);
+        assert_eq!(budget.decide(false, true), EpochDecision::AbortExhausted);
+    }
+
+    /// The abort message must be readable as a cancellation and NOT as a
+    /// timeout or a fuel exhaustion — by an operator and by both classifiers.
+    #[test]
+    fn the_abort_message_is_distinguishable_from_a_timeout() {
+        let lower = CANCEL_PREEMPT_MESSAGE.to_lowercase();
+        assert!(lower.contains("cancel"), "{CANCEL_PREEMPT_MESSAGE}");
+        assert!(
+            !lower.contains("timed out") && !lower.contains("timeout"),
+            "a cancellation must not read as a wall-clock timeout: {CANCEL_PREEMPT_MESSAGE}"
+        );
+        assert!(
+            !lower.contains("fuel"),
+            "a cancellation must not read as fuel exhaustion: {CANCEL_PREEMPT_MESSAGE}"
+        );
+        assert!(
+            CANCEL_PREEMPT_MESSAGE.contains(CANCEL_PREEMPT_MARKER),
+            "the trap handler matches on the marker; it must be present in the message"
+        );
+    }
+
+    /// Neither classifier may retry a preempted job. The controller-side twin
+    /// (`aegix_retry_intelligence::classify_error`) keys on the same
+    /// `[reason_class=cancelled]` token, which
+    /// `crate::reason_class::NON_TRANSIENT` already contains.
+    #[test]
+    fn the_abort_message_classifies_non_transient() {
+        assert!(
+            CANCEL_PREEMPT_MESSAGE
+                .contains(&format!("reason_class={}", crate::reason_class::CANCELLED)),
+            "the message must carry the cancelled reason class"
+        );
+        assert!(
+            !crate::runtime::is_transient_error_text(CANCEL_PREEMPT_MESSAGE),
+            "a preempted job must never be retried in-worker"
+        );
+    }
+
+    /// The trap handler's recogniser must fire on both renderings, because
+    /// wasmtime attaches the wasm backtrace as error CONTEXT — which moves the
+    /// original message out of the top-level `Display`.
+    #[test]
+    fn the_preempt_recogniser_sees_the_error_through_added_context() {
+        let bare = anyhow::anyhow!("{}", CANCEL_PREEMPT_MESSAGE);
+        assert!(is_cancel_preempt_error(&bare));
+
+        // Also the wasmtime-native error type the four trap arms actually
+        // hold — `wasmtime::Error` is a DISTINCT type from `anyhow::Error` in
+        // wasmtime 47, and this is exactly what the callback returns.
+        assert!(is_cancel_preempt_error(&wasmtime::Error::msg(
+            CANCEL_PREEMPT_MESSAGE
+        )));
+
+        let wrapped = bare.context("wasm trap: wasm backtrace: 0x1234");
+        assert!(
+            is_cancel_preempt_error(&wrapped),
+            "a preempt error wrapped in wasmtime's backtrace context must still be recognised"
+        );
+
+        assert!(!is_cancel_preempt_error(&anyhow::anyhow!(
+            "wasm trap: wasm `unreachable` instruction executed"
+        )));
+        assert!(!is_cancel_preempt_error(&anyhow::anyhow!(
+            "WASM execution timed out after 120s"
+        )));
+    }
+
+    /// A granted slice must YIELD to the executor, by exactly the granted
+    /// ticks. A `Continue` here compiles, passes every budget test above, and
+    /// silently restores a guest that can hold a tokio worker thread for its
+    /// whole timeout — so the variant is pinned directly.
+    #[test]
+    fn a_granted_slice_yields_to_the_executor() {
+        for ticks in [1u64, 7, 1200] {
+            match update_for_continue(ticks) {
+                UpdateDeadline::Yield(n) => assert_eq!(n, ticks),
+                other => panic!(
+                    "a granted slice must yield, got a non-yielding update: {}",
+                    match other {
+                        UpdateDeadline::Continue(_) => "Continue",
+                        UpdateDeadline::Interrupt => "Interrupt",
+                        _ => "another variant",
+                    }
+                ),
+            }
+        }
+    }
+
+    /// The tick budget handed to the callback is exactly what the pre-callback
+    /// code armed in one shot — the slicing subdivides that number, it does not
+    /// recompute it.
+    #[test]
+    fn the_total_budget_is_the_same_number_the_single_shot_path_armed() {
+        for secs in [1u64, 10, 30, 120, 3600] {
+            let d = Duration::from_secs(secs);
+            let total = crate::runtime::epoch_ticks_for_timeout(d);
+            let (first, mut budget) = EpochBudget::new(total);
+            let mut granted = first;
+            while let EpochDecision::Continue(x) = budget.decide(false, false) {
+                granted += x;
+            }
+            assert_eq!(
+                granted, total,
+                "a {secs}s job must be granted exactly {total} ticks in total"
+            );
+        }
+    }
+}

@@ -1,0 +1,4609 @@
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    dead_code,
+    unused_imports,
+    unused_mut,
+    unused_variables
+)]
+use anyhow::{bail, Context, Result};
+use handlebars::Handlebars;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+pub mod advisory_db;
+mod analyze;
+pub mod catalog;
+pub mod container;
+pub mod dependency_allowlist;
+pub mod js_templates;
+pub mod sandbox_run;
+pub mod scaffold;
+pub mod source_entities;
+mod target_cache;
+
+// Re-export the allowlist gate at the crate root so callers (and the
+// `mcp::utils` re-export shim in controller) can keep importing
+// `validate_dependencies` from a stable location.
+use aegix_capability_world::{CapabilityWorld, WorldDeclaration};
+pub use catalog::{
+    manifest_dependencies, recommended_max_fuel, CatalogTemplate, CatalogTemplateError,
+};
+pub use container::{CompileAvailability, CompileMode};
+pub use dependency_allowlist::{get_allowed_dependencies, validate_dependencies};
+pub use sandbox_run::{CompileSlot, RunError, SandboxCommand};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::sync::Semaphore;
+use uuid::Uuid;
+
+/// wasm-security-review (2026-05-22): default cap on the size of
+/// user-supplied Rust source accepted by the compilation pipeline.
+/// 1 MiB is comfortably above any realistic module (current
+/// production modules sit well under 100 KiB) while still bounding a
+/// hostile submission from holding a compilation slot for the full
+/// 60-second cargo timeout. Override with `WASM_MAX_SOURCE_BYTES`.
+pub(crate) const DEFAULT_MAX_SOURCE_BYTES: usize = 1_048_576;
+
+/// wasm-security-review (2026-05-22): parse an env var as a positive
+/// integer, falling back to `default` on missing / unparseable / zero
+/// values. Mirrors `worker::runtime::nonzero_env_or_default` so the
+/// "0 = misconfig, use default" semantic stays consistent across
+/// crates without needing to depend on the worker crate from here.
+pub(crate) fn nonzero_env_or_default(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+/// L-15 (2026-05-22): the RustSec advisory database is baked into the
+/// builder image at `/opt/talos-advisory-db` at image-build time. The
+/// runtime passes `--no-fetch` to cargo audit, so the DB is never
+/// refreshed in-cluster — every compilation in a given image relies
+/// on the advisory set that existed when the image was built. Without
+/// a freshness check, a long-running cluster pinned to an old image
+/// can silently miss new advisories for weeks or months.
+///
+/// Thresholds:
+/// - **Warn**: [`advisory_db::ADVISORY_DB_WARN_AGE_DAYS`] (30). Operators
+///   rebuild the builder image roughly monthly per CLAUDE.md guidance; a
+///   warning here surfaces the condition before it becomes a fail-closed.
+/// - **Fail-closed in production**: [`advisory_db::advisory_db_max_age_days`]
+///   (default 90, `AEGIX_ADVISORY_DB_MAX_AGE_DAYS`). Three months without
+///   an advisory refresh is too long; in production the compilation
+///   refuses rather than rubber-stamping the build with stale data.
+///   Outside production (dev/CI) the warning is enough.
+///
+/// The age, the limit and the decision have ONE home, [`advisory_db`]
+/// (2026-09-22) — the same computation the controller samples hourly onto
+/// `aegix_advisory_db_age_days`, so what the gate consults and what the
+/// alerts read cannot drift. This function only renders the outcome.
+pub(crate) fn check_advisory_db_age(db_path: &str) -> Result<()> {
+    check_advisory_db_age_as(db_path, aegix_config::is_production())
+}
+
+/// [`check_advisory_db_age`] with the posture passed in, so the refusal arm
+/// is driven by a test without touching the process-global `RUST_ENV`.
+pub(crate) fn check_advisory_db_age_as(db_path: &str, production: bool) -> Result<()> {
+    check_measured_advisory_db_age_as(
+        db_path,
+        advisory_db::advisory_db_age_days(db_path),
+        production,
+    )
+}
+
+/// The gate over an age measured ELSEWHERE — the builder image's copy, dated
+/// inside the sandbox container `cargo audit` runs in (G-21, 2026-10-14).
+/// `db_path` names the copy in the messages.
+pub(crate) fn check_measured_advisory_db_age(
+    db_path: &str,
+    age: std::result::Result<u64, advisory_db::AdvisoryDbAgeError>,
+) -> Result<()> {
+    check_measured_advisory_db_age_as(db_path, age, aegix_config::is_production())
+}
+
+pub(crate) fn check_measured_advisory_db_age_as(
+    db_path: &str,
+    age: std::result::Result<u64, advisory_db::AdvisoryDbAgeError>,
+    production: bool,
+) -> Result<()> {
+    use advisory_db::{
+        advisory_db_gate_outcome, advisory_db_max_age_days, AdvisoryDbGateOutcome,
+        ADVISORY_DB_WARN_AGE_DAYS,
+    };
+    let age_days = match age {
+        Ok(age) => age,
+        Err(e) => {
+            // A DB that cannot be dated is a separate failure mode the audit
+            // tool itself surfaces with its own actionable error message.
+            // Don't double-report here; log and let the cargo audit
+            // invocation produce the operator-recognised error.
+            tracing::warn!(
+                target: "aegix_compilation",
+                event_kind = "advisory_db_metadata_unreadable",
+                path = %db_path,
+                error = %e,
+                "Could not date the advisory DB to check freshness — \
+                 cargo audit will surface the missing-DB error if applicable."
+            );
+            return Ok(());
+        }
+    };
+    let fail_threshold_days = advisory_db_max_age_days();
+    let warn_threshold_days = ADVISORY_DB_WARN_AGE_DAYS;
+    match advisory_db_gate_outcome(age_days, fail_threshold_days, production) {
+        AdvisoryDbGateOutcome::Refuse => {
+            // Fail closed — production must not compile against a stale
+            // advisory set. Operator action: rebuild the builder image.
+            Err(anyhow::anyhow!(
+                "RustSec advisory database at {db_path} is {age_days} days old \
+                 (max {fail_threshold_days} days in production). Rebuild the \
+                 talos-builder image (`scripts/build-compiler-image.sh`) to \
+                 refresh the baked-in advisory snapshot, or set \
+                 AEGIX_ADVISORY_DB_MAX_AGE_DAYS=<bigger_number> if you have a \
+                 compensating control for stale advisories."
+            ))
+        }
+        AdvisoryDbGateOutcome::WarnExpiredUnenforced => {
+            // Outside production: loud warning, don't block.
+            tracing::warn!(
+                target: "aegix_compilation",
+                event_kind = "advisory_db_stale_dev",
+                path = %db_path,
+                age_days,
+                fail_threshold_days,
+                "Advisory DB is past the production fail threshold but \
+                 this is dev/test — compilation continues. Rebuild the \
+                 builder image to refresh."
+            );
+            Ok(())
+        }
+        AdvisoryDbGateOutcome::WarnAging => {
+            tracing::warn!(
+                target: "aegix_compilation",
+                event_kind = "advisory_db_aging",
+                path = %db_path,
+                age_days,
+                warn_threshold_days,
+                fail_threshold_days,
+                "Advisory DB is aging — rebuild the talos-builder image \
+                 monthly to absorb new RustSec advisories."
+            );
+            Ok(())
+        }
+        AdvisoryDbGateOutcome::Pass => Ok(()),
+    }
+}
+
+/// L-16: stable fingerprint of the effective dependency allowlist
+/// (default set + extras-from-env). A SHA-256 of the sorted, joined
+/// crate names — same input on two pods produces the same fingerprint,
+/// and an operator changing
+/// `MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA` flips the fingerprint
+/// noticeably. We return the first 16 hex chars (8 bytes); collision
+/// risk between distinct allowlists at that prefix length is ~2^-32
+/// (birthday-bound) — fine for log-correlation, not load-bearing for
+/// security.
+pub(crate) fn dependency_allowlist_fingerprint() -> String {
+    let names = dependency_allowlist::get_allowed_dependencies();
+    // `get_allowed_dependencies` returns a HashSet (or similar
+    // unordered set). Collect into a Vec and sort for stable input.
+    let mut sorted: Vec<String> = names.into_iter().collect();
+    sorted.sort();
+    let joined = sorted.join(",");
+    let digest = Sha256::digest(joined.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// L-16: fingerprint of the WIT host contract baked into the
+/// `module-templates/wit/aegix.wit` file the scaffold copies into
+/// every compilation workspace. Computed once at process startup
+/// (the file doesn't change between compiles in a given pod) and
+/// cached in a [`OnceLock`].
+pub(crate) fn wit_schema_fingerprint() -> &'static str {
+    static FP: OnceLock<String> = OnceLock::new();
+    FP.get_or_init(|| {
+        // Search the same paths the scaffold uses, in priority order.
+        let candidate_paths = [
+            std::env::var("AEGIX_WIT_PATH").ok(),
+            Some("/app/module-templates/wit/aegix.wit".to_string()),
+            Some("module-templates/wit/aegix.wit".to_string()),
+            Some("wit/aegix.wit".to_string()),
+        ];
+        for candidate in candidate_paths.into_iter().flatten() {
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                let digest = Sha256::digest(&bytes);
+                return hex::encode(&digest[..8]);
+            }
+        }
+        "unknown".to_string()
+    })
+}
+
+#[cfg(test)]
+mod provenance_fingerprint_tests {
+    use super::{dependency_allowlist_fingerprint, wit_schema_fingerprint};
+
+    #[test]
+    fn allowlist_fingerprint_is_stable_for_default_set() {
+        // Two calls with the same env produce the same output.
+        let a = dependency_allowlist_fingerprint();
+        let b = dependency_allowlist_fingerprint();
+        assert_eq!(a, b);
+        // Format: 16 hex chars (8 bytes).
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn wit_schema_fingerprint_returns_hex_or_unknown() {
+        let fp = wit_schema_fingerprint();
+        // Either a 16-char hex digest, or the literal "unknown" if
+        // the test env doesn't have the WIT file on disk (unit-test
+        // sandbox typically doesn't).
+        assert!(fp == "unknown" || (fp.len() == 16 && fp.chars().all(|c| c.is_ascii_hexdigit())));
+    }
+}
+
+#[cfg(test)]
+mod advisory_db_age_tests {
+    //! The gate's DECISION is tested purely in `advisory_db::tests`
+    //! (`the_gate_refuses_only_an_expired_copy_in_production`), because
+    //! `RUST_ENV` is process-global. What is tested here is the rendering
+    //! this function still owns: outside production a copy of any age
+    //! passes, and a copy that cannot be dated passes rather than
+    //! double-faulting.
+    use super::check_advisory_db_age;
+    use std::time::{Duration, SystemTime};
+
+    /// A non-existent DB path is treated as "not our problem here" —
+    /// cargo audit surfaces the missing-DB error. The freshness check
+    /// must not double-fault.
+    #[test]
+    fn nonexistent_db_returns_ok() {
+        // The gate reads AEGIX_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
+        let _g = crate::container::env_lock();
+        let result = check_advisory_db_age("/does/not/exist/advisory-db");
+        assert!(result.is_ok(), "missing DB should not error here");
+    }
+
+    #[test]
+    fn fresh_db_passes() {
+        // The gate reads AEGIX_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
+        let _g = crate::container::env_lock();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        check_advisory_db_age(tmp.path().to_str().unwrap()).expect("fresh dir should pass");
+    }
+
+    /// The same 400-day-old copy under a PRODUCTION posture is refused, and
+    /// the refusal names the age, the limit and the rebuild script; under a
+    /// non-production posture it passes (the operator-facing WARN is the
+    /// gate's, its decision is `advisory_db_gate_outcome`'s).
+    /// Backdate a directory's mtime and CONFIRM it stuck.
+    ///
+    /// An empty tempdir carries no `.git` ref and no `crates/`, so the
+    /// directory mtime is the only signal `advisory_db_age_days` can read.
+    /// `File::open(dir).set_modified()` returns `Ok` on macOS but does not
+    /// always take effect, which made the caller below fail roughly one run
+    /// in three — always as a confusing `expect_err` on the GATE, never
+    /// naming the real cause (the age read back as 0, so the gate correctly
+    /// passed). Retry, verify against the same reader the gate uses, and
+    /// report the setup failure as a setup failure.
+    fn backdate_dir(path: &std::path::Path, days: u64) -> bool {
+        let target = SystemTime::now() - Duration::from_secs(days * 86_400);
+        for _ in 0..5 {
+            if std::fs::File::open(path)
+                .and_then(|f| f.set_modified(target))
+                .is_err()
+            {
+                continue;
+            }
+            // Verify through the production reader, not through a second
+            // metadata call: agreeing with the gate is the property we need.
+            if let Ok(age) = super::advisory_db::advisory_db_age_days(
+                path.to_str().expect("tempdir path is utf-8"),
+            ) {
+                if age == days {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn expired_db_is_refused_in_production_and_passes_elsewhere() {
+        // The gate reads AEGIX_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
+        let _g = crate::container::env_lock();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        if !backdate_dir(tmp.path(), 400) {
+            // Loud skip, not a silent pass: the platform would not honour a
+            // directory backdate, so the rendering below cannot be exercised
+            // here. The gate's DECISION is covered without the filesystem by
+            // `advisory_db::tests::the_gate_refuses_only_an_expired_copy_in_production`.
+            eprintln!(
+                "SKIPPED expired_db_is_refused_in_production_and_passes_elsewhere: \
+                 this filesystem did not honour a directory mtime backdate after 5 attempts"
+            );
+            return;
+        }
+        let p = tmp.path().to_str().unwrap();
+        let refused = super::check_advisory_db_age_as(p, true).expect_err("production refuses");
+        let msg = refused.to_string();
+        assert!(msg.contains("is 400 days old"), "{msg}");
+        assert!(msg.contains("max 90 days in production"), "{msg}");
+        assert!(msg.contains("scripts/build-compiler-image.sh"), "{msg}");
+        super::check_advisory_db_age_as(p, false).expect("outside production it passes");
+        // A copy under the warn threshold passes in production too.
+        let fresh = tempfile::tempdir().expect("create tempdir");
+        super::check_advisory_db_age_as(fresh.path().to_str().unwrap(), true)
+            .expect("a fresh copy passes in production");
+    }
+
+    /// TEXTUAL, and stated as such: the production wrapper hands the real
+    /// posture to the seam the tests drive. A wrapper passing `false` would
+    /// leave every test above green and never refuse anything.
+    #[test]
+    fn the_gate_wrapper_passes_the_real_posture() {
+        // Production text only: this test quotes the needle, so a whole-file
+        // search would match its own assertion and vouch for nothing (the
+        // pin-that-matches-its-own-needle shape, package DL).
+        let prod = include_str!("lib.rs")
+            .split("mod advisory_db_age_tests")
+            .next()
+            .expect("production text");
+        assert_eq!(
+            prod.matches("check_advisory_db_age_as(db_path, aegix_config::is_production())")
+                .count(),
+            1,
+            "check_advisory_db_age must pass aegix_config::is_production() to the seam"
+        );
+    }
+
+    /// G-21 (2026-10-14), textual: the compile path dates the builder copy
+    /// through the probe the audit's own sandbox decision returned. The
+    /// needles are assembled at run time so this test cannot match itself.
+    #[test]
+    fn the_compile_gate_dates_the_copy_the_audit_reads() {
+        let src = include_str!("lib.rs");
+        for needle in [
+            [
+                "container::audit_command_with_db_probe",
+                "(workspace, &cargo_registry_cache)",
+            ]
+            .concat(),
+            [
+                "advisory_db::builder_advisory_db_age_days",
+                "(probe, slot).await",
+            ]
+            .concat(),
+        ] {
+            assert_eq!(src.matches(needle.as_str()).count(), 1, "{needle}");
+        }
+    }
+
+    /// 400 days old — past every limit an operator could reasonably set —
+    /// and this binary is not production, so the gate warns and passes.
+    #[test]
+    fn expired_db_outside_production_passes() {
+        // The gate reads AEGIX_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
+        let _g = crate::container::env_lock();
+        assert!(
+            !aegix_config::is_production(),
+            "this test binary must not run as production"
+        );
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let t = SystemTime::now() - Duration::from_secs(400 * 86_400);
+        std::fs::File::open(tmp.path())
+            .and_then(|f| f.set_modified(t))
+            .expect("backdate");
+        check_advisory_db_age(tmp.path().to_str().unwrap())
+            .expect("an expired copy outside production warns and passes");
+    }
+}
+
+/// M-13: gate for the host-process JS/Python compile paths.
+///
+/// `compile_js_to_wasm` runs `jco componentize` and `compile_python_to_wasm`
+/// runs `componentize-py`; when no container runtime is available they would
+/// run on the host, where `componentize-py` executes arbitrary Python at
+/// compile time. Where the sandbox is required
+/// (`container::compile_sandbox_required`, a deployment that faces users) the
+/// host path is refused, and nothing opts back in (operator decision G-9,
+/// 2026-10-15 — until then `AEGIX_COMPILATION_ALLOW_HOST_FALLBACK` did).
+/// Development is unchanged.
+fn require_host_lang_toolchain_allowed(language: &str) -> Result<()> {
+    if !container::compile_sandbox_required() {
+        return Ok(());
+    }
+    bail!(
+        "{language} compilation needs the sandbox container in a deployment that faces users, \
+         and none is available: the {language} toolchain would run on the controller host, which \
+         is unsafe for multi-tenant use. Give the controller podman or docker with the builder \
+         image. There is no host fallback (operator decision G-9)."
+    );
+}
+
+/// Concurrency guard for `cargo component build` processes.
+/// Limits the number of concurrent compilations to prevent resource exhaustion.
+/// Defaults to the number of CPU cores, configurable via `AEGIX_MAX_COMPILATIONS`.
+///
+/// MCP-638 (2026-05-13): clamp the configured value to ≥ 1. Pre-fix
+/// `AEGIX_MAX_COMPILATIONS=0` parsed to `usize 0` and `Semaphore::new(0)`
+/// never admits an `acquire().await` — every compile attempt blocks
+/// forever and operators see compile jobs accumulate with no log
+/// signal pointing at the misconfiguration. Sibling to the same fix
+/// in `aegix-execution-orchestration::trigger::exec_semaphore`.
+///
+/// An `Arc` so a permit can be OWNED ([`CompileSlot`]): a detached container
+/// reaper keeps the slot until the container it is removing is gone (see
+/// `sandbox_run`).
+fn compilation_semaphore() -> &'static Arc<Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEMAPHORE.get_or_init(|| {
+        let max = max_concurrent_compilations();
+        tracing::info!(
+            max_compilations = max,
+            "Compilation concurrency guard initialized"
+        );
+        Arc::new(Semaphore::new(max))
+    })
+}
+
+/// How many compiles run at once: `AEGIX_MAX_COMPILATIONS`, 3 when it is not
+/// set, never 0. Read once, so the guard and whoever sizes work against it
+/// (the catalog seed) agree.
+pub fn max_concurrent_compilations() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        let raw = std::env::var("AEGIX_MAX_COMPILATIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3); // Default to 3 concurrent compilations
+        if raw == 0 {
+            tracing::warn!(
+                target: "aegix_compilation",
+                event_kind = "compilation_semaphore_zero_clamped",
+                configured = raw,
+                clamped_to = 1,
+                "AEGIX_MAX_COMPILATIONS=0 would deadlock every compile \
+                 (Semaphore::new(0) never admits). Clamping to 1 (serial \
+                 compile). Set =1 explicitly to silence this warning."
+            );
+            1
+        } else {
+            raw
+        }
+    })
+}
+
+/// The refusal every compile, lint and source-analysis entry point returns
+/// on a deployment that has turned module compilation off
+/// (`AEGIX_MODULE_COMPILATION=false`, see [`aegix_config::module_compilation`]).
+///
+/// A type, not a string, so a protocol surface can tell it from a toolchain
+/// failure ([`is_compilation_disabled`]): the first is the deployment's
+/// stated policy and is safe to say to the caller, the second can carry host
+/// paths and cargo's stderr and is logged instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompilationDisabled;
+
+/// What a caller is told when [`CompilationDisabled`] is the reason.
+pub const COMPILATION_DISABLED_MESSAGE: &str =
+    "Module compilation is turned off on this deployment (AEGIX_MODULE_COMPILATION=false):      nothing is built from source here, and modules come from the registry.      Use list_module_catalog to see the modules this deployment offers.";
+
+/// What a caller is told for any other compile-service error. The detail
+/// (which can carry host paths and the toolchain's stderr) goes to the log.
+pub const COMPILATION_SERVICE_ERROR_MESSAGE: &str = "Compilation service error — see server logs";
+
+impl std::fmt::Display for CompilationDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(COMPILATION_DISABLED_MESSAGE)
+    }
+}
+
+impl std::error::Error for CompilationDisabled {}
+
+/// Whether a compile-service error is the deployment's "compilation is
+/// off" refusal, at any depth of the error's context chain.
+/// The static-lint findings that refuse a compile: the error-severity half
+/// of the source analysis every compile path runs before it builds. Exposed
+/// so a template's author meets them in a test that takes milliseconds, not at
+/// the end of a build; the compile paths below ask this same function.
+#[must_use]
+pub fn source_lint_errors(source_code: &str) -> Vec<CompilationError> {
+    analyze::lint_source_code(source_code)
+        .into_iter()
+        .filter(lint_refuses_compile)
+        .collect()
+}
+
+/// Refuse a JavaScript or Python source that names the module interface as it
+/// was called before 2026-11-16 (`aegix_module_source::legacy_names`), before
+/// a toolchain is run over it. The Rust path meets the same refusal in its
+/// static lint; these two paths run no lint, and their toolchains would
+/// answer an import of the former package with an error about a missing
+/// interface.
+fn refuse_former_interface_names(source: &str) -> Result<()> {
+    match aegix_module_source::legacy_names::refusal(source) {
+        Some(why) => Err(anyhow::anyhow!(why)),
+        None => Ok(()),
+    }
+}
+
+/// Whether one static-lint finding refuses the compile.
+fn lint_refuses_compile(e: &CompilationError) -> bool {
+    e.severity == "error"
+}
+
+pub fn is_compilation_disabled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CompilationDisabled>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<CompilationDisabled>().is_some())
+}
+
+/// The sentence a protocol surface returns for an `Err` from this service:
+/// the policy refusal verbatim, anything else as the generic sentence. The
+/// ONE home for both, so a surface cannot answer "see server logs" for a
+/// refusal the operator chose.
+pub fn caller_facing_service_error(error: &anyhow::Error) -> &'static str {
+    if is_compilation_disabled(error) {
+        COMPILATION_DISABLED_MESSAGE
+    } else {
+        COMPILATION_SERVICE_ERROR_MESSAGE
+    }
+}
+
+pub struct CompilationService {
+    workspace_root: PathBuf,
+    wit_path: PathBuf,
+    event_tx: aegix_engine_events::CompilationEventSender,
+    /// `false` on a registry-only deployment. Read once at construction
+    /// from [`aegix_config::module_compilation_enabled`].
+    compilation_enabled: bool,
+}
+
+impl CompilationService {
+    pub fn new(
+        workspace_root: PathBuf,
+        event_tx: aegix_engine_events::CompilationEventSender,
+    ) -> Self {
+        // Resolve the WIT fixture path with this priority:
+        //   1. AEGIX_WIT_PATH env var (operator override — lets Docker images
+        //      place the file wherever makes sense for the runtime image layout).
+        //   2. Compile-time relative path: $CARGO_MANIFEST_DIR/../wit/aegix.wit
+        //      which is correct for `cargo run` from the workspace root.
+        let wit_path = std::env::var("AEGIX_WIT_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".."))
+                    .join("wit/aegix.wit")
+            });
+
+        if !wit_path.exists() {
+            tracing::error!(
+                wit_path = %wit_path.display(),
+                "WIT fixture missing at expected path"
+            );
+        }
+
+        let compilation_enabled = aegix_config::module_compilation_enabled();
+        if !compilation_enabled {
+            tracing::info!(
+                target: "aegix_compilation",
+                event_kind = "module_compilation_disabled",
+                "Module compilation is OFF (AEGIX_MODULE_COMPILATION): every compile, lint and \
+                 source-analysis request is refused and no toolchain is run."
+            );
+        }
+
+        Self {
+            workspace_root,
+            wit_path,
+            event_tx,
+            compilation_enabled,
+        }
+    }
+
+    /// Override the deployment switch. For a test, or an embedder that
+    /// decides the policy itself rather than through the environment.
+    pub fn with_compilation_enabled(mut self, enabled: bool) -> Self {
+        self.compilation_enabled = enabled;
+        self
+    }
+
+    /// Whether this service builds modules from source.
+    pub fn compilation_enabled(&self) -> bool {
+        self.compilation_enabled
+    }
+
+    /// Whether a module can compile HERE, and how — without running any
+    /// toolchain (2026-11-03). The switch first: a deployment that turned
+    /// compilation off is `SwitchedOff` whatever its host carries. Then the
+    /// sandbox half, from the SAME probe `container::build_command` resolves
+    /// its command with ([`container::sandbox_availability`]), so a status
+    /// report that says "available" names a compile that would run, and one
+    /// that says "refused" carries the sentence the compile would fail with.
+    /// A status report asks this, never [`Self::compilation_enabled`] alone.
+    #[must_use]
+    pub fn compile_availability(&self) -> CompileAvailability {
+        if !self.compilation_enabled {
+            return CompileAvailability::SwitchedOff;
+        }
+        container::sandbox_availability()
+    }
+
+    /// Refuse, before any work, on a deployment that has compilation off.
+    /// Called first by every public entry point so a refused request does
+    /// not emit a progress event or a static-lint answer on its way to the
+    /// slot. [`Self::acquire_slot`] is the guarantee; this is the manners.
+    fn ensure_enabled(&self) -> Result<()> {
+        if self.compilation_enabled {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(CompilationDisabled))
+        }
+    }
+
+    /// Wait (unbounded — callers wrap it in their own timeout) for a compile
+    /// slot on the process-wide [`compilation_semaphore`].
+    ///
+    /// THE chokepoint for the compile switch. A sandbox child can only be
+    /// spawned with a `&CompileSlot` ([`sandbox_run::SandboxCommand::run`]),
+    /// and this is the only place the service obtains one, so a deployment
+    /// with compilation off cannot run a toolchain over module source by
+    /// any path — including one added later that forgets
+    /// [`Self::ensure_enabled`].
+    async fn acquire_slot(&self) -> Result<CompileSlot> {
+        self.ensure_enabled()?;
+        CompileSlot::acquire(Arc::clone(compilation_semaphore()))
+            .await
+            .map_err(|_| anyhow::anyhow!("Compilation semaphore closed"))
+    }
+
+    pub fn send_event(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        status: &str,
+        message: Option<String>,
+        progress: Option<f32>,
+    ) {
+        let event = aegix_engine_events::CompilationEvent {
+            job_id,
+            user_id,
+            status: status.to_string(),
+            message,
+            progress,
+        };
+        let _ = self.event_tx.send(event);
+    }
+
+    /// Render template with config (if it contains Handlebars syntax)
+    /// Security: Uses strict Handlebars mode with HTML escaping enabled
+    fn render_template(&self, template: &str, config: &serde_json::Value) -> Result<String> {
+        // Only render through Handlebars if the template explicitly opts in
+        // with a `// handlebars: true` directive line.
+        let has_handlebars = template
+            .lines()
+            .any(|line| line.trim() == "// handlebars: true");
+        if !has_handlebars {
+            return Ok(template.to_string());
+        }
+
+        // wasm-security-review (2026-05-22): refuse templates that
+        // substitute the WIT world string from a Handlebars variable.
+        // A template like `#[aegix_node(world = "{{user_world}}")]`
+        // would let config control the capability world declared in
+        // source. Defense-in-depth: the post-compile detected-vs-
+        // declared check would catch a binary that imports more than
+        // its declared world, but that check is fail-CLOSED on
+        // observed escalation rather than on intent — and the
+        // declared world is the input to that very check. Forbidding
+        // dynamic world strings at template-parse time eliminates the
+        // class entirely.
+        if let Some(token) = template_substitutes_world(template) {
+            anyhow::bail!(
+                "template-injection: the `world = ...` declaration must be a \
+                 hard-coded literal, not a Handlebars substitution \
+                 (found `{token}`). The WIT capability world drives the \
+                 worker's tiered linker — letting config choose it would let \
+                 an operator silently grant a module higher privileges than \
+                 the source attribute declares. Hard-code the world, e.g. \
+                 `#[aegix_node(world = \"http-node\")]`."
+            );
+        }
+
+        let mut handlebars = Handlebars::new();
+
+        // SECURITY: Enable strict mode — missing template variables produce an error
+        // rather than silently substituting an empty string.
+        handlebars.set_strict_mode(true);
+
+        // SECURITY: Disable HTML escaping for Rust code generation.
+        // HTML escaping (&→&amp;, <→&lt;, etc.) would corrupt valid Rust syntax,
+        // e.g. `a < b` → `a &lt; b`, breaking compilation. We rely instead on
+        // validate_config_values() below, which rejects characters that could
+        // break out of a string literal context in generated source code.
+        handlebars.register_escape_fn(handlebars::no_escape);
+
+        // Validate config before rendering — must run BEFORE substitution so checks
+        // apply to the raw user-supplied values, not the post-render output.
+        self.validate_config_values(config)?;
+
+        // Register template
+        handlebars
+            .register_template_string("node_template", &template)
+            .context("Failed to parse Handlebars template")?;
+
+        // Render with config
+        let rendered = handlebars
+            .render("node_template", config)
+            .context("Failed to render template")?;
+
+        Ok(rendered)
+    }
+
+    /// Validate WASM module structure
+    /// Security: Ensures the compiled WASM is valid before storing
+    fn validate_wasm(&self, wasm_bytes: &[u8]) -> Result<()> {
+        // Check WASM magic number: \0asm (0x00 0x61 0x73 0x6d)
+        if wasm_bytes.len() < 4 {
+            bail!("WASM module too small to be valid");
+        }
+
+        if &wasm_bytes[0..4] != b"\0asm" {
+            bail!("Invalid WASM magic number - not a valid WebAssembly module");
+        }
+
+        // Check version
+        if wasm_bytes.len() < 8 {
+            bail!("WASM module header incomplete");
+        }
+
+        // For core WASM: bytes 4–7 are the 4-byte version field; u32-LE = 1.
+        // For WASM components (Component Model): bytes 4–5 are the layer (0x0d, 0x00)
+        // and bytes 6–7 are the version (0x01, 0x00). Reading all four as u32-LE gives
+        // 0x00_01_00_0d = 65549. Accept any value up to 2^26 — wasmtime does full
+        // structural validation at instantiation time.
+        let version =
+            u32::from_le_bytes([wasm_bytes[4], wasm_bytes[5], wasm_bytes[6], wasm_bytes[7]]);
+
+        match version {
+            1 => tracing::debug!("WASM validation passed: core WASM module (version 1)"),
+            _ if version < 67_108_864 => {
+                tracing::debug!(version, "WASM validation passed: component model binary")
+            }
+            _ => bail!("Invalid WASM version: {} (suspiciously large)", version),
+        }
+
+        Ok(())
+    }
+
+    /// Validate config values to prevent code injection
+    /// Security: Ensures config values are safe for code generation
+    fn validate_config_values(&self, config: &serde_json::Value) -> Result<()> {
+        match config {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    // Recursively validate nested objects
+                    self.validate_config_values(value)?;
+
+                    // Validate key doesn't contain suspicious characters
+                    if key.contains("{{") || key.contains("}}") || key.contains("${") {
+                        bail!(
+                            "Config key '{}' contains potentially unsafe characters",
+                            key
+                        );
+                    }
+                }
+            }
+            serde_json::Value::String(s) => {
+                // SECURITY: Prevent nested template injection
+                if s.contains("{{") || s.contains("}}") {
+                    bail!(
+                        "Config value contains Handlebars syntax which is not allowed: {}",
+                        s
+                    );
+                }
+
+                // SECURITY: Prevent command injection in generated code
+                if s.contains("`;") || s.contains("${") || s.contains("$(") {
+                    bail!(
+                        "Config value contains potentially unsafe command injection characters: {}",
+                        s
+                    );
+                }
+
+                // SECURITY: Restrict substitution values to printable ASCII.
+                //
+                // Config values are typically substituted into Rust string literals
+                // (`const KEY: &str = "{{API_KEY}}";`). The strict allowlist below
+                // catches the entire injection attack surface in one pass:
+                //   * Control chars (`\n`, `\r`, `\0`, `\x1b` ESC, …) — break source structure.
+                //   * ASCII `"` / `\\` — break out of string-literal context.
+                //   * Unicode look-alikes for quote/backslash (e.g. U+201C "LEFT DOUBLE
+                //     QUOTATION MARK") — visually misleading even if rustc treats only
+                //     ASCII `"` as the string delimiter; rejecting them keeps the
+                //     "no quote-like chars" invariant honest.
+                //   * Any non-ASCII char — credential values (API keys, tokens,
+                //     passwords) are ASCII by every existing format. Rejecting non-ASCII
+                //     also closes a class of confusable / IDN / RTL-override attacks
+                //     against operators reading the rendered source.
+                //
+                // Allowed range: U+0020 (SPACE) through U+007E (`~`) inclusive,
+                // EXCLUDING `"` (U+0022) and `\` (U+005C).
+                for (idx, ch) in s.char_indices() {
+                    let code = ch as u32;
+                    let is_printable_ascii = (0x20..=0x7e).contains(&code);
+                    let is_quote_or_backslash = ch == '"' || ch == '\\';
+                    if !is_printable_ascii || is_quote_or_backslash {
+                        bail!(
+                            "Config value contains a disallowed character at byte {} \
+                             (U+{:04X}). Only printable ASCII (U+0020..=U+007E) is \
+                             permitted in compile-time substitution values, and \
+                             quote (U+0022) / backslash (U+005C) are excluded to \
+                             prevent string-literal escape injection.",
+                            idx,
+                            code
+                        );
+                    }
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    self.validate_config_values(item)?;
+                }
+            }
+            _ => {} // Numbers, booleans, null are safe
+        }
+        Ok(())
+    }
+
+    /// Compile a catalog template, forwarding the dependencies its
+    /// `talos.json` declares.
+    ///
+    /// **This replaced the old `compile_to_wasm(user, job, name, source)`
+    /// convenience, which defaulted `dependencies` to `None`.** That default
+    /// was silently wrong at every catalog call site: the source came from a
+    /// template directory whose manifest declared the crates it needed, and
+    /// dropping them produced `unresolved import` at runtime while CI — which
+    /// reads the manifest — stayed green. The convenience was deleted rather
+    /// than fixed, so no future caller can re-acquire the footgun; taking a
+    /// [`CatalogTemplate`] makes the dependency source structural.
+    ///
+    /// The declared dependencies are still gated by
+    /// [`dependency_allowlist::validate_dependencies`] inside
+    /// `create_workspace` — see [`catalog`] for the exact supply-chain bound.
+    pub async fn compile_catalog_template(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        template: &CatalogTemplate,
+    ) -> Result<CompilationResult> {
+        self.compile_to_wasm_with_config(
+            user_id,
+            job_id,
+            name,
+            template.source(),
+            &serde_json::json!({}),
+            template.dependencies(),
+        )
+        .await
+    }
+
+    /// Compile Rust source to WASM with config
+    /// If source_code contains Handlebars syntax, it will be rendered with config first
+    ///
+    /// The binary is reconciled against the world the SOURCE declares. A
+    /// surface that checked a caller's world (a role, an actor ceiling)
+    /// compiles with [`Self::compile_rust_for_world`] instead, so the binary is
+    /// held to the world that was checked.
+    pub async fn compile_to_wasm_with_config(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        dependencies: Option<&serde_json::Value>,
+    ) -> Result<CompilationResult> {
+        self.compile_rust(
+            user_id,
+            job_id,
+            name,
+            source_code,
+            config,
+            dependencies,
+            None,
+        )
+        .await
+    }
+
+    /// Compile Rust source for a REQUIRED capability world — the world a
+    /// role gate or an actor ceiling checked before the compile. Every world
+    /// the source declares (`#[aegix_module(world = …)]`, `#[aegix_node(…)]`,
+    /// `wit_bindgen::generate!({ world: … })`) must be that world, and the
+    /// binary is reconciled against it, so a body cannot name a wider world
+    /// than the one that was checked (security review 2026-10-14, G-1). Until
+    /// then the source's own declaration was the reference and the checked
+    /// world was never applied to a Rust body that carried one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compile_rust_for_world(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        dependencies: Option<&serde_json::Value>,
+        world: &str,
+    ) -> Result<CompilationResult> {
+        self.compile_rust(
+            user_id,
+            job_id,
+            name,
+            source_code,
+            config,
+            dependencies,
+            Some(world),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compile_rust(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        dependencies: Option<&serde_json::Value>,
+        required_world: Option<&str>,
+    ) -> Result<CompilationResult> {
+        self.ensure_enabled()?;
+        // wasm-security-review (2026-05-22): bound the source size
+        // BEFORE acquiring a compilation slot or touching the filesystem.
+        // A hostile 100 MiB source string would otherwise hold the
+        // semaphore for the full 60-second cargo timeout while doing
+        // nothing useful — and `cargo component build` would likely OOM
+        // before producing an error. WASM_MAX_SOURCE_BYTES overrides the
+        // default cap.
+        let max_source_bytes =
+            nonzero_env_or_default("WASM_MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES);
+        if source_code.len() > max_source_bytes {
+            return Ok(CompilationResult {
+                success: false,
+                wasm_bytes: None,
+                errors: vec![CompilationError {
+                    line: None,
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: format!(
+                        "source-too-large: source code is {} bytes but the cap is {} bytes \
+                         (set WASM_MAX_SOURCE_BYTES to raise it). Reduce the module size or \
+                         split into multiple smaller modules.",
+                        source_code.len(),
+                        max_source_bytes
+                    ),
+                    severity: "error".to_string(),
+                }],
+                size_bytes: 0,
+                content_hash: String::new(),
+                capability_world: CapabilityWorld::Unknown,
+                imported_interfaces: vec![],
+            });
+        }
+
+        self.send_event(
+            user_id,
+            job_id,
+            "starting",
+            Some("Initializing compilation environment...".to_string()),
+            Some(0.05),
+        );
+
+        // Acquire compilation permit with timeout (backpressure if at capacity).
+        // The slot is passed to every sandbox child this compile runs, so the
+        // permit is held until each child (and its container) is dead.
+        let slot = tokio::time::timeout(
+            std::time::Duration::from_secs(120), // 2 min wait for compilation slot
+            self.acquire_slot(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Compilation queue full (max {} concurrent). All slots busy for >2 minutes. Try again shortly.",
+                max_concurrent_compilations()
+            )
+        })??;
+
+        tracing::debug!(name, "starting compilation");
+        let compile_start = std::time::Instant::now();
+
+        // 0a. Run static source lints (instant, no compilation overhead).
+        self.send_event(
+            user_id,
+            job_id,
+            "linting",
+            Some("Running static source analysis...".to_string()),
+            Some(0.1),
+        );
+        let lint_warnings = analyze::lint_source_code(source_code);
+        let lint_errors: Vec<CompilationError> = lint_warnings
+            .iter()
+            .filter(|e| lint_refuses_compile(e))
+            .cloned()
+            .collect();
+        if !lint_errors.is_empty() {
+            self.send_event(
+                user_id,
+                job_id,
+                "failed",
+                Some("Static analysis failed with errors".to_string()),
+                Some(1.0),
+            );
+            return Ok(CompilationResult {
+                success: false,
+                wasm_bytes: None,
+                errors: lint_errors,
+                size_bytes: 0,
+                content_hash: String::new(),
+                capability_world: CapabilityWorld::Unknown,
+                imported_interfaces: vec![],
+            });
+        }
+
+        // 0. Render template if it contains Handlebars syntax
+        self.send_event(
+            user_id,
+            job_id,
+            "scaffolding",
+            Some("Generating project source code...".to_string()),
+            Some(0.15),
+        );
+        let rendered_code = self
+            .render_template(source_code, config)
+            .context("Template rendering failed")?;
+        tracing::info!(
+            elapsed_ms = compile_start.elapsed().as_millis() as u64,
+            name,
+            "Compilation phase: source generated"
+        );
+
+        // The world the binary is reconciled against post-compile. A
+        // compile FOR a world (one a gate checked) is held to that world and
+        // refuses a source declaring any other; otherwise the source's own
+        // declaration is the reference. A mismatch means the macro expansion
+        // targeted a different world than the reference — a bait-and-switch
+        // attempt or a typo/comment-confusion bug.
+        let declared_world = match required_world {
+            None => extract_wit_world(&rendered_code),
+            Some(required) => match required_world_declaration(&rendered_code, required) {
+                Ok(world) => world,
+                Err(message) => {
+                    tracing::warn!(
+                        module_name = %name,
+                        required_world = %required,
+                        "world-mismatch: the source declares a world other than the one checked"
+                    );
+                    self.send_event(user_id, job_id, "failed", Some(message.clone()), Some(1.0));
+                    return Ok(CompilationResult {
+                        success: false,
+                        wasm_bytes: None,
+                        errors: vec![CompilationError {
+                            line: None,
+                            column: None,
+                            end_line: None,
+                            end_column: None,
+                            message,
+                            severity: "error".to_string(),
+                        }],
+                        size_bytes: 0,
+                        content_hash: String::new(),
+                        capability_world: CapabilityWorld::Unknown,
+                        imported_interfaces: vec![],
+                    });
+                }
+            },
+        };
+
+        // 1. Create temporary workspace
+        let (workspace, package_name) = self
+            .create_workspace(job_id, name, &rendered_code, dependencies)
+            .await?;
+        tracing::info!(elapsed_ms = compile_start.elapsed().as_millis() as u64, name, job_id = %job_id, "Compilation phase: workspace created");
+
+        // L-37: run the rest of compilation in an inner method so the
+        // single workspace-cleanup site below covers EVERY exit path
+        // (success, audit-fail, build-fail, validation-fail, panic). The
+        // pre-refactor code had 9 inline `remove_dir_all` calls scattered
+        // across early-return arms; a panic between any two of those
+        // leaked the workspace.
+        let result = self
+            .compile_with_workspace(
+                user_id,
+                job_id,
+                name,
+                &workspace,
+                &package_name,
+                lint_warnings,
+                compile_start,
+                &declared_world,
+                &slot,
+            )
+            .await;
+
+        // Cleanup workspace on ALL paths (success, error, panic-recovery
+        // boundary). Mirrors `compile_python_module`'s pattern.
+        tokio::fs::remove_dir_all(&workspace).await.ok();
+
+        result
+    }
+
+    /// Inner compilation kernel — assumes the workspace already exists
+    /// at `workspace`. The caller is responsible for cleanup so this
+    /// function can use `?` and early returns freely without leaking
+    /// the workspace dir.
+    #[allow(clippy::too_many_arguments)]
+    async fn compile_with_workspace(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        workspace: &PathBuf,
+        package_name: &str,
+        lint_warnings: Vec<CompilationError>,
+        compile_start: std::time::Instant,
+        // Source-declared capability world (from `extract_wit_world`).
+        // Compared against the binary-inspected world after compilation
+        // to detect declared/actual mismatches (see step 8).
+        declared_world: &str,
+        // The caller's compile slot; every sandbox child below holds it.
+        slot: &CompileSlot,
+    ) -> Result<CompilationResult> {
+        // 1.4. Pre-generate `Cargo.lock` so `cargo audit --no-fetch`
+        // (which runs inside `--network=none`) has a real lockfile to
+        // scan. `create_workspace` writes Cargo.toml + src/lib.rs but
+        // never produces a lockfile — the build step (1.6) is what
+        // historically generated it as a side-effect, but audit ran
+        // BEFORE that. Without a lockfile cargo-audit exits non-zero
+        // with no JSON output; production fails closed but dev
+        // silently warned through (N-7 from the aegix-compilation
+        // review — dev fail-open).
+        //
+        // Wasm-security review 2026-05-23 (H-6): lockfile generation
+        // now runs INSIDE the same `--network=none --read-only` build
+        // container as the compile + audit steps. Pre-fix it ran
+        // directly on the controller host (where vault tokens, master
+        // DEK, and LLM keys are mounted) — the doc-comment justified
+        // this with "cargo generate-lockfile only does dependency
+        // resolution," which is true today but doesn't make it safe to
+        // run user-controlled `Cargo.toml` parsing on the controller
+        // host. If a future cargo TOML-parsing or resolver CVE lands,
+        // an attacker would land code execution on the credential-
+        // bearing host. The fix mirrors the audit-command pattern:
+        // build the sandboxed Command via `container::build_command`,
+        // then append the `generate-lockfile --offline --quiet` args.
+        // `--offline` still forces local-registry resolution, so the
+        // `--network=none` container doesn't break legitimate use.
+        //
+        // We compute `cargo_registry_cache` and `wit_dir` here (used
+        // by `container::build_command` to mount the registry cache
+        // RO and the WIT directory RO into the container). They were
+        // previously declared after this block; pull them up.
+        let cargo_registry_cache = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".cargo/registry");
+        let wit_dir = self
+            .wit_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        // No target cache for lockfile generation — it only resolves the
+        // dependency graph, never builds artifacts.
+        let lockfile_cmd =
+            container::build_command(workspace, &cargo_registry_cache, wit_dir, None);
+        let lockfile_result = match lockfile_cmd {
+            Ok(mut cmd) => {
+                cmd.args(["generate-lockfile", "--offline", "--quiet"])
+                    .current_dir(workspace);
+                cmd.run(Duration::from_secs(30), slot).await
+            }
+            Err(e) => {
+                // 2026-09-10: PROPAGATE. `build_command` returns `Err` for
+                // exactly three reasons — the production fail-closed gate
+                // (no runtime, no host-fallback ack), an invalid
+                // `AEGIX_BUILDER_IMAGE`, or an unresolvable mount path — and
+                // every one of them is a reason NOT to run cargo on the host.
+                // The pre-fix arm did precisely that ("same as audit_command's
+                // fallback policy", which had the same hole), so the gate the
+                // operator thought they had was one `Err` away from a host
+                // spawn inheriting the controller's environment.
+                return Err(e).context(
+                    "Pre-audit lockfile generation requires the compilation sandbox \
+                     (container::build_command refused to build a host command)",
+                );
+            }
+        };
+        match &lockfile_result {
+            Ok(out) if out.status.success() => {
+                tracing::debug!(
+                    target: "aegix_compilation",
+                    event_kind = "lockfile_generated",
+                    "Pre-audit Cargo.lock generated"
+                );
+            }
+            Ok(out) => {
+                tracing::warn!(
+                    target: "aegix_compilation",
+                    event_kind = "lockfile_generation_failed",
+                    fallback_reason = "cargo_nonzero",
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "cargo generate-lockfile --offline returned non-zero — \
+                     audit will run without a lockfile and likely surface as \
+                     missing-lockfile (production fails closed, dev warns)"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "aegix_compilation",
+                    event_kind = "lockfile_generation_failed",
+                    fallback_reason = "spawn_or_timeout",
+                    "cargo generate-lockfile --offline timed out or failed to spawn — \
+                     audit will run without a lockfile"
+                );
+            }
+        }
+
+        // 1.5. CVE scan
+        self.send_event(
+            user_id,
+            job_id,
+            "auditing",
+            Some("Performing dependency security audit...".to_string()),
+            Some(0.2),
+        );
+        // `cargo_registry_cache` was hoisted up above (H-6) for the
+        // sandboxed lockfile-gen step; reuse it here.
+        let (audit_cmd, audit_db_probe) =
+            match container::audit_command_with_db_probe(workspace, &cargo_registry_cache) {
+                Ok((cmd, probe)) => (Ok(cmd), probe),
+                Err(e) => (Err(e), None),
+            };
+        // Stable image-baked advisory DB path. Both controller/Dockerfile
+        // and Dockerfile.builder stage the DB at /opt/talos-advisory-db
+        // (chmod a+rX, world-readable). Passing --db explicitly avoids
+        // depending on $CARGO_HOME, which the runtime sets to a tmpfs
+        // path (/tmp/cargo-cache) that gets wiped per pod.
+        let audit_db = container::ADVISORY_DB_PATH;
+        // L-15: freshness check on the baked-in DB. Fails closed in
+        // production at 90 days. Outside production (dev/CI) the
+        // check warns but continues — see `check_advisory_db_age` for
+        // the full policy. We run this BEFORE the audit so a stale
+        // DB produces a clear actionable error instead of a confusing
+        // "0 vulnerabilities found" pass against an obsolete snapshot.
+        //
+        // G-21 (2026-10-14): the gate dates the copy the audit READS. In
+        // container mode that is the builder image's, dated by a probe in
+        // the same image; in host mode the host's, `stat`ed directly.
+        let db_age_checked = match audit_db_probe {
+            Some(probe) => check_measured_advisory_db_age(
+                audit_db,
+                advisory_db::builder_advisory_db_age_days(probe, slot).await,
+            ),
+            None => check_advisory_db_age(audit_db),
+        };
+        if let Err(e) = db_age_checked {
+            self.send_event(
+                user_id,
+                job_id,
+                "failed",
+                Some(format!("Advisory DB age check failed: {e}")),
+                Some(1.0),
+            );
+            return Err(e);
+        }
+        let audit_args = ["audit", "--db", audit_db, "--json", "--no-fetch"];
+        let audit_result = match audit_cmd {
+            Ok(mut cmd) => {
+                cmd.args(audit_args).current_dir(workspace);
+                cmd.run(Duration::from_secs(30), slot).await
+            }
+            Err(e) => {
+                // 2026-09-10: PROPAGATE rather than fall back to host cargo —
+                // see the lockfile arm above for why every `Err` here is a
+                // reason not to spawn on the host. cargo-audit is the gate
+                // that refuses known-vulnerable dependencies; running it
+                // unsandboxed on the credential-bearing host to "keep the
+                // gate" is the wrong trade.
+                return Err(e).context(
+                    "Dependency audit requires the compilation sandbox \
+                     (container::audit_command refused to build a host command)",
+                );
+            }
+        };
+
+        match audit_result {
+            Ok(ref out) if !out.status.success() => {
+                let summary = parse_audit_summary(&out.stdout);
+                // L-finding-4: surface informational advisories (unmaintained
+                // / unsound / notice) in BOTH the blocking and non-blocking
+                // branches. Pre-fix only the blocking branch consumed the
+                // parsed list; an informational-only audit run (e.g. an
+                // `unmaintained` dep with no real CVEs) silently passed
+                // with no operator-visible signal.
+                if summary.informational_count > 0 {
+                    tracing::warn!(
+                        target: "aegix_compilation",
+                        event_kind = "audit_informational_advisories",
+                        user_id = %user_id,
+                        job_id = %job_id,
+                        count = summary.informational_count,
+                        advisories = %summary.informational_names.join(", "),
+                        "cargo-audit surfaced {} informational advisor{} (unmaintained / unsound / notice) — \
+                         not blocking compilation, but operators should review and pin or replace the affected crate(s)",
+                        summary.informational_count,
+                        if summary.informational_count == 1 { "y" } else { "ies" },
+                    );
+                }
+                if summary.blocking_count > 0 {
+                    self.send_event(
+                        user_id,
+                        job_id,
+                        "failed",
+                        Some(format!(
+                            "Audit failed: {} vulnerabilit{} found",
+                            summary.blocking_count,
+                            if summary.blocking_count == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            },
+                        )),
+                        Some(1.0),
+                    );
+                    // Confirmed vulnerabilities — block compilation.
+                    // (cleanup handled by outer compile_to_wasm_with_config)
+                    return Err(anyhow::anyhow!(
+                        "Dependency security audit failed — {} vulnerable crate(s): {}. \
+                         Remove or downgrade the affected dependency.",
+                        summary.blocking_count,
+                        summary.blocking_names.join(", "),
+                    ));
+                }
+                // Non-zero exit with NO blocking advisories. Two cases:
+                //  (a) tool/DB problem — production fail-closed below.
+                //  (b) informational-only run — proceed (the WARN above
+                //      already surfaced them); the non-zero exit from
+                //      cargo-audit on an informational-only result is
+                //      treated the same as case (a) in production
+                //      because we cannot distinguish "informational
+                //      advisories caused exit 1" from "tool broke and
+                //      we found nothing" without parsing cargo-audit's
+                //      stderr. Fail-closed in prod is the right call;
+                //      the WARN tells the operator what happened. "Prod"
+                //      is wherever the sandbox is required (G-9: staging
+                //      too, as docker-compose.prod.yml runs).
+                if container::compile_sandbox_required() {
+                    self.send_event(
+                        user_id,
+                        job_id,
+                        "failed",
+                        Some("Audit tool failed in production".to_string()),
+                        Some(1.0),
+                    );
+                    // (cleanup handled by outer compile_to_wasm_with_config)
+                    return Err(anyhow::anyhow!(
+                        "cargo-audit exited with an error in production. \
+                         Most likely the RustSec advisory database is missing or stale inside the \
+                         talos-builder image — rebuild it via `scripts/build-compiler-image.sh` \
+                         (the Dockerfile pre-fetches the DB at build time; --no-fetch is enforced \
+                         at runtime because the sandbox denies network)."
+                    ));
+                }
+                tracing::warn!(
+                    target: "aegix_compilation",
+                    event_kind = "audit_skipped_dev",
+                    "cargo-audit exited non-zero with no parsed vulnerabilities — tool, \
+                     advisory-DB, or missing-Cargo.lock issue. Skipping in dev mode (production \
+                     would fail closed). If this fires repeatedly, check the lockfile_generated \
+                     event from step 1.4 — a failed pre-audit `cargo generate-lockfile --offline` \
+                     will reliably trip this branch."
+                );
+            }
+            Err(_) => {
+                if container::compile_sandbox_required() {
+                    self.send_event(
+                        user_id,
+                        job_id,
+                        "failed",
+                        Some("Audit tool unavailable in production".to_string()),
+                        Some(1.0),
+                    );
+                    // (cleanup handled by outer compile_to_wasm_with_config)
+                    return Err(anyhow::anyhow!(
+                        "cargo-audit unavailable or timed out — blocked in production. \
+                         Verify the talos-builder image has cargo-audit installed AND a populated \
+                         advisory-db at /home/builder/.cargo/advisory-db (rebuild via \
+                         `scripts/build-compiler-image.sh` if missing)."
+                    ));
+                }
+                tracing::warn!("cargo-audit not available or timed out — skipping CVE scan in non-production mode");
+            }
+            Ok(ref out) => {
+                // Clean audit (exit 0). Without `--deny=informational`,
+                // cargo-audit exits 0 even when informational advisories
+                // are present — surface them so operators still see the
+                // signal. Blocking advisories with exit 0 shouldn't
+                // happen under our `--no-fetch --json` invocation, but
+                // we check defensively: if any blocking entry slipped
+                // through, block compilation. L-finding-4.
+                let summary = parse_audit_summary(&out.stdout);
+                if summary.blocking_count > 0 {
+                    self.send_event(
+                        user_id,
+                        job_id,
+                        "failed",
+                        Some(format!(
+                            "Audit failed: {} vulnerabilit{} found",
+                            summary.blocking_count,
+                            if summary.blocking_count == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            },
+                        )),
+                        Some(1.0),
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Dependency security audit failed — {} vulnerable crate(s): {}. \
+                         Remove or downgrade the affected dependency.",
+                        summary.blocking_count,
+                        summary.blocking_names.join(", "),
+                    ));
+                }
+                if summary.informational_count > 0 {
+                    tracing::warn!(
+                        target: "aegix_compilation",
+                        event_kind = "audit_informational_advisories",
+                        user_id = %user_id,
+                        job_id = %job_id,
+                        count = summary.informational_count,
+                        advisories = %summary.informational_names.join(", "),
+                        "cargo-audit surfaced {} informational advisor{} on the clean-exit path \
+                         (unmaintained / unsound / notice) — not blocking compilation, \
+                         but operators should review",
+                        summary.informational_count,
+                        if summary.informational_count == 1 { "y" } else { "ies" },
+                    );
+                }
+            }
+        }
+
+        // 2. Run cargo component build with timeout (60 seconds)
+        self.send_event(
+            user_id,
+            job_id,
+            "building",
+            Some("Compiling Rust source to WASM component...".to_string()),
+            Some(0.3),
+        );
+        // `wit_dir` was hoisted up above (H-6) for the sandboxed
+        // lockfile-gen step; reuse it here.
+        //
+        // Persistent per-USER target cache (see `target_cache` module):
+        // dependency artifacts survive across this user's compiles, so
+        // repeat compiles only rebuild the user's lib.rs (~2-3 s) instead
+        // of the whole dep graph (~15-30 s). `None` (disabled / cache-dir
+        // failure) falls back to the throwaway `{workspace}/target`.
+        let user_target_cache = target_cache::resolve_for(user_id);
+        let build_cmd = container::build_command(
+            workspace,
+            &cargo_registry_cache,
+            wit_dir,
+            user_target_cache.as_deref(),
+        );
+        let output = match build_cmd {
+            Ok(mut cmd) => {
+                cmd.args([
+                    "component",
+                    "build",
+                    "--release",
+                    "--target",
+                    "wasm32-wasip2",
+                    "--manifest-path",
+                    workspace
+                        .join("Cargo.toml")
+                        .to_str()
+                        .unwrap_or("Cargo.toml"),
+                ]);
+                // 60s for large worlds like automation-node
+                cmd.run(Duration::from_secs(60), slot)
+                    .await
+                    .map_err(|e| e.with_timeout_context("Compilation timed out after 60 seconds"))?
+            }
+            Err(e) => {
+                self.send_event(
+                    user_id,
+                    job_id,
+                    "failed",
+                    Some(format!("Build setup failed: {}", e)),
+                    Some(1.0),
+                );
+                tracing::error!(error = %e, "Failed to build compilation container command");
+                // (cleanup handled by outer compile_to_wasm_with_config)
+                return Err(e.context("Container compilation setup failed"));
+            }
+        };
+
+        tracing::info!(
+            elapsed_ms = compile_start.elapsed().as_millis() as u64,
+            name,
+            "Compilation phase: cargo build complete"
+        );
+
+        // 3. Check for errors
+        if !output.status.success() {
+            self.send_event(
+                user_id,
+                job_id,
+                "failed",
+                Some("Cargo build failed with compilation errors".to_string()),
+                Some(1.0),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            let workspace_prefix = workspace.to_str().unwrap_or("");
+            let sanitized_stderr = if workspace_prefix.is_empty() {
+                stderr.to_string()
+            } else {
+                stderr.replace(workspace_prefix, "<workspace>")
+            };
+
+            tracing::error!(name, stdout = %stdout, stderr = %sanitized_stderr, "compilation failed");
+
+            let errors = self.parse_errors(&sanitized_stderr);
+
+            // (cleanup handled by outer compile_to_wasm_with_config)
+            return Ok(CompilationResult {
+                success: false,
+                wasm_bytes: None,
+                errors,
+                size_bytes: 0,
+                content_hash: String::new(),
+                capability_world: CapabilityWorld::Unknown,
+                imported_interfaces: vec![],
+            });
+        }
+
+        self.send_event(
+            user_id,
+            job_id,
+            "success",
+            Some("Module successfully compiled and verified".to_string()),
+            Some(1.0),
+        );
+
+        // 4. Locate and read the component WASM binary.
+        //
+        // cargo-component 0.21+ with --target wasm32-wasip2 writes the adapted
+        // component model binary to ONE of two locations depending on its version
+        // and internal behaviour:
+        //   A) target/wasm32-wasip1/release/name.wasm  (older cargo-component behaviour)
+        //   B) target/wasm32-wasip2/release/name.wasm  (newer behaviour, wasip2 is already
+        //                                               a component target)
+        //
+        // A WASM component model binary starts with the 8-byte magic sequence:
+        //   00 61 73 6d  0d 00 01 00
+        // A core WASM module starts with:
+        //   00 61 73 6d  01 00 00 00
+        //
+        // Strategy: try the path that cargo-component reported via its "Creating component"
+        // stdout line first, then probe both candidate paths for the component magic and
+        // use whichever one is valid.  This is robust across cargo-component versions and
+        // across CARGO_TARGET_DIR environments.
+        let wasm_filename = format!("{}.wasm", package_name.replace("-", "_"));
+        // Artifact location precedence mirrors where the build actually
+        // wrote: the per-user target cache when one was in play (in the
+        // container path the stdout line reports the CONTAINER-side
+        // /cache/target/... which doesn't exist host-side, so this base is
+        // what the probe below resolves against), else the legacy
+        // CARGO_TARGET_DIR env / throwaway workspace target.
+        let target_base = user_target_cache.clone().unwrap_or_else(|| {
+            std::env::var("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| workspace.join("target"))
+        });
+
+        // Parse "Creating component /path/to/name.wasm" from cargo stdout.
+        // The path may be absolute or relative to the compilation workspace.
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let component_path_from_stdout: Option<PathBuf> = stdout_str.lines().find_map(|line| {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("Creating component ") {
+                let raw = PathBuf::from(rest.trim());
+                // Prefer absolute path; fall back to resolving relative to workspace.
+                if raw.is_absolute() && raw.exists() {
+                    Some(raw)
+                } else {
+                    let resolved = workspace.join(&raw);
+                    if resolved.exists() {
+                        Some(resolved)
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        });
+
+        // Helper: true if the file has the WASM component model magic (0x0d at byte 4).
+        // Core WASM has 0x01 at byte 4; component model binaries have 0x0d.
+        // Reads only the first 8 bytes so this is O(1) regardless of file size.
+        fn is_component_magic(p: &PathBuf) -> bool {
+            use std::io::Read;
+            let Ok(mut f) = std::fs::File::open(p) else {
+                return false;
+            };
+            let mut buf = [0u8; 8];
+            matches!(
+                f.read(&mut buf),
+                Ok(n) if n >= 8 && &buf[0..4] == b"\0asm" && buf[4] == 0x0d
+            )
+        }
+
+        // Return the modification time of a file, or None if unavailable.
+        fn mtime(p: &PathBuf) -> Option<std::time::SystemTime> {
+            std::fs::metadata(p).and_then(|m| m.modified()).ok()
+        }
+
+        let candidate_wasip1 = target_base
+            .join("wasm32-wasip1/release")
+            .join(&wasm_filename);
+        let candidate_wasip2 = target_base
+            .join("wasm32-wasip2/release")
+            .join(&wasm_filename);
+
+        let final_wasm_path: PathBuf = if let Some(p) = component_path_from_stdout {
+            // cargo-component told us exactly where the component landed.
+            tracing::info!(path = %p.display(), "cargo-component reported component path via stdout");
+            p
+        } else {
+            // Fallback: inspect both candidate paths.
+            // After a successful compilation the FRESHEST file with component-model magic
+            // is the one just written.  A stale binary from a previous session will have
+            // an older mtime even if it also happens to be a component model binary.
+            let wasip1_ok = is_component_magic(&candidate_wasip1);
+            let wasip2_ok = is_component_magic(&candidate_wasip2);
+            let wasip1_mtime = mtime(&candidate_wasip1);
+            let wasip2_mtime = mtime(&candidate_wasip2);
+
+            tracing::info!(
+                wasip1_is_component = wasip1_ok,
+                wasip2_is_component = wasip2_ok,
+                wasip1_mtime = ?wasip1_mtime,
+                wasip2_mtime = ?wasip2_mtime,
+                cargo_stdout = %stdout_str.trim(),
+                "cargo-component stdout parse missed 'Creating component'; probing candidate paths"
+            );
+
+            match (wasip1_ok, wasip2_ok) {
+                (true, true) => {
+                    // Both are component binaries; use the one most recently written.
+                    if wasip2_mtime >= wasip1_mtime {
+                        tracing::info!(path = %candidate_wasip2.display(), "selecting wasm32-wasip2 (fresher)");
+                        candidate_wasip2
+                    } else {
+                        tracing::info!(path = %candidate_wasip1.display(), "selecting wasm32-wasip1 (fresher)");
+                        candidate_wasip1
+                    }
+                }
+                (true, false) => {
+                    tracing::info!(path = %candidate_wasip1.display(), "selecting wasm32-wasip1 (only valid component)");
+                    candidate_wasip1
+                }
+                (false, true) => {
+                    tracing::info!(path = %candidate_wasip2.display(), "selecting wasm32-wasip2 (only valid component)");
+                    candidate_wasip2
+                }
+                (false, false) => {
+                    tracing::error!(
+                        wasip1_exists = candidate_wasip1.exists(),
+                        wasip2_exists = candidate_wasip2.exists(),
+                        cargo_stdout = %stdout_str,
+                        "WASM component binary not found at either candidate path"
+                    );
+                    anyhow::bail!(
+                        "cargo-component succeeded but no component binary was found.\n\
+                         Checked:\n  {} (component={wasip1_ok})\n  {} (component={wasip2_ok})\n\
+                         CARGO_TARGET_DIR={:?}",
+                        candidate_wasip1.display(),
+                        candidate_wasip2.display(),
+                        std::env::var("CARGO_TARGET_DIR").ok()
+                    )
+                }
+            }
+        };
+
+        let wasm_bytes = tokio::fs::read(&final_wasm_path).await.with_context(|| {
+            format!(
+                "Failed to read compiled WASM from {}",
+                final_wasm_path.display()
+            )
+        })?;
+        tracing::info!(
+            elapsed_ms = compile_start.elapsed().as_millis() as u64,
+            name,
+            size_bytes = wasm_bytes.len(),
+            "Compilation phase: WASM extracted"
+        );
+
+        // 5. Validate WASM structure
+        // (cleanup handled by outer compile_to_wasm_with_config)
+        self.validate_wasm(&wasm_bytes)?;
+
+        // 6. Validate size (max 1MB — `max_component_bytes(Rust)`)
+        if wasm_bytes.len() > max_component_bytes(ModuleLanguage::Rust) {
+            bail!("Compiled WASM exceeds 1MB size limit");
+        }
+
+        // SECURITY: Check minimum size - valid WASM modules are at least a few KB
+        if wasm_bytes.len() < 1024 {
+            bail!(
+                "Compiled WASM is suspiciously small ({} bytes), likely compilation error",
+                wasm_bytes.len()
+            );
+        }
+
+        // 7. Compute hash for deduplication
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm_bytes);
+        let content_hash = hex::encode(hasher.finalize().as_slice());
+
+        // L-16 (2026-05-22): emit a structured compile-provenance log
+        // so downstream observability can correlate a content_hash with
+        // the security posture under which it was produced. Three
+        // dimensions matter for "is this binary still trustworthy":
+        //   - dependency_allowlist_fp — fingerprint of the effective
+        //     allowlist (default + extras). Tightening the allowlist
+        //     between two compiles of the same source produces the
+        //     same content_hash but different allowlist_fp, and
+        //     operators investigating a CVE can grep both.
+        //   - advisory_db_age_days — how stale the RustSec snapshot
+        //     was at compile time. A "passed audit" with a 100-day-old
+        //     DB is a much weaker statement than one with a fresh DB.
+        //   - wit_schema_fp — fingerprint of the WIT host contract
+        //     (`wit/aegix.wit`) the module was bound against. A WIT
+        //     bump that adds new host functions doesn't invalidate
+        //     old binaries (their imports are a subset) but tracking
+        //     it makes "this binary expects pre-X WIT" auditable.
+        let allowlist_fp = dependency_allowlist_fingerprint();
+        // `u64::MAX` is this field's documented "unknown" sentinel; the
+        // reason it could not be dated is the sampler's and the gate's to log.
+        let advisory_db_age_days =
+            advisory_db::advisory_db_age_days(container::ADVISORY_DB_PATH).unwrap_or(u64::MAX);
+        let wit_schema_fp = wit_schema_fingerprint();
+        tracing::info!(
+            target: "talos_compilation_provenance",
+            event_kind = "compile_provenance",
+            content_hash = %content_hash,
+            dependency_allowlist_fp = %allowlist_fp,
+            advisory_db_age_days,
+            wit_schema_fp = %wit_schema_fp,
+            wasm_bytes = wasm_bytes.len(),
+            "Compile provenance recorded — content_hash + security-posture fingerprints"
+        );
+
+        // 8. Inspect capability world — determines which WIT interfaces are imported.
+        let inspection = aegix_wit_inspector::inspect_component(&wasm_bytes);
+        tracing::info!(
+            capability_world = %inspection.capability_world,
+            interfaces = %inspection.imported_interfaces.join(", "),
+            "Capability world detected"
+        );
+
+        // 8a. Reconcile declared (source) vs detected (binary) world.
+        //
+        // `extract_wit_world` parses the user's source for the
+        // `world = "..."` declaration; `inspect_component` inspects the
+        // compiled WASM's imported interfaces and infers the
+        // capability tier. The two should agree.
+        //
+        // Mismatch causes:
+        // 1. **Typo / comment-confusion** — e.g. an out-of-date `//
+        //    world: "minimal-node"` comment in the source while the
+        //    actual `#[aegix_module]` attribute targets `agent-node`.
+        //    Most common, harmless beyond confusion.
+        // 2. **Bait-and-switch** — source declares `minimal-node`
+        //    (least privilege, looks safe in code review) but the
+        //    macro expansion or scaffold inserts higher-tier imports.
+        //    The worker's tiered linker would reject this at
+        //    instantiation (the binary's imports won't resolve
+        //    against the minimal-node linker), but flagging it here
+        //    surfaces the bug to the operator before the module is
+        //    ever dispatched.
+        // 3. **Inspector limitations** — `inspect_component`
+        //    classifies based on the set of imported interfaces; a
+        //    binary that imports a SUBSET of its declared world's
+        //    interfaces may classify as a lower tier than declared.
+        //    This is benign (it means the user over-declared
+        //    privileges in source but doesn't actually use them).
+        //
+        // We log at WARN with structured fields so operators can
+        // alert on this; we do NOT fail the compile because case
+        // 3 is benign and case 1/2 are surfaced anyway when the
+        // worker tries to instantiate. The `aegix-mcp-handlers`
+        // and `aegix-inline-compile-service` layers do additional
+        // checks (post-compile actor capability ceiling vs detected
+        // world) — this log feeds operator observability, not
+        // gating.
+        // wasm-security-review (2026-05-22): hard-fail when the
+        // detected world is NOT a subset of the declared world (i.e.
+        // the binary requested MORE privileges than the source
+        // declared). Pre-fix this was a WARN-only log relying on the
+        // worker's tiered linker to refuse instantiation — defense-
+        // in-depth, but a bait-and-switch module would still get
+        // saved to the catalog and operators wouldn't see the
+        // mismatch until the first execution attempt.
+        //
+        // The benign case (declared > detected — user over-declared
+        // privileges in source but doesn't actually use them) remains
+        // a WARN. The dangerous case (detected > declared, or worlds
+        // are incomparable) is a compile error.
+        let inspection = match reconcile_declared_world(name, declared_world, inspection) {
+            Ok(inspection) => inspection,
+            Err(refused) => return Ok(refused),
+        };
+
+        // 9. (workspace cleanup handled by outer compile_to_wasm_with_config)
+        let size_bytes = wasm_bytes.len() as i32;
+        tracing::info!(
+            name,
+            size_bytes,
+            content_hash = %content_hash,
+            "compilation successful"
+        );
+
+        Ok(CompilationResult {
+            success: true,
+            wasm_bytes: Some(wasm_bytes),
+            errors: lint_warnings, // Non-blocking warnings from static analysis
+            size_bytes,
+            content_hash,
+            capability_world: inspection.capability_world,
+            imported_interfaces: inspection.imported_interfaces,
+        })
+    }
+
+    async fn create_workspace(
+        &self,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        dependencies: Option<&serde_json::Value>,
+    ) -> Result<(PathBuf, String)> {
+        let workspace = self.workspace_root.join(job_id.to_string());
+        tokio::fs::create_dir_all(&workspace).await?;
+
+        // Sanitize name for Cargo package (replace spaces and invalid chars)
+        // Use hyphens (kebab-case) as required by cargo-component.
+        //
+        // CONCURRENCY (correctness-critical): the cargo package name becomes
+        // the output artifact filename (`<package>.wasm`). All compiles share
+        // one `CARGO_TARGET_DIR` (e.g. `/tmp/cargo-target`) to keep the
+        // dependency build cache warm. Callers pass a FIXED `name`
+        // ("custom_sandbox") for every sandbox compile, so without a
+        // per-job suffix every build wrote the SAME
+        // `target/.../custom_sandbox.wasm`. Two concurrent compiles then
+        // clobbered that single file and the mtime-based read handed BOTH
+        // jobs whichever finished last — module B silently persisted with
+        // module A's WASM (content_hash no longer matched its source).
+        // Folding the unique `job_id` into the package name gives every
+        // build its own artifact path; the shared target dir still caches
+        // dependencies (keyed by their own fingerprints, unaffected by the
+        // user crate's name).
+        let package_name = sanitize_package_name(name, &job_id.simple().to_string());
+
+        // Extract the WIT world from the source so the Cargo.toml target world matches
+        // exactly what the macro declared. This prevents cargo-component from guessing
+        // the world and guarantees the tiered-linker security model works.
+        let world = extract_wit_world(source_code);
+
+        // Crates already present in the base Cargo.toml template — injecting them again
+        // would produce a duplicate key error and abort compilation.
+        // serde and serde_json are always available implicitly; wit-bindgen-rt and
+        // aegix_sdk_macros are internal — users should never need to declare them.
+        static PRE_BUNDLED: &[&str] = &[
+            "serde",
+            "serde_json",
+            "wit-bindgen",
+            "wit-bindgen-rt",
+            "aegix_sdk_macros",
+            "aegix-sdk-macros",
+        ];
+
+        // Enforce crate allowlist before building the Cargo.toml dependency block.
+        // This is a defense-in-depth check — mcp/sandbox.rs also validates at the
+        // MCP layer for user-facing error messages, but enforcing here guarantees
+        // no code path can bypass the allowlist regardless of how compilation is invoked.
+        if let Err(allowlist_err) = crate::dependency_allowlist::validate_dependencies(dependencies)
+        {
+            bail!("Dependency allowlist violation: {}", allowlist_err);
+        }
+
+        let mut custom_deps = String::new();
+        if let Some(serde_json::Value::Object(deps)) = dependencies {
+            for (crate_name, version_val) in deps {
+                if !crate_name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                {
+                    bail!("Invalid crate name: {}", crate_name);
+                }
+
+                // Skip crates that are already in the base template — declaring them
+                // again produces a "duplicate key" Cargo.toml parse error.
+                if PRE_BUNDLED.contains(&crate_name.as_str()) {
+                    tracing::debug!(
+                        crate_name,
+                        "skipping pre-bundled crate in custom dependencies"
+                    );
+                    continue;
+                }
+
+                let version = match version_val {
+                    serde_json::Value::String(s) => s,
+                    _ => bail!("Invalid dependency version format for crate {}", crate_name),
+                };
+
+                // Reject characters that could break out of the TOML string literal or
+                // inject new sections. Only semver-compatible characters are allowed:
+                // digits, dots, hyphens, carets, tildes, asterisks, and spaces.
+                if version.contains("git")
+                    || version.contains("path")
+                    || version.contains('{')
+                    || version.contains('}')
+                    || version.contains('"')
+                    || version.contains('\'')
+                    || version.contains('\n')
+                    || version.contains('\r')
+                    || version.contains('[')
+                    || version.contains(']')
+                    || version.contains('\\')
+                {
+                    bail!(
+                        "Invalid dependency version for {}: contains disallowed characters",
+                        crate_name
+                    );
+                }
+
+                // Some crates require feature flags to unlock their primary functionality.
+                // Emit a Cargo inline-table for those instead of a bare version string.
+                let dep_line = match crate_name.as_str() {
+                    // uuid: v4 (random) and v7 (time-ordered) generation are feature-gated.
+                    // Without these flags `Uuid::new_v4()` / `Uuid::now_v7()` won't compile.
+                    "uuid" => format!(
+                        "uuid = {{ version = \"{}\", features = [\"v4\", \"v7\"] }}\n",
+                        version
+                    ),
+                    // tokio: only the "rt" + "macros" features are safe in a single-threaded
+                    // WASM context; "full" pulls in OS threads which aren't available in WASIP2.
+                    "tokio" => format!(
+                        "tokio = {{ version = \"{}\", features = [\"rt\", \"macros\", \"time\", \"sync\", \"io-util\"] }}\n",
+                        version
+                    ),
+                    _ => format!("{} = \"{}\"\n", crate_name, version),
+                };
+                custom_deps.push_str(&dep_line);
+            }
+        }
+
+        // Path to the internal proc-macro crate every generated module
+        // depends on. `/app/aegix_sdk_macros` is where BOTH runtime images
+        // (controller + builder) bake it; `AEGIX_SDK_MACROS_PATH` overrides
+        // for non-image environments (host-side integration tests, local
+        // `cargo run` of the controller) — mirroring `AEGIX_WIT_PATH`. The
+        // value is operator-controlled env, but it lands inside a TOML
+        // string literal, so refuse shapes that would escape it rather
+        // than emit a malformed manifest.
+        let sdk_macros_path = std::env::var("AEGIX_SDK_MACROS_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty() && !s.contains('"') && !s.contains('\n'))
+            .unwrap_or_else(|| "/app/aegix_sdk_macros".to_string());
+
+        // Write Cargo.toml configured for cargo-component
+        // SECURITY: Component model provides better isolation than core WASM
+        // PERFORMANCE: Optimized release builds with LTO
+        let cargo_toml = format!(
+            r#"[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wit-bindgen-rt = {{ version = "0.44.0", features = ["bitflags"] }}
+serde = {{ version = "1.0", features = ["derive"] }}
+serde_json = "1.0"
+aegix_sdk_macros = {{ path = "{sdk_macros_path}" }}
+{}
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "aegix:{}"
+
+[package.metadata.component.target]
+path = "wit/aegix.wit"
+world = "{}"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# REQUIRED: wasm32-wasip2 defaults to panic = "unwind" (WASI EH is supported),
+# but the WASM component model adapter uses abort-mode ABI conventions for the
+# cabi_post_run / cabi_realloc boundary functions. Enabling software unwind tables
+# corrupts the canonical ABI for ALL return paths — Ok(), Err(), and panic!() all
+# trap with different addresses. Explicitly forcing abort-mode is mandatory.
+#
+# With panic = "abort":
+#   - Normal returns (Ok/Err) cross the WIT boundary correctly.
+#   - Panics call process::abort() → WASI stderr gets the message → the worker's
+#     WASI stderr capture (BufferCapture in context.rs) reads it →
+#     extract_panic_message_from_stderr() formats Err("PANIC: message").
+#   - The catch_unwind in #[aegix_module] / #[aegix_node] is a no-op but harmless.
+panic = "abort"
+"#,
+            package_name, custom_deps, package_name, world
+        );
+
+        tokio::fs::write(workspace.join("Cargo.toml"), cargo_toml).await?;
+
+        // Write lib.rs
+        tokio::fs::create_dir_all(workspace.join("src")).await?;
+        tokio::fs::write(workspace.join("src/lib.rs"), source_code).await?;
+
+        // Copy WIT file to the workspace root's wit directory so the macro finds it at "../wit/aegix.wit"
+        let ws_wit_dest = self.workspace_root.join("wit/aegix.wit");
+        tokio::fs::create_dir_all(self.workspace_root.join("wit"))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create WIT staging directory at {}",
+                    self.workspace_root.join("wit").display()
+                )
+            })?;
+        tokio::fs::copy(&self.wit_path, &ws_wit_dest)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to copy WIT file from {} to {} (source must exist at CompilationService.wit_path — check the controller build's wit/ directory is mounted/copied into the image)",
+                    self.wit_path.display(),
+                    ws_wit_dest.display(),
+                )
+            })?;
+
+        // Also copy it inside the package directory for cargo-component's Cargo.toml metadata
+        let pkg_wit_dest = workspace.join("wit/aegix.wit");
+        tokio::fs::create_dir_all(workspace.join("wit"))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create package WIT directory at {}",
+                    workspace.join("wit").display()
+                )
+            })?;
+        tokio::fs::copy(&self.wit_path, &pkg_wit_dest)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to copy WIT file from {} to {}",
+                    self.wit_path.display(),
+                    pkg_wit_dest.display(),
+                )
+            })?;
+
+        Ok((workspace, package_name))
+    }
+
+    fn parse_errors(&self, stderr: &str) -> Vec<CompilationError> {
+        self.parse_errors_with_offset(stderr, 0)
+    }
+
+    /// Parse rustc error output, adjusting line numbers by subtracting `line_offset`
+    /// (the number of boilerplate lines prepended before the user's source code).
+    ///
+    /// Captures the full error block (code snippet, help text, notes) rather than
+    /// just the summary line, so callers get enough context to fix the issue.
+    fn parse_errors_with_offset(&self, stderr: &str, line_offset: i32) -> Vec<CompilationError> {
+        // Regex to extract location from rustc output:
+        //   --> src/lib.rs:LINE:COL
+        static RE_LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re_loc = RE_LOCATION
+            .get_or_init(|| regex::Regex::new(r"-->\s*src/lib\.rs:(\d+):(\d+)").unwrap());
+
+        let mut errors = Vec::new();
+
+        // Collect location annotations that appear on lines like:
+        //   --> src/lib.rs:12:5
+        // These typically appear right after the error message line.
+        let lines: Vec<&str> = stderr.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.contains("error:") || line.contains("error[E") {
+                let mut err_line: Option<i32> = None;
+                let mut err_col: Option<i32> = None;
+
+                // Capture the full error block: from the error line until the next
+                // blank line or next top-level error/warning, collecting the code
+                // snippet, help text, and notes that rustc emits.
+                let mut block_lines: Vec<&str> = vec![line];
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let next = lines[j];
+                    // Stop at the next top-level error/warning or aborting message
+                    if (next.starts_with("error") || next.starts_with("warning"))
+                        && !next.starts_with("   ")
+                        && j > i + 1
+                    {
+                        break;
+                    }
+                    block_lines.push(next);
+
+                    // Extract location from this block if we haven't yet
+                    if err_line.is_none() {
+                        if let Some(caps) = re_loc.captures(next) {
+                            if let (Ok(l), Ok(c)) = (caps[1].parse::<i32>(), caps[2].parse::<i32>())
+                            {
+                                // Adjust line number by subtracting boilerplate offset
+                                err_line = Some((l - line_offset).max(1));
+                                err_col = Some(c);
+                            }
+                        }
+                    }
+                    j += 1;
+                }
+
+                // Join the full block as the message (up to 2000 chars to avoid DB bloat)
+                let full_message = block_lines.join("\n");
+                let message = if full_message.len() > 2000 {
+                    format!(
+                        "{}...",
+                        aegix_text_util::truncate_at_char_boundary(&full_message, 2000)
+                    )
+                } else {
+                    full_message
+                };
+
+                errors.push(CompilationError {
+                    line: err_line,
+                    column: err_col,
+                    end_line: None,
+                    end_column: None,
+                    message,
+                    severity: "error".to_string(),
+                });
+
+                // Skip past the block we just consumed
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+
+        // If no structured errors found, return the whole stderr
+        if errors.is_empty() && !stderr.is_empty() {
+            errors.push(CompilationError {
+                line: None,
+                column: None,
+                end_line: None,
+                end_column: None,
+                message: stderr.to_string(),
+                severity: "error".to_string(),
+            });
+        }
+
+        errors
+    }
+}
+
+/// Extract the WIT world name from the source, scanning for `world: "..."` or
+/// `world = "..."` patterns.
+///
+/// Returns `"minimal-node"` (least-privilege, no host imports beyond
+/// JSON in/out) when no world declaration is found. The previous default
+/// — `"automation-node"` — silently linked the full host import set into
+/// modules that omitted the annotation, granting the user code privileges
+/// it never asked for. Operators who want the legacy permissive default
+/// can set `AEGIX_DEFAULT_WIT_WORLD=automation-node`.
+/// Derive a valid cargo package name (kebab-case label) from a module
+/// display name + per-job suffix.
+///
+/// Cargo label rules enforced here: dash-separated segments must be
+/// non-empty and must not start with a digit. Display names routinely
+/// contain runs of non-alphanumerics — `"Alert Normalize (GCP
+/// Monitoring)"` maps to consecutive dashes, whose empty segments made
+/// cargo-component fail with "dash-separated words may not be empty"
+/// (live hot_update bite, 2026-07-17). Empty segments are FILTERED, not
+/// re-joined; a name that is ALL symbols still yields a valid label
+/// because the alphanumeric `job_id` suffix survives.
+///
+/// The `job_id` suffix is also correctness-critical for concurrency —
+/// see the CONCURRENCY comment at the call site in `create_workspace`.
+fn sanitize_package_name(name: &str, job_suffix: &str) -> String {
+    format!("{name}-{job_suffix}")
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .to_lowercase()
+        .split('-')
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| {
+            if seg.starts_with(|c: char| c.is_ascii_digit()) {
+                format!("n{seg}")
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Step 8a of a compile: reconcile the world the source DECLARED with the world
+/// the binary IMPORTS. An escalation (the binary imports an interface the
+/// declared world does not, or either side is unknown) refuses the compile,
+/// returned as the failed `CompilationResult`; an over-declaration is logged
+/// and the compile goes on. The verdict is asked of the IMPORT SET
+/// (`aegix_wit_inspector::imports_outside_world`), never of the classified
+/// world: `agent-node` and `database-node` are incomparable, so a binary that
+/// fits both has one name and two homes (2026-10-16). A free function so the
+/// refusal is testable without a `cargo component` build.
+fn reconcile_declared_world(
+    name: &str,
+    declared_world: &str,
+    inspection: aegix_wit_inspector::ComponentInspection,
+) -> Result<aegix_wit_inspector::ComponentInspection, CompilationResult> {
+    let detected_world_str = inspection.capability_world.to_string();
+    let (verdict, outside) = declaration_verdict(declared_world, &inspection);
+    if verdict != WorldDeclaration::Matches {
+        if verdict == WorldDeclaration::Escalation {
+            let err_msg = format!(
+                "world-mismatch: source declares `{declared_world}` but the \
+                 compiled binary imports `{detected_world_str}` capabilities \
+                 ({interfaces}); outside the declared world: {outside}. The \
+                 binary requests MORE privileges than the source attribute \
+                 declares — refusing to ship. Fix the source `world = \"...\"` \
+                 attribute to match what the module actually uses, or remove \
+                 the unused imports.",
+                declared_world = declared_world,
+                detected_world_str = detected_world_str,
+                interfaces = inspection.imported_interfaces.join(", "),
+                outside = if outside.is_empty() {
+                    "(an unknown world on one side)".to_string()
+                } else {
+                    outside.join(", ")
+                },
+            );
+            tracing::error!(
+                declared_world = %declared_world,
+                detected_world = %detected_world_str,
+                interfaces = %inspection.imported_interfaces.join(", "),
+                outside = %outside.join(", "),
+                module_name = %name,
+                "world-mismatch (escalation): the binary imports an interface \
+                 the declared world does not — refusing to emit binary"
+            );
+            return Err(CompilationResult {
+                success: false,
+                wasm_bytes: None,
+                errors: vec![CompilationError {
+                    line: None,
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: err_msg,
+                    severity: "error".to_string(),
+                }],
+                size_bytes: 0,
+                content_hash: String::new(),
+                capability_world: inspection.capability_world,
+                imported_interfaces: inspection.imported_interfaces,
+            });
+        }
+        // Benign over-declaration — source asked for more than the
+        // binary uses. Still flag at WARN for operator visibility.
+        tracing::warn!(
+            declared_world = %declared_world,
+            detected_world = %detected_world_str,
+            interfaces = %inspection.imported_interfaces.join(", "),
+            module_name = %name,
+            "WIT world over-declared: source-declared world is more \
+             privileged than the binary actually requires. This is \
+             benign (defense in depth) but the source declaration \
+             should be tightened to the least-privilege world the \
+             module actually needs."
+        );
+    }
+    Ok(inspection)
+}
+
+/// The verdict on a source declaration against an inspected binary, with the
+/// interfaces outside the declared world. `Matches` when the declaration
+/// names the binary's own world; `OverDeclared` when every import fits a
+/// declaration that names a wider or incomparable world; `Escalation` when an
+/// import falls outside it or either side is unknown. An empty declaration
+/// matches (nothing was declared).
+fn declaration_verdict(
+    declared_world: &str,
+    inspection: &aegix_wit_inspector::ComponentInspection,
+) -> (WorldDeclaration, Vec<String>) {
+    if declared_world.is_empty() {
+        return (WorldDeclaration::Matches, vec![]);
+    }
+    let declared: CapabilityWorld = declared_world.parse().unwrap_or(CapabilityWorld::Unknown);
+    if declared == CapabilityWorld::Unknown
+        || inspection.capability_world == CapabilityWorld::Unknown
+    {
+        return (WorldDeclaration::Escalation, vec![]);
+    }
+    let outside =
+        aegix_wit_inspector::imports_outside_world(&inspection.imported_interfaces, &declared);
+    if !outside.is_empty() {
+        return (WorldDeclaration::Escalation, outside);
+    }
+    if declared == inspection.capability_world {
+        (WorldDeclaration::Matches, vec![])
+    } else {
+        (WorldDeclaration::OverDeclared, vec![])
+    }
+}
+
+/// Every world the source declares, in order: each `world = "…"` /
+/// `world: "…"` on a comment-stripped line (an attribute, a `aegix_node`
+/// argument, a `wit_bindgen::generate!` world). [`extract_wit_world`] takes the
+/// first; [`required_world_declaration`] requires ALL of them to agree, so a
+/// decoy declaration ahead of the real macro cannot pass.
+fn source_declared_worlds(source: &str) -> Vec<String> {
+    let stripped = strip_all_comments(source);
+    let mut worlds = Vec::new();
+    for raw_line in stripped.lines() {
+        let line = strip_line_comment(raw_line);
+        for marker in [r#"world: ""#, r#"world = ""#] {
+            let mut rest_of_line = line;
+            while let Some(start) = rest_of_line.find(marker) {
+                let rest = &rest_of_line[start + marker.len()..];
+                match rest.find('"') {
+                    Some(end) => {
+                        worlds.push(rest[..end].to_string());
+                        rest_of_line = &rest[end..];
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    worlds
+}
+
+/// The first world the source declares, if any — the label a caller with no
+/// other claim asks a compile to be checked at (`import_workflow`'s bundle
+/// with no `capability_world`, 2026-10-15). `compile_rust_for_world` still
+/// requires every declaration to agree with it.
+pub fn source_declared_world(source: &str) -> Option<String> {
+    source_declared_worlds(source).into_iter().next()
+}
+
+/// The world a compile FOR `required` reconciles its binary against, or the
+/// `world-mismatch` refusal. `required` must be a compilable world, and every
+/// world the source declares must be the same world (either spelling). A
+/// source that declares none is held to `required` by the post-compile
+/// reconciliation alone. Pure, so the refusal is testable without a build.
+pub fn required_world_declaration(source: &str, required: &str) -> Result<String, String> {
+    let required_world: CapabilityWorld = required.parse().unwrap_or(CapabilityWorld::Unknown);
+    if required_world == CapabilityWorld::Unknown {
+        return Err(format!(
+            "world-mismatch: `{required}` is not a compilable capability world"
+        ));
+    }
+    for declared in source_declared_worlds(source) {
+        let declared_world: CapabilityWorld = declared.parse().unwrap_or(CapabilityWorld::Unknown);
+        if declared_world != required_world {
+            return Err(format!(
+                "world-mismatch: the source declares `{declared}` but this compile was \
+                 authorised for `{}`. A module's world is the one its compile was checked \
+                 at; change the source's `world` to `{}`, or request that world.",
+                required_world.as_node_str(),
+                required_world.as_node_str(),
+            ));
+        }
+    }
+    Ok(required_world.as_node_str().to_string())
+}
+
+/// The world to RECORD for a module just built for `requested`: the world the
+/// compiled binary was found to be (`res.capability_world`, the inspection —
+/// for JS/Python the authoritative world it was built at) when that world is
+/// within `requested`, and otherwise `requested` itself — the world the binary
+/// was checked at and will be linked at — provided every interface the binary
+/// imports is one `requested` imports. Never a label narrower than what the
+/// binary needs (security review 2026-10-14, G-1), and never a refusal for a
+/// binary that fits: `agent-node` and `database-node` are incomparable, so a
+/// memory-only binary built for `database-node` is named `agent` by the
+/// classifier and recorded `database` here (2026-10-16). Refused when the
+/// request or the binary's world is unknown, or an import falls outside the
+/// request. Returns the short form the `modules.capability_world` CHECK
+/// accepts (`trusted` for `automation-node`).
+pub fn world_to_record(requested: &str, res: &CompilationResult) -> Result<&'static str, String> {
+    let detected = &res.capability_world;
+    let requested_world: CapabilityWorld = requested.parse().unwrap_or(CapabilityWorld::Unknown);
+    if *detected == CapabilityWorld::Unknown || requested_world == CapabilityWorld::Unknown {
+        return Err(format!(
+            "world-mismatch: the compiled binary is `{}`, which `{requested}` does not cover",
+            detected.as_node_str()
+        ));
+    }
+    let outside =
+        aegix_wit_inspector::imports_outside_world(&res.imported_interfaces, &requested_world);
+    if !outside.is_empty() {
+        return Err(format!(
+            "world-mismatch: the compiled binary is `{}` and imports {} outside `{requested}`",
+            detected.as_node_str(),
+            outside.join(", ")
+        ));
+    }
+    if aegix_capability_world::ceiling_permits(requested, detected.as_str()) {
+        Ok(detected.as_str())
+    } else {
+        Ok(requested_world.as_str())
+    }
+}
+
+fn extract_wit_world(source: &str) -> String {
+    // MCP-637 (2026-05-12) + wasm-security-review (2026-05-22):
+    // closes N-8 (extract_wit_world matches first occurrence
+    // including comments). Pre-fix `source.find(...)` matched ANY
+    // occurrence of `world: "..."` or `world = "..."`, including
+    // text inside `//` line comments and `/* ... */` block comments.
+    //
+    // A source file like
+    //
+    //     /* #[aegix_node(world = "automation-node")] */
+    //     #[aegix_node(world = "minimal-node")]
+    //     pub fn run(...) { ... }
+    //
+    // previously resolved to "automation-node" because the block
+    // comment match came first. We now strip both line AND block
+    // comments before scanning. Defense-in-depth: the post-compile
+    // declared-vs-detected check (in `compile_with_workspace`) hard-
+    // fails when detected > declared, so any extraction mis-match
+    // still surfaces as a compile error rather than silently
+    // shipping a higher-privilege binary.
+    if let Some(first) = source_declared_worlds(source).into_iter().next() {
+        return first;
+    }
+
+    // Least-privilege default. Override via env for back-compat.
+    // MCP-631: empty-env hardening — `AEGIX_DEFAULT_WIT_WORLD=""` (Helm
+    // placeholder) would otherwise yield an empty world that the
+    // compilation pipeline rejects with a confusing "unknown world"
+    // error rather than using the least-privilege default.
+    aegix_config::get_env("AEGIX_DEFAULT_WIT_WORLD", "minimal-node")
+}
+
+/// wasm-security-review (2026-05-22): returns the offending token when
+/// a template's `world = ...` declaration draws from a Handlebars
+/// variable rather than a string literal. Matches both attribute and
+/// comment forms (`world = "{{x}}"`, `world: "{{x}}"`). Pure function
+/// for unit testing.
+///
+/// Matching rule: scan the comment-stripped template for either
+/// `world = "` or `world: "` and inspect the following string. If the
+/// string contains a Handlebars expression (`{{` … `}}`), the
+/// substitution is rejected. Whitespace tolerant.
+pub(crate) fn template_substitutes_world(template: &str) -> Option<String> {
+    let stripped = strip_all_comments(template);
+    for line in stripped.lines() {
+        // Tolerate `world = "..."`, `world="..."`, `world : "..."` etc.
+        // We hunt for the keyword and the literal opener `"`, then
+        // look for `{{` before the closing `"`.
+        for needle in ["world", "world-name"] {
+            let mut search_from = 0usize;
+            while let Some(found) = line[search_from..].find(needle) {
+                let after = &line[search_from + found + needle.len()..];
+                // Skip whitespace, then expect `=` or `:` (we accept
+                // both — `world = "..."` and `world: "..."` are both
+                // recognised by `extract_wit_world`).
+                let after_eq = after.trim_start();
+                if let Some(rest) = after_eq
+                    .strip_prefix('=')
+                    .or_else(|| after_eq.strip_prefix(':'))
+                {
+                    let after_quote = rest.trim_start();
+                    if let Some(string_body) = after_quote.strip_prefix('"') {
+                        if let Some(end) = string_body.find('"') {
+                            let value = &string_body[..end];
+                            if value.contains("{{") && value.contains("}}") {
+                                return Some(value.to_string());
+                            }
+                            // String literal but no Handlebars
+                            // substitution — fine, advance past it
+                            // and keep scanning the same line for
+                            // additional occurrences.
+                            search_from += found + needle.len();
+                            continue;
+                        }
+                    }
+                }
+                search_from += found + needle.len();
+            }
+        }
+    }
+    None
+}
+
+/// wasm-security-review (2026-05-22): replace every `/* ... */` block
+/// comment with equal-length spaces, preserving the byte positions of
+/// surrounding source. Block-comment-aware so it doesn't fire on
+/// `let s = "/* literal */"`. Pure function for unit testing.
+///
+/// We replace with spaces (not removal) so any future code that
+/// surfaces a byte offset back to the user (rustc spans, lint
+/// positions, etc.) still points at the original location.
+fn strip_all_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            out.push(b);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        // Open of a block comment `/*` — scan until the matching `*/`
+        // and overwrite the whole region with spaces (preserve newlines
+        // so line numbers don't shift).
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.push(b' ');
+            out.push(b' ');
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+            // Consume the closing `*/` if present (it may not be — an
+            // unterminated comment will be rejected by rustc later).
+            if i + 1 < bytes.len() {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+            }
+            continue;
+        }
+        out.push(b);
+        i += 1;
+    }
+    // SAFETY: we only ever replaced non-ASCII-relevant bytes (`/` and
+    // `*` from a comment region) with ASCII spaces, and we copy
+    // arbitrary UTF-8 bytes through unchanged otherwise. The result is
+    // valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+/// MCP-637: strip the `// ...` tail from a source line while
+/// preserving string-literal contents. A naive `find("//").map(...)`
+/// would mis-strip `let url = "https://example.com";`. Walks the line
+/// once, tracking whether we're inside a string literal (respecting
+/// `\"` escapes); returns the slice up to the first `//` that occurs
+/// OUTSIDE a string.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes[i + 1] == b'/' {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationResult {
+    pub success: bool,
+    pub wasm_bytes: Option<Vec<u8>>,
+    pub errors: Vec<CompilationError>,
+    pub size_bytes: i32,
+    pub content_hash: String,
+    /// WIT capability world detected by binary inspection after compilation.
+    pub capability_world: CapabilityWorld,
+    /// The aegix:core/* interfaces imported by the compiled component.
+    pub imported_interfaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationError {
+    pub line: Option<i32>,
+    pub column: Option<i32>,
+    pub end_line: Option<i32>,
+    pub end_column: Option<i32>,
+    pub message: String,
+    pub severity: String,
+}
+
+/// Source language for a module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModuleLanguage {
+    Rust,
+    JavaScript,
+    TypeScript,
+    /// Python via componentize-py. Requires componentize-py in PATH.
+    Python,
+    /// Go via TinyGo. Requires tinygo in PATH.
+    Go,
+}
+
+impl ModuleLanguage {
+    /// Parse a language string loosely (case-insensitive, common aliases).
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "javascript" | "js" => ModuleLanguage::JavaScript,
+            "typescript" | "ts" => ModuleLanguage::TypeScript,
+            "python" | "py" => ModuleLanguage::Python,
+            "go" | "golang" => ModuleLanguage::Go,
+            _ => ModuleLanguage::Rust,
+        }
+    }
+}
+
+impl std::fmt::Display for ModuleLanguage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleLanguage::Rust => write!(f, "rust"),
+            ModuleLanguage::JavaScript => write!(f, "javascript"),
+            ModuleLanguage::TypeScript => write!(f, "typescript"),
+            ModuleLanguage::Python => write!(f, "python"),
+            ModuleLanguage::Go => write!(f, "go"),
+        }
+    }
+}
+
+// ============================================================================
+// Multi-language compilation (JS / Python → WASM Component Model)
+// ============================================================================
+
+impl CompilationService {
+    /// Compile JavaScript source code to a WASM Component Model binary.
+    ///
+    /// Uses `jco componentize` (the JavaScript Component Model toolchain) to
+    /// compile JS source into a WASM component that implements the Aegix WIT
+    /// interface. The resulting binary is interchangeable with Rust-compiled
+    /// modules — the runtime, fuel metering, and capability worlds work identically.
+    ///
+    /// Requires `jco` to be installed: `npm install -g @bytecodealliance/jco`
+    pub async fn compile_js_to_wasm(
+        &self,
+        js_source: &str,
+        world: &str,
+        job_id: &str,
+    ) -> Result<Vec<u8>> {
+        self.ensure_enabled()?;
+        refuse_former_interface_names(js_source)?;
+        // M-13: the compile runs SANDBOXED (container::tool_command — same
+        // --network=none/read-only/non-root envelope as the Rust path)
+        // whenever a container runtime is available. Only the host-fallback
+        // path needs the production gate: jco evaluates the module via
+        // StarlingMonkey at componentize time.
+        if !container::will_sandbox() {
+            require_host_lang_toolchain_allowed("javascript")?;
+        }
+
+        let slot = self.acquire_slot().await?;
+
+        let workspace = self.workspace_root.join(format!("js-{}", job_id));
+        tokio::fs::create_dir_all(&workspace).await?;
+        let out = self
+            .compile_js_in_workspace(&workspace, js_source, world, &slot)
+            .await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        let wasm_bytes = out?;
+
+        tracing::info!(
+            job_id = job_id,
+            language = "javascript",
+            output_bytes = wasm_bytes.len(),
+            "JS → WASM compilation complete"
+        );
+        Ok(wasm_bytes)
+    }
+
+    /// Inner JS compile body — the caller owns workspace cleanup (L-37
+    /// inner/outer pattern), so every early return here is leak-free.
+    ///
+    /// Known platform caveat: wasmtime 45's Cranelift panics
+    /// (`value_is_real`, machinst/lower.rs) when compiling StarlingMonkey
+    /// (jco) output **on aarch64** — the produced component is valid and
+    /// executes fine on x86-64 (verified: linux/amd64 codegen OK + the
+    /// panic reproduced only on Apple Silicon). Production workers are
+    /// linux/amd64, so this only affects local dev execution of JS modules
+    /// on ARM Macs.
+    async fn compile_js_in_workspace(
+        &self,
+        workspace: &Path,
+        js_source: &str,
+        world: &str,
+        slot: &CompileSlot,
+    ) -> Result<Vec<u8>> {
+        // Write JS source + the WIT the world resolves against. Tool args are
+        // RELATIVE to the workspace: the sandbox mounts it at /build with
+        // `-w /build`, and the host fallback sets `current_dir(workspace)`,
+        // so the same argv resolves identically in both modes.
+        tokio::fs::write(workspace.join("module.js"), js_source).await?;
+        if self.wit_path.exists() {
+            tokio::fs::copy(&self.wit_path, workspace.join("aegix.wit")).await?;
+        }
+
+        let mut cmd = container::tool_command("jco", workspace)
+            .context("JS compilation sandbox setup failed")?;
+        cmd.args([
+            "componentize",
+            "module.js",
+            "--wit",
+            "aegix.wit",
+            "--world-name",
+            world,
+            "-o",
+            "module.wasm",
+        ]);
+        // Align jco's WASI import surface with the linker tier that will run
+        // the module. StarlingMonkey imports `wasi:http/outgoing-handler`
+        // (its `fetch`) unconditionally, but the worker only grants that raw
+        // interface to the AUTOMATION (trusted) tier — every lower tier's
+        // linker provides `wasi:http/types` ONLY (see the worker's
+        // `add_wasi_http_types_only` vs `add_only_http_to_linker_async`). So
+        // for any world below automation, `--disable http` drops the
+        // outgoing-handler import (keeping the types, which the tier DOES
+        // provide) — without it a minimal-node JS module fails to link with
+        // "wasi:http/outgoing-handler not found in the linker". This mirrors
+        // the capability model rather than widening it: dropping the RAW
+        // handler removes StarlingMonkey's ungated global `fetch` only. An
+        // http-/network-node module still reaches the network through the
+        // Aegix-gated `aegix:core` http import (SSRF-checked, tier-aware),
+        // which comes from `aegix.wit`, not wasi:http — so egress stays on
+        // the enforced path and a minimal-node module gets none at all.
+        if !world_grants_raw_wasi_http(world) {
+            cmd.args(["--disable", "http"]);
+        }
+        let result = cmd
+            .run(Duration::from_secs(120), slot)
+            .await
+            .map_err(|e| e.with_timeout_message("JS compilation timed out after 120s"))?;
+
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            // Sanitize paths in error messages
+            let sanitized = stderr.replace(workspace.to_str().unwrap_or(""), "<workspace>");
+            bail!("JS compilation failed:\n{}", sanitized);
+        }
+
+        let wasm_bytes = tokio::fs::read(workspace.join("module.wasm")).await?;
+
+        // Validate the output is a valid WASM component
+        if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
+            bail!("JS compilation produced invalid WASM binary");
+        }
+        check_interpreted_component(&wasm_bytes, ModuleLanguage::JavaScript, world)?;
+        Ok(wasm_bytes)
+    }
+
+    /// Compile Python source code to a WASM Component Model binary.
+    ///
+    /// Uses `componentize-py` to compile Python source into a WASM component.
+    /// Requires `componentize-py` to be installed: `pip install componentize-py`
+    pub async fn compile_python_to_wasm(
+        &self,
+        python_source: &str,
+        world: &str,
+        job_id: &str,
+    ) -> Result<Vec<u8>> {
+        self.ensure_enabled()?;
+        refuse_former_interface_names(python_source)?;
+        // M-13: the compile runs SANDBOXED (container::tool_command — same
+        // --network=none/read-only/non-root envelope as the Rust path)
+        // whenever a container runtime is available. Only the host-fallback
+        // path needs the production gate — componentize-py runs arbitrary
+        // Python introspection at compile time, the highest-risk of the
+        // non-Rust paths.
+        if !container::will_sandbox() {
+            require_host_lang_toolchain_allowed("python")?;
+        }
+
+        let slot = self.acquire_slot().await?;
+
+        let workspace = self.workspace_root.join(format!("py-{}", job_id));
+        tokio::fs::create_dir_all(&workspace).await?;
+        let out = self
+            .compile_python_in_workspace(&workspace, python_source, world, &slot)
+            .await;
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        let wasm_bytes = out?;
+
+        tracing::info!(
+            job_id = job_id,
+            language = "python",
+            output_bytes = wasm_bytes.len(),
+            "Python → WASM compilation complete"
+        );
+        Ok(wasm_bytes)
+    }
+
+    /// Inner Python compile body — the caller owns workspace cleanup (L-37
+    /// inner/outer pattern), so every early return here is leak-free.
+    async fn compile_python_in_workspace(
+        &self,
+        workspace: &Path,
+        python_source: &str,
+        world: &str,
+        slot: &CompileSlot,
+    ) -> Result<Vec<u8>> {
+        // componentize-py binds a world-level `export run: func(...)` to a
+        // protocol class named `WitWorld` on the app module. The Python SDK's
+        // `@aegix_module` decorator (and plain `def run`) authors a module-
+        // level function instead, so append the adapter shim unless the
+        // source already provides the class itself.
+        let app_source = if python_source.contains("class WitWorld") {
+            python_source.to_string()
+        } else {
+            format!("{python_source}\n{PY_WITWORLD_SHIM}")
+        };
+
+        // Layout: app.py + wit/aegix.wit. Args are RELATIVE to the workspace
+        // (sandbox mounts it at /build with -w /build; host fallback sets
+        // current_dir) and `componentize app` names the MODULE, not a file —
+        // the invocation shape verified against componentize-py 0.24.
+        tokio::fs::write(workspace.join("app.py"), app_source).await?;
+        let wit_dir = workspace.join("wit");
+        tokio::fs::create_dir_all(&wit_dir).await?;
+        if self.wit_path.exists() {
+            tokio::fs::copy(&self.wit_path, wit_dir.join("aegix.wit")).await?;
+        }
+
+        let mut cmd = container::tool_command("componentize-py", workspace)
+            .context("Python compilation sandbox setup failed")?;
+        cmd.args([
+            "-d",
+            "wit",
+            "-w",
+            world,
+            "componentize",
+            "app",
+            "-o",
+            "module.wasm",
+        ]);
+        let result = cmd
+            .run(Duration::from_secs(120), slot)
+            .await
+            .map_err(|e| e.with_timeout_message("Python compilation timed out after 120s"))?;
+
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let sanitized = stderr.replace(workspace.to_str().unwrap_or(""), "<workspace>");
+            bail!("Python compilation failed:\n{}", sanitized);
+        }
+
+        let wasm_bytes = tokio::fs::read(workspace.join("module.wasm")).await?;
+        if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
+            bail!("Python compilation produced invalid WASM binary");
+        }
+        check_interpreted_component(&wasm_bytes, ModuleLanguage::Python, world)?;
+        Ok(wasm_bytes)
+    }
+}
+
+/// The largest compiled component each language may produce (security review
+/// 2026-10-14, G-20). A Rust module is its own code (the 1 MiB the Rust path
+/// has always held); a JavaScript or Python component carries its language's
+/// whole runtime (StarlingMonkey, CPython), so its bound is that runtime plus
+/// headroom. Until then a JS or Python component was read with no size bound.
+#[must_use]
+pub fn max_component_bytes(language: ModuleLanguage) -> usize {
+    match language {
+        ModuleLanguage::Rust | ModuleLanguage::Go => 1_048_576,
+        ModuleLanguage::JavaScript | ModuleLanguage::TypeScript => 32 * 1024 * 1024,
+        ModuleLanguage::Python => 64 * 1024 * 1024,
+    }
+}
+
+/// A JavaScript or Python component as the Rust path holds one: within its
+/// language's size bound ([`max_component_bytes`]), and importing nothing the
+/// requested `world` does not permit (G-20 — until then such a component was
+/// never inspected; the toolchain is told the world, and this checks what it
+/// produced).
+fn check_interpreted_component(
+    wasm_bytes: &[u8],
+    language: ModuleLanguage,
+    world: &str,
+) -> Result<()> {
+    let max = max_component_bytes(language);
+    if wasm_bytes.len() > max {
+        bail!(
+            "Compiled component is {} bytes, over the {max}-byte limit for this language",
+            wasm_bytes.len()
+        );
+    }
+    let inspection = aegix_wit_inspector::inspect_component(wasm_bytes);
+    let requested: CapabilityWorld = world.parse().unwrap_or(CapabilityWorld::Unknown);
+    let outside =
+        aegix_wit_inspector::imports_outside_world(&inspection.imported_interfaces, &requested);
+    if inspection.capability_world == CapabilityWorld::Unknown || !outside.is_empty() {
+        bail!(
+            "Compiled component imports the '{}' world ({}), wider than the requested '{world}'",
+            inspection.capability_world,
+            outside.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Adapter appended to Python module source that doesn't define its own
+/// `WitWorld`: componentize-py resolves the world's `export run` through a
+/// class of that name, while the Python SDK contract is a module-level
+/// `run` (the `@aegix_module` decorator returns a `str -> str` callable;
+/// undecorated functions may return a dict). Handles both by serializing
+/// non-string results as JSON.
+const PY_WITWORLD_SHIM: &str = r#"
+# --- generated by talos (do not edit): adapts the module entry point to
+# --- componentize-py's world-export protocol class.
+class WitWorld:
+    def run(self, input: str) -> str:
+        result = run(input)
+        if isinstance(result, str):
+            return result
+        import json as _talos_json
+        return _talos_json.dumps(result)
+"#;
+
+#[cfg(test)]
+mod package_name_tests {
+    use super::sanitize_package_name;
+
+    #[test]
+    fn parenthesized_display_names_yield_valid_labels() {
+        // The live hot_update failure shape: parens + spaces → consecutive
+        // dashes → empty label segments.
+        let n = sanitize_package_name("Alert Normalize (GCP Monitoring)", "abc123");
+        assert_eq!(n, "alert-normalize-gcp-monitoring-abc123");
+        assert!(!n.contains("--"));
+    }
+
+    #[test]
+    fn every_segment_is_nonempty_and_letter_led() {
+        for name in [
+            "a  (b)",
+            "(x)",
+            "!!!",
+            "run-string-2",
+            "trailing symbols)))",
+            "日本語 module",
+        ] {
+            let label = sanitize_package_name(name, "0f9a");
+            assert!(!label.is_empty(), "{name:?} produced empty label");
+            for seg in label.split('-') {
+                assert!(
+                    !seg.is_empty(),
+                    "{name:?} produced empty segment in {label:?}"
+                );
+                assert!(
+                    !seg.starts_with(|c: char| c.is_ascii_digit()),
+                    "{name:?} produced digit-led segment in {label:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod jspy_world_detection_tests {
+    use super::*;
+
+    #[test]
+    fn only_automation_world_grants_raw_wasi_http() {
+        // The capability rule that decides jco's `--disable http`. ONLY the
+        // trusted/automation tier's linker provides wasi:http/outgoing-handler;
+        // every lower world (and unknown) must compile with it disabled.
+        assert!(world_grants_raw_wasi_http("automation-node"));
+        assert!(world_grants_raw_wasi_http("trusted"));
+        for w in [
+            "minimal-node",
+            "http-node",
+            "network-node",
+            "secrets-node",
+            "database-node",
+            "governance-node",
+            "agent-node",
+            "",
+            "not-a-world",
+        ] {
+            assert!(
+                !world_grants_raw_wasi_http(w),
+                "{w} must NOT grant raw wasi:http (fail closed)"
+            );
+        }
+    }
+
+    #[test]
+    fn js_world_annotation_is_parsed() {
+        assert_eq!(
+            CompilationService::detect_js_world(
+                "// @aegix-world: http-node\nexport function run(i) {}"
+            ),
+            Some("http-node".to_string())
+        );
+        // Tolerates no space after the colon and trailing prose.
+        assert_eq!(
+            CompilationService::detect_js_world("/* @aegix-world:secrets-node — needs vault */"),
+            Some("secrets-node".to_string())
+        );
+    }
+
+    #[test]
+    fn js_world_absent_or_empty_falls_back_to_none() {
+        assert_eq!(
+            CompilationService::detect_js_world("export function run(i) {}"),
+            None
+        );
+        assert_eq!(
+            CompilationService::detect_js_world("// @aegix-world:   "),
+            None
+        );
+    }
+
+    #[test]
+    fn python_shim_appended_only_when_witworld_absent() {
+        // The shim decision mirrors compile_python_in_workspace's check —
+        // pin both branches so an SDK-shaped module gets the adapter and a
+        // raw protocol-class module passes through untouched.
+        let sdk_shaped = "def run(input: str) -> str:\n    return input\n";
+        assert!(!sdk_shaped.contains("class WitWorld"));
+        let raw = "class WitWorld:\n    def run(self, input):\n        return input\n";
+        assert!(raw.contains("class WitWorld"));
+        // And the shim itself defines exactly the protocol class.
+        assert!(PY_WITWORLD_SHIM.contains("class WitWorld"));
+        assert!(PY_WITWORLD_SHIM.contains("def run(self, input: str) -> str"));
+    }
+}
+
+/// Whether a capability world's linker tier grants the RAW
+/// `wasi:http/outgoing-handler` interface (StarlingMonkey's `fetch`).
+///
+/// Only the automation (Trusted) tier does — the worker links the GATED
+/// handler there (`aegix-worker-runtime/src/host/wasi_http.rs`, since
+/// 2026-09-25: the `aegix:core/http` gate set, not upstream's unfiltered
+/// `add_only_http_to_linker_async`) and `add_wasi_http_types_only` (types, no
+/// handler) everywhere else. So JS for any lower world must be
+/// compiled with `jco --disable http` (see `compile_js_in_workspace`);
+/// keeping the handler import would fail to link with
+/// "wasi:http/outgoing-handler not found in the linker". An
+/// unknown/unparseable world is treated as NOT granting it — fail closed to
+/// the narrower import surface. Pure so the capability→toolchain mapping is
+/// unit-testable without invoking jco.
+fn world_grants_raw_wasi_http(world: &str) -> bool {
+    matches!(
+        world.parse::<CapabilityWorld>(),
+        Ok(CapabilityWorld::Trusted)
+    )
+}
+
+/// Auto-detect the source language from the source code content.
+pub fn detect_language(source_code: &str) -> ModuleLanguage {
+    // TypeScript indicators
+    if source_code.contains(": string")
+        || source_code.contains(": number")
+        || source_code.contains(": boolean")
+        || source_code.contains("interface ")
+        || source_code.contains(": void")
+    {
+        return ModuleLanguage::TypeScript;
+    }
+    // Go indicators
+    if source_code.contains("package main")
+        || source_code.contains("func Run(")
+        || (source_code.contains("func ") && source_code.contains("import ("))
+    {
+        return ModuleLanguage::Go;
+    }
+    // Python indicators
+    if source_code.contains("def run(")
+        || source_code.contains("import json")
+        || source_code.contains("from aegix")
+        || (source_code.contains("def ") && !source_code.contains("fn "))
+    {
+        return ModuleLanguage::Python;
+    }
+    // JavaScript indicators
+    if source_code.contains("export function")
+        || source_code.contains("export async function")
+        || source_code.contains("module.exports")
+        || source_code.contains("const ")
+            && !source_code.contains("fn ")
+            && !source_code.contains("let mut")
+    {
+        return ModuleLanguage::JavaScript;
+    }
+    ModuleLanguage::Rust
+}
+
+impl CompilationService {
+    /// Fast syntax/type check without full compilation.
+    /// Uses `cargo check` instead of `cargo component build --release`, so it
+    /// skips code-gen, linking and Wizer snapshotting. Typically 3-5x faster.
+    pub async fn lint_code(
+        &self,
+        user_id: Option<Uuid>,
+        name: &str,
+        source_code: &str,
+        world: &str,
+        dependencies: Option<&serde_json::Value>,
+    ) -> Result<Vec<CompilationError>> {
+        self.ensure_enabled()?;
+        // Static-lint pre-pass first — instant, no compile semaphore needed.
+        // Mirrors compile_to_wasm_with_config so domain-specific hints
+        // (e.g. `secrets::get` → `secrets::get_secret`) surface from BOTH
+        // the lint pre-flight and the full compile path.
+        let static_errors = source_lint_errors(source_code);
+        if !static_errors.is_empty() {
+            return Ok(static_errors);
+        }
+
+        // Acquire compilation permit (same semaphore as full builds)
+        let slot = tokio::time::timeout(std::time::Duration::from_secs(60), self.acquire_slot())
+            .await
+            .map_err(|_| anyhow::anyhow!("Lint queue full. Try again shortly."))??;
+
+        // Inject the aegix_node macro preamble only when the source does not
+        // already carry a proc-macro annotation.  The sandbox codegen in
+        // mcp/sandbox.rs may have already injected
+        // `#[aegix_sdk_macros::aegix_module(world = "...")]`.  Adding a second
+        // macro on top causes E0428 "defined multiple times" errors for every
+        // item both macros try to emit (15+ with the log_json WIT addition).
+        let already_annotated = source_code.contains("#[aegix_node")
+            || source_code.contains("aegix_sdk_macros::aegix_node")
+            || source_code.contains("#[aegix_module")
+            || source_code.contains("aegix_sdk_macros::aegix_module")
+            || source_code.contains("wit_bindgen::generate!");
+
+        let (full_source, preamble_lines) = if already_annotated {
+            (source_code.to_string(), 0usize)
+        } else {
+            // Inject the annotation specifically before `fn run` (not the first fn)
+            // so that helper functions defined before `run` don't absorb the macro.
+            static RE_RUN_FN_LINT: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| {
+                    regex::Regex::new(r"(?m)^[ \t]*(pub[ \t]+)?fn[ \t]+run[ \t]*\(").unwrap()
+                });
+            let use_line = "use aegix_sdk_macros::aegix_node;\n";
+            let annotation = format!("#[aegix_node(world = \"{world}\")]\n");
+            match RE_RUN_FN_LINT.find(source_code) {
+                Some(m) => {
+                    // Helpers before `fn run` are shifted by 1 (the use line only).
+                    // `fn run` and lines after it are shifted by 2 (use + annotation).
+                    // Report preamble as 1 — helpers get correct line numbers; `run`
+                    // errors are off by 1 which is acceptable for the lint fast-path.
+                    let code = format!(
+                        "{use_line}{}{}{}",
+                        &source_code[..m.start()],
+                        annotation,
+                        &source_code[m.start()..]
+                    );
+                    (code, 1usize)
+                }
+                None => {
+                    // No `fn run` found — fall back to original prepend
+                    (format!("{use_line}{annotation}{source_code}"), 2usize)
+                }
+            }
+        };
+
+        let job_id = Uuid::new_v4();
+        let (workspace, _package_name) = self
+            .create_workspace(job_id, name, &full_source, dependencies)
+            .await?;
+
+        // L-37 inner/outer: every exit of the check below — a timeout and a
+        // sandbox refusal included — reaches the ONE workspace cleanup after
+        // it. Until 2026-09-25 both of those `?`-returned past the cleanup and
+        // leaked the workspace directory.
+        let result: Result<Vec<CompilationError>> = async {
+            // Run `cargo component check` (NOT plain `cargo check`).
+            // Plain `cargo check` does not invoke cargo-component's build pipeline, so
+            // `src/bindings.rs` is never generated. The proc macro
+            // `#[aegix_module]` expands to `include!(concat!(..., "/src/bindings.rs"))`,
+            // which fails with "No such file or directory" — manifesting as a confusing
+            // lint error on every run_sandbox call. `cargo component check` generates
+            // bindings first, then delegates to `cargo check` for the type check.
+            //
+            // When container isolation is enabled, lint also runs inside the builder
+            // container for consistency (same toolchain, same isolation).
+            let cargo_registry_cache = dirs_next::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join(".cargo/registry");
+            let wit_dir = self
+                .wit_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            // Same per-user target cache as the full compile: `cargo component
+            // check` builds the dependency graph's rmeta, which dominates the
+            // 30 s lint budget when cold. Anonymous callers lint uncached.
+            let lint_target_cache = user_id.and_then(target_cache::resolve_for);
+            let lint_cmd = container::build_command(
+                &workspace,
+                &cargo_registry_cache,
+                wit_dir,
+                lint_target_cache.as_deref(),
+            );
+            let output = match lint_cmd {
+                Ok(mut cmd) => {
+                    cmd.args([
+                        "component",
+                        "check",
+                        "--target",
+                        "wasm32-wasip2",
+                        "--manifest-path",
+                        workspace
+                            .join("Cargo.toml")
+                            .to_str()
+                            .unwrap_or("Cargo.toml"),
+                    ]);
+                    cmd.run(Duration::from_secs(30), &slot).await.map_err(|e| {
+                        e.with_timeout_context("Lint check timed out after 30 seconds")
+                    })?
+                }
+                Err(e) => {
+                    // MCP-148 (2026-05-08): Honor the production fail-closed
+                    // policy. `container::build_command` already bails with a
+                    // clear "install podman/docker OR set
+                    // AEGIX_COMPILATION_ALLOW_HOST_FALLBACK=true" message in
+                    // production-no-runtime mode. Pre-fix this arm silently
+                    // ran direct cargo on the host (running build.rs +
+                    // proc-macros from aegix_sdk_macros + any user deps OUTSIDE
+                    // any sandbox), and the static-only-lints emptiness made
+                    // the response look like "lint passed" even though the
+                    // cargo check never ran the way the policy required.
+                    // Match compile_custom_sandbox: propagate the bail in
+                    // production unless the operator opted into host
+                    // fallback. Non-production stays on the legacy direct
+                    // cargo path.
+                    // 2026-09-10: the non-production arm no longer runs a bare
+                    // host `cargo` either. `build_command` already returns a
+                    // scrubbed host command whenever host mode is CONFIGURED
+                    // (container disabled, or dev without a runtime), so an `Err`
+                    // here is a genuine refusal or misconfiguration, and the
+                    // pre-fix fallback would have masked it with an unscrubbed
+                    // host spawn.
+                    return Err(e).context(
+                        "Lint check requires the compilation sandbox (container::build_command \
+                         refused to build a host command)",
+                    );
+                }
+            };
+
+            let errors = if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let workspace_prefix = workspace.to_str().unwrap_or("");
+                let sanitized_stderr = if workspace_prefix.is_empty() {
+                    stderr.to_string()
+                } else {
+                    stderr.replace(workspace_prefix, "<workspace>")
+                };
+                self.parse_errors_with_offset(&sanitized_stderr, preamble_lines as i32)
+            } else {
+                vec![]
+            };
+
+            Ok(errors)
+        }
+        .await;
+
+        tokio::fs::remove_dir_all(&workspace).await.ok();
+
+        result
+    }
+
+    /// Compile source to WASM with an explicit language override.
+    ///
+    /// - `Rust` / `None`: standard `cargo component build` path
+    /// - `Python`: `componentize-py` targeting the world declared in-source
+    /// - `JavaScript`: `jco componentize` targeting the world declared
+    ///   in-source (`// @aegix-world: <world>`, default `minimal-node`)
+    /// - `TypeScript` / `Go`: refused with a clear error — silently falling
+    ///   back to the Rust path (the pre-wiring behavior) produced a wall of
+    ///   irrelevant rustc errors for a `.ts` module.
+    pub async fn compile_to_wasm_with_language(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        dependencies: Option<&serde_json::Value>,
+        language: Option<ModuleLanguage>,
+    ) -> Result<CompilationResult> {
+        self.compile_to_wasm_with_language_and_world(
+            user_id,
+            job_id,
+            name,
+            source_code,
+            config,
+            dependencies,
+            language,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::compile_to_wasm_with_language`] with an explicit capability
+    /// world for the JS/Python paths. `world_override` (when `Some`) is
+    /// AUTHORITATIVE over in-source annotations — protocol surfaces
+    /// (compile_custom_sandbox's `capability_world` arg) validate the world
+    /// against actor ceilings BEFORE compiling, so letting a source
+    /// annotation widen it afterwards would bypass that gate. For Rust it is
+    /// the world the compile is FOR ([`Self::compile_rust_for_world`]): a
+    /// source declaring another world is refused. (Until 2026-10-14 it was
+    /// ignored for Rust — security review G-1.)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compile_to_wasm_with_language_and_world(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        dependencies: Option<&serde_json::Value>,
+        language: Option<ModuleLanguage>,
+        world_override: Option<&str>,
+    ) -> Result<CompilationResult> {
+        self.ensure_enabled()?;
+        match language {
+            Some(ModuleLanguage::Python) => {
+                self.compile_python_module(
+                    user_id,
+                    job_id,
+                    name,
+                    source_code,
+                    config,
+                    world_override,
+                )
+                .await
+            }
+            Some(ModuleLanguage::JavaScript) => {
+                self.compile_js_module(user_id, job_id, name, source_code, world_override)
+                    .await
+            }
+            Some(ModuleLanguage::TypeScript) => {
+                bail!(
+                    "TypeScript modules must be transpiled to JavaScript before \
+                     submission (jco componentizes plain JS). Submit the compiled \
+                     JS with language=javascript."
+                )
+            }
+            Some(ModuleLanguage::Go) => {
+                bail!("Go module compilation is not supported")
+            }
+            _ => {
+                self.compile_rust(
+                    user_id,
+                    job_id,
+                    name,
+                    source_code,
+                    config,
+                    dependencies,
+                    world_override,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Compile a JavaScript module to WASM via `jco componentize`, wrapped in
+    /// the same [`CompilationResult`] envelope the Rust/Python paths return.
+    ///
+    /// The capability world comes from an in-source annotation
+    /// (`// @aegix-world: http-node`), defaulting to least-privilege
+    /// `minimal-node` — same posture as `extract_wit_world` (M-14).
+    async fn compile_js_module(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        world_override: Option<&str>,
+    ) -> Result<CompilationResult> {
+        let world = world_override.map(str::to_string).unwrap_or_else(|| {
+            Self::detect_js_world(source_code).unwrap_or_else(|| "minimal-node".to_string())
+        });
+        self.send_event(
+            user_id,
+            job_id,
+            "compiling",
+            Some("Invoking jco componentize...".to_string()),
+            Some(0.4),
+        );
+        tracing::info!(
+            name = %name,
+            world = %world,
+            sandboxed = container::will_sandbox(),
+            "Compiling JavaScript module via jco"
+        );
+
+        match self
+            .compile_js_to_wasm(source_code, &world, &job_id.to_string())
+            .await
+        {
+            Ok(wasm_bytes) => {
+                let size_bytes = wasm_bytes.len() as i32;
+                let content_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+                let cap_world = world
+                    .parse::<CapabilityWorld>()
+                    .unwrap_or(CapabilityWorld::Unknown);
+                Ok(CompilationResult {
+                    success: true,
+                    wasm_bytes: Some(wasm_bytes),
+                    errors: vec![],
+                    size_bytes,
+                    content_hash,
+                    capability_world: cap_world,
+                    imported_interfaces: vec![],
+                })
+            }
+            Err(e) => Ok(CompilationResult {
+                success: false,
+                wasm_bytes: None,
+                errors: vec![CompilationError {
+                    line: None,
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: format!("{e:#}"),
+                    severity: "error".to_string(),
+                }],
+                size_bytes: 0,
+                content_hash: String::new(),
+                capability_world: CapabilityWorld::Unknown,
+                imported_interfaces: vec![],
+            }),
+        }
+    }
+
+    /// Extract the capability world from JavaScript source.
+    ///
+    /// Looks for a `// @aegix-world: <world>` comment annotation (the JS
+    /// counterpart of Python's `@aegix_module(world=...)`).
+    fn detect_js_world(source: &str) -> Option<String> {
+        let idx = source.find("@aegix-world:")?;
+        let rest = source[idx + "@aegix-world:".len()..].trim_start();
+        let world: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        (!world.is_empty()).then_some(world)
+    }
+
+    /// Compile a Python module to WASM via `componentize-py`.
+    ///
+    /// The Python source is written to a temporary workspace, then
+    /// `componentize-py` is invoked with the appropriate WIT world.
+    /// The resulting WASM component is read and returned.
+    async fn compile_python_module(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        config: &serde_json::Value,
+        world_override: Option<&str>,
+    ) -> Result<CompilationResult> {
+        // M-13: same sandbox-or-gate rule as compile_python_to_wasm. This
+        // path is the one hit by `compile_to_wasm_with_language`, so covering
+        // both entrypoints means there's no surface that can reach
+        // `componentize-py` UNSANDBOXED on the host without the explicit
+        // operator opt-in.
+        if !container::will_sandbox() {
+            require_host_lang_toolchain_allowed("python")?;
+        }
+
+        self.send_event(
+            user_id,
+            job_id,
+            "starting",
+            Some("Initializing Python compilation environment...".to_string()),
+            Some(0.05),
+        );
+        let slot = tokio::time::timeout(std::time::Duration::from_secs(120), self.acquire_slot())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Python compilation queue full (max {} concurrent). Try again later.",
+                    compilation_semaphore().available_permits()
+                        + std::env::var("AEGIX_MAX_COMPILATIONS")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(3)
+                )
+            })??;
+
+        // Create temp workspace
+        let workspace = self
+            .workspace_root
+            .join(format!("py-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&workspace).await?;
+
+        // Run the compilation in a closure so we can ensure cleanup on all exit paths.
+        let result = self
+            .compile_python_inner(
+                user_id,
+                job_id,
+                name,
+                source_code,
+                config,
+                &workspace,
+                world_override,
+                &slot,
+            )
+            .await;
+
+        // Cleanup workspace on ALL paths (success, error, early return).
+        tokio::fs::remove_dir_all(&workspace).await.ok();
+
+        result
+    }
+
+    /// Inner Python compilation logic — separated so the caller can guarantee cleanup.
+    ///
+    /// Delegates the actual invocation to [`Self::compile_python_in_workspace`]
+    /// (shared with `compile_python_to_wasm`) so the sandbox, the SDK shim,
+    /// and the componentize-py argv shape live in exactly one place. This
+    /// replaced a hand-rolled invocation that passed `-w aegix:core/<world>`
+    /// — componentize-py resolves bare world names against the WIT package,
+    /// so that form never worked (the path was dead code; the shared core is
+    /// the verified-working shape).
+    async fn compile_python_inner(
+        &self,
+        user_id: Uuid,
+        job_id: Uuid,
+        name: &str,
+        source_code: &str,
+        _config: &serde_json::Value,
+        workspace: &std::path::Path,
+        world_override: Option<&str>,
+        slot: &CompileSlot,
+    ) -> Result<CompilationResult> {
+        self.send_event(
+            user_id,
+            job_id,
+            "compiling",
+            Some("Detecting Python capability world...".to_string()),
+            Some(0.1),
+        );
+        let world = world_override.map(str::to_string).unwrap_or_else(|| {
+            Self::detect_python_world(source_code).unwrap_or_else(|| "minimal-node".to_string())
+        });
+
+        tracing::info!(
+            name = %name,
+            world = %world,
+            sandboxed = container::will_sandbox(),
+            "Compiling Python module via componentize-py"
+        );
+        self.send_event(
+            user_id,
+            job_id,
+            "compiling",
+            Some("Invoking componentize-py...".to_string()),
+            Some(0.4),
+        );
+
+        let wasm_bytes = match self
+            .compile_python_in_workspace(workspace, source_code, &world, slot)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Ok(CompilationResult {
+                    success: false,
+                    wasm_bytes: None,
+                    errors: vec![CompilationError {
+                        line: None,
+                        column: None,
+                        end_line: None,
+                        end_column: None,
+                        message: format!("{e:#}"),
+                        severity: "error".to_string(),
+                    }],
+                    size_bytes: 0,
+                    content_hash: String::new(),
+                    capability_world: CapabilityWorld::Unknown,
+                    imported_interfaces: vec![],
+                });
+            }
+        };
+
+        let size_bytes = wasm_bytes.len() as i32;
+        let content_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
+        // Map world string to CapabilityWorld enum
+        let cap_world = world
+            .parse::<CapabilityWorld>()
+            .unwrap_or(CapabilityWorld::Unknown);
+
+        tracing::info!(
+            name = %name,
+            world = %world,
+            size_bytes = size_bytes,
+            "Python module compiled successfully"
+        );
+
+        Ok(CompilationResult {
+            success: true,
+            wasm_bytes: Some(wasm_bytes),
+            errors: vec![],
+            size_bytes,
+            content_hash,
+            capability_world: cap_world,
+            imported_interfaces: vec![],
+        })
+    }
+
+    /// Extract the capability world from Python source code.
+    ///
+    /// Looks for `@aegix_module(world="...")` or `__talos_world__ = "..."`.
+    fn detect_python_world(source: &str) -> Option<String> {
+        // Pattern 1: @aegix_module(world="http-node")
+        if let Some(idx) = source.find("@aegix_module") {
+            let after = &source[idx..];
+            if let Some(w_start) = after.find("world=") {
+                let rest = &after[w_start + 6..];
+                let quote = rest.chars().next()?;
+                if quote == '"' || quote == '\'' {
+                    let end = rest[1..].find(quote)?;
+                    return Some(rest[1..1 + end].to_string());
+                }
+            }
+        }
+        // Pattern 2: __talos_world__ = "http-node"
+        if let Some(idx) = source.find("__talos_world__") {
+            let after = &source[idx..];
+            if let Some(eq) = after.find('=') {
+                let rest = after[eq + 1..].trim_start();
+                let quote = rest.chars().next()?;
+                if quote == '"' || quote == '\'' {
+                    let end = rest[1..].find(quote)?;
+                    return Some(rest[1..1 + end].to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Summary of `cargo audit --json` output for error reporting.
+///
+/// Wasm-security review 2026-05-23 (L-finding-4): the audit output is
+/// split into BLOCKING (real vulnerabilities + non-`informational`
+/// advisories) and INFORMATIONAL (`unmaintained`, `unsound`, `notice`,
+/// etc.). Pre-fix every advisory with `count > 0` blocked compilation
+/// — an `unmaintained` notice on a transitive dep would refuse the
+/// whole compile, which is conservative-safe but operationally
+/// friction-full for operators who routinely review the RustSec
+/// stream and accept those advisories. Now the call site blocks ONLY
+/// on `blocking_count > 0`; informational advisories surface in a
+/// WARN log so operators can audit them without losing the compile.
+struct AuditSummary {
+    /// Real vulnerabilities + non-informational advisories. Blocking.
+    blocking_count: usize,
+    /// Pretty identifiers for the blocking set, e.g. `RUSTSEC-2025-…(crate)`.
+    blocking_names: Vec<String>,
+    /// `informational`-classified advisories: unmaintained / unsound /
+    /// notice. Surfaced via WARN log; do NOT block compilation.
+    informational_count: usize,
+    /// Pretty identifiers for the informational set.
+    informational_names: Vec<String>,
+}
+
+/// Parse `cargo audit --json` stdout into a compact summary.
+///
+/// Returns an empty summary on any parse error (fail-open for reporting
+/// only — production tool-failure detection is at the call site, which
+/// hard-bails when status != 0 + blocking_count == 0). Distinguishes
+/// "no JSON at all" from "valid JSON, no vulnerabilities key" so
+/// operators can detect schema drift in `cargo audit`'s output without
+/// the silent fail-open masking the underlying issue.
+///
+/// L-finding-4: classifies each advisory by `advisory.informational`
+/// (absent / null → real vulnerability → blocking; non-empty string →
+/// informational → non-blocking). `cargo-audit`'s schema encodes
+/// `informational` as one of `"unmaintained" | "unsound" | "notice" |
+/// "other"` — all of which are operationally distinct from a CVE and
+/// should NOT halt compilation by themselves.
+fn parse_audit_summary(stdout: &[u8]) -> AuditSummary {
+    let empty = AuditSummary {
+        blocking_count: 0,
+        blocking_names: vec![],
+        informational_count: 0,
+        informational_names: vec![],
+    };
+    let v = match serde_json::from_slice::<serde_json::Value>(stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            // Snippet — first 256 bytes — so the operator can spot the
+            // offending output without flooding logs. Don't include the
+            // whole stdout (could be MB if cargo dumped a stack trace).
+            let snippet: String = String::from_utf8_lossy(stdout).chars().take(256).collect();
+            tracing::warn!(
+                target: "aegix_compilation",
+                event_kind = "audit_parse_failure",
+                error = %e,
+                stdout_snippet = %snippet,
+                "cargo-audit stdout was not valid JSON — possible schema drift; \
+                 vulnerability detection is fail-open for this run"
+            );
+            return empty;
+        }
+    };
+
+    if v.pointer("/vulnerabilities").is_none() {
+        // Valid JSON but no vulnerabilities key → schema may have moved.
+        // Distinct from the missing-count case below (where the key
+        // exists but the count is absent or zero).
+        let snippet: String = String::from_utf8_lossy(stdout).chars().take(256).collect();
+        tracing::warn!(
+            target: "aegix_compilation",
+            event_kind = "audit_parse_failure",
+            schema_drift = "missing_vulnerabilities_key",
+            stdout_snippet = %snippet,
+            "cargo-audit JSON missing /vulnerabilities key — schema drift"
+        );
+        return empty;
+    }
+
+    let mut blocking_names: Vec<String> = Vec::new();
+    let mut informational_names: Vec<String> = Vec::new();
+
+    if let Some(list) = v
+        .pointer("/vulnerabilities/list")
+        .and_then(|l| l.as_array())
+    {
+        for entry in list {
+            let id = entry.pointer("/advisory/id").and_then(|v| v.as_str());
+            let pkg = entry.pointer("/advisory/package").and_then(|v| v.as_str());
+            // RustSec encodes `informational` as a STRING (e.g.
+            // "unmaintained") on non-CVE notices, and as `null` /
+            // absent on real CVEs. Treat any non-null non-empty
+            // string as informational; everything else (including
+            // null and missing key) is blocking. Defense-in-depth:
+            // if an unrecognised `informational` value appears, it
+            // still routes to the informational bucket — we'd
+            // rather under-block in dev (operator sees the WARN
+            // and decides) than over-block on schema drift.
+            let informational = entry
+                .pointer("/advisory/informational")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let pretty = match (id, pkg) {
+                (Some(id), Some(pkg)) => match informational {
+                    Some(kind) => Some(format!("{id}({pkg}, {kind})")),
+                    None => Some(format!("{id}({pkg})")),
+                },
+                (Some(id), None) => Some(id.to_string()),
+                (None, Some(pkg)) => Some(pkg.to_string()),
+                _ => None,
+            };
+            if let Some(p) = pretty {
+                if informational.is_some() {
+                    informational_names.push(p);
+                } else {
+                    blocking_names.push(p);
+                }
+            }
+        }
+    }
+
+    // Prefer the parsed list counts (we just walked the same list) over
+    // the top-level `/vulnerabilities/count` — the latter doesn't
+    // distinguish the two buckets, so trusting our walk gives a
+    // consistent (blocking, informational) split.
+    AuditSummary {
+        blocking_count: blocking_names.len(),
+        blocking_names,
+        informational_count: informational_names.len(),
+        informational_names,
+    }
+}
+
+#[cfg(test)]
+mod parse_audit_summary_tests {
+    use super::parse_audit_summary;
+
+    /// L-finding-4: a vulnerability with `informational: null`
+    /// (real CVE) goes in the blocking bucket and forms the
+    /// compile-blocking signal.
+    #[test]
+    fn real_cve_lands_in_blocking() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0001",
+                  "package": "vulncrate",
+                  "informational": null
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 1);
+        assert_eq!(s.informational_count, 0);
+        assert!(s.blocking_names[0].contains("RUSTSEC-2024-0001"));
+        assert!(s.blocking_names[0].contains("vulncrate"));
+    }
+
+    /// L-finding-4: a vulnerability with `informational: "unmaintained"`
+    /// lands in the informational bucket — operators see the WARN
+    /// but compilation proceeds. Pre-fix the old shape would have
+    /// blocked.
+    #[test]
+    fn unmaintained_lands_in_informational_not_blocking() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2023-0042",
+                  "package": "abandonedcrate",
+                  "informational": "unmaintained"
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 1);
+        assert!(s.informational_names[0].contains("unmaintained"));
+    }
+
+    /// L-finding-4: `informational: "unsound"` is also non-blocking
+    /// — it's a soundness notice on a transitive dep, not a CVE.
+    #[test]
+    fn unsound_lands_in_informational() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0099",
+                  "package": "unsoundcrate",
+                  "informational": "unsound"
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 1);
+    }
+
+    /// L-finding-4: mixed list — one CVE, one unmaintained. Blocking
+    /// fires because the CVE is present.
+    #[test]
+    fn mixed_advisories_split_correctly() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 2,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0001",
+                  "package": "vulncrate",
+                  "informational": null
+                }
+              },
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2023-0042",
+                  "package": "abandonedcrate",
+                  "informational": "unmaintained"
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 1);
+        assert_eq!(s.informational_count, 1);
+        assert!(s.blocking_names[0].contains("vulncrate"));
+        assert!(s.informational_names[0].contains("abandonedcrate"));
+    }
+
+    /// L-finding-4: a missing `informational` key (older cargo-audit
+    /// schemas) defaults to BLOCKING — fail-closed direction.
+    #[test]
+    fn missing_informational_key_defaults_to_blocking() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0001",
+                  "package": "vulncrate"
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 1);
+        assert_eq!(s.informational_count, 0);
+    }
+
+    /// L-finding-4: empty `informational` string is treated as
+    /// "key not meaningfully set" → blocking. Defense against a
+    /// future schema oddity that emits `"informational": ""`.
+    #[test]
+    fn empty_informational_string_defaults_to_blocking() {
+        let json = br#"{
+          "vulnerabilities": {
+            "count": 1,
+            "list": [
+              {
+                "advisory": {
+                  "id": "RUSTSEC-2024-0001",
+                  "package": "vulncrate",
+                  "informational": ""
+                }
+              }
+            ]
+          }
+        }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 1);
+        assert_eq!(s.informational_count, 0);
+    }
+
+    /// Empty vulnerabilities list → both buckets empty (clean audit).
+    #[test]
+    fn empty_list_yields_empty_summary() {
+        let json = br#"{ "vulnerabilities": { "count": 0, "list": [] } }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 0);
+    }
+
+    /// Schema drift: missing `/vulnerabilities` key → empty summary
+    /// (fail-open for reporting; the call site still fail-closes in
+    /// production on non-zero exit code).
+    #[test]
+    fn missing_vulnerabilities_key_yields_empty() {
+        let json = br#"{ "something_else": 1 }"#;
+        let s = parse_audit_summary(json);
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 0);
+    }
+
+    /// Schema drift: not JSON at all → empty summary.
+    #[test]
+    fn non_json_yields_empty() {
+        let s = parse_audit_summary(b"error: not the json you were looking for");
+        assert_eq!(s.blocking_count, 0);
+        assert_eq!(s.informational_count, 0);
+    }
+}
+
+#[cfg(test)]
+mod extract_wit_world_tests {
+    use super::extract_wit_world;
+
+    /// MCP-637: a line comment containing the marker must NOT be
+    /// matched. The real attribute on the next line is the source of
+    /// truth.
+    #[test]
+    fn ignores_line_comment_above_real_attribute() {
+        let source = r#"
+// world: "minimal-node" — see aegix.wit for the full set
+#[aegix_node(world = "automation-node")]
+pub fn run() {}
+"#;
+        assert_eq!(extract_wit_world(source), "automation-node");
+    }
+
+    /// MCP-637: trailing line comment with the marker on the same
+    /// physical line as a real attribute must not steal precedence
+    /// from a real attribute on a LATER line.
+    #[test]
+    fn ignores_trailing_line_comment() {
+        let source = r#"
+let x = 1; // world: "minimal-node" — bogus
+#[aegix_node(world = "agent-node")]
+pub fn run() {}
+"#;
+        assert_eq!(extract_wit_world(source), "agent-node");
+    }
+
+    /// MCP-637: string-literal `//` does not count as a comment start.
+    /// Make sure the comment-stripper preserves the marker that's
+    /// inside a string literal earlier on the same line.
+    #[test]
+    fn preserves_marker_inside_string_literal() {
+        let source = r#"
+let url = "https://example.com/world: \"minimal-node\""; #[aegix_node(world = "network-node")] fn run() {}
+"#;
+        // The escaped `\"` quotes inside the string keep the comment-
+        // stripper from terminating early; the colon-form marker
+        // appears inside a string literal so it would NOT be a match
+        // candidate even without the line-comment stripping. The
+        // equals-form `world = "network-node"` after `; #[aegix_node(...)`
+        // wins.
+        assert_eq!(extract_wit_world(source), "network-node");
+    }
+
+    /// Existing behavior — colon and equals forms both work, default
+    /// kicks in when neither is present.
+    #[test]
+    fn colon_form_matches() {
+        assert_eq!(
+            extract_wit_world(r#"aegix.wit world: "agent-node""#),
+            "agent-node"
+        );
+    }
+
+    #[test]
+    fn equals_form_matches() {
+        assert_eq!(
+            extract_wit_world(r#"#[aegix_node(world = "http-node")] fn run() {}"#),
+            "http-node"
+        );
+    }
+
+    #[test]
+    fn default_when_no_marker() {
+        // Without RUST_ENV or AEGIX_DEFAULT_WIT_WORLD set, default
+        // is "minimal-node" (least-privilege).
+        std::env::remove_var("AEGIX_DEFAULT_WIT_WORLD");
+        assert_eq!(extract_wit_world("pub fn run() {}"), "minimal-node");
+    }
+
+    /// wasm-security-review (2026-05-22): block comment containing
+    /// the marker must NOT win over a real attribute on a later line.
+    /// Pre-fix this returned `automation-node`.
+    #[test]
+    fn ignores_block_comment_above_real_attribute() {
+        let source = r#"
+/* #[aegix_node(world = "automation-node")] */
+#[aegix_node(world = "minimal-node")]
+pub fn run() {}
+"#;
+        assert_eq!(extract_wit_world(source), "minimal-node");
+    }
+
+    /// Multi-line block comment with the marker inside is stripped
+    /// before scanning. The real attribute below wins.
+    #[test]
+    fn ignores_multiline_block_comment() {
+        let source = r#"
+/*
+ * Some documentation that mentions world = "automation-node"
+ * for illustrative purposes.
+ */
+#[aegix_node(world = "http-node")]
+pub fn run() {}
+"#;
+        assert_eq!(extract_wit_world(source), "http-node");
+    }
+
+    /// String literal containing `/* */` markers is NOT treated as a
+    /// comment region. Defense against the `strip_all_comments`
+    /// being fooled by `"// /* x */"` inside a string.
+    #[test]
+    fn block_comment_inside_string_literal_is_preserved() {
+        let source = r#"
+let s = "/* world = \"automation-node\" */";
+#[aegix_node(world = "secrets-node")]
+pub fn run() {}
+"#;
+        assert_eq!(extract_wit_world(source), "secrets-node");
+    }
+}
+
+#[cfg(test)]
+mod template_world_injection_tests {
+    use super::template_substitutes_world;
+
+    #[test]
+    fn detects_attribute_form_substitution() {
+        let template = r#"
+// handlebars: true
+#[aegix_node(world = "{{user_world}}")]
+pub fn run() {}
+"#;
+        assert!(template_substitutes_world(template).is_some());
+    }
+
+    #[test]
+    fn detects_colon_form_substitution() {
+        let template = r#"
+// handlebars: true
+// world: "{{user_world}}"
+pub fn run() {}
+"#;
+        assert!(template_substitutes_world(template).is_some());
+    }
+
+    #[test]
+    fn allows_literal_world_string() {
+        let template = r#"
+// handlebars: true
+#[aegix_node(world = "http-node")]
+pub fn run() {}
+"#;
+        assert_eq!(template_substitutes_world(template), None);
+    }
+
+    #[test]
+    fn allows_handlebars_in_unrelated_string() {
+        let template = r#"
+// handlebars: true
+const KEY: &str = "{{api_key}}";
+#[aegix_node(world = "http-node")]
+pub fn run() {}
+"#;
+        assert_eq!(template_substitutes_world(template), None);
+    }
+
+    #[test]
+    fn block_comment_with_world_substitution_still_blocked() {
+        // A template that hides a `world = "{{...}}"` inside a block
+        // comment shouldn't matter (it wouldn't reach extract_wit_world
+        // either, since strip_all_comments removes it). But we still
+        // want template_substitutes_world to be paranoid about
+        // ANY world = "{{...}}" form regardless of context, because
+        // a stray Handlebars expression next to the `world` keyword
+        // is suspicious. The current impl strips comments before
+        // scanning, so this returns None — that's the conservative
+        // behaviour: defer to extract_wit_world and the post-compile
+        // detected-vs-declared check, both of which run on the
+        // post-comment-stripped source.
+        let template = r#"
+// handlebars: true
+/* world = "{{user_world}}" */
+#[aegix_node(world = "http-node")]
+pub fn run() {}
+"#;
+        assert_eq!(template_substitutes_world(template), None);
+    }
+}
+
+#[cfg(test)]
+mod m13_gate_tests {
+    use super::*;
+    // Shared with container::tests; serialises every test in this
+    // crate that mutates process env vars so they don't race in
+    // parallel mode. See container::TEST_ENV_LOCK for rationale.
+    use crate::container::env_lock;
+
+    fn with_env<T>(rust_env: &str, ack: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev_env = std::env::var("RUST_ENV").ok();
+        let prev_flag = std::env::var(container::RETIRED_HOST_FALLBACK).ok();
+        std::env::set_var("RUST_ENV", rust_env);
+        match ack {
+            Some(v) => std::env::set_var(container::RETIRED_HOST_FALLBACK, v),
+            None => std::env::remove_var(container::RETIRED_HOST_FALLBACK),
+        }
+        let out = f();
+        match prev_env {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
+        }
+        match prev_flag {
+            Some(v) => std::env::set_var(container::RETIRED_HOST_FALLBACK, v),
+            None => std::env::remove_var(container::RETIRED_HOST_FALLBACK),
+        }
+        out
+    }
+
+    #[test]
+    fn gate_no_op_in_dev() {
+        let _g = env_lock();
+        with_env("development", None, || {
+            assert!(require_host_lang_toolchain_allowed("python").is_ok());
+            assert!(require_host_lang_toolchain_allowed("javascript").is_ok());
+        });
+    }
+
+    /// G-9: where the sandbox is required — production and staging — the
+    /// host path is refused, and the retired acknowledgement does not open it.
+    #[test]
+    fn gate_refuses_the_host_path_wherever_the_sandbox_is_required() {
+        let _g = env_lock();
+        for env in ["production", "staging"] {
+            for ack in [
+                None,
+                Some("acknowledge-single-tenant-rce-risk"),
+                Some("true"),
+            ] {
+                let err = with_env(env, ack, || require_host_lang_toolchain_allowed("python"))
+                    .expect_err("refused");
+                let msg = format!("{err}");
+                assert!(msg.contains("python"), "{env} {ack:?}: {msg}");
+                assert!(msg.contains("no host fallback"), "{env} {ack:?}: {msg}");
+                assert!(msg.contains("multi-tenant"), "{env} {ack:?}: {msg}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compile_for_world_tests {
+    //! A compile FOR a world holds the source to that world (security review
+    //! 2026-10-14, G-1). The role gate and the actor ceiling check the
+    //! caller's `capability_world`; until this date a Rust body that already
+    //! carried its own declaration was built at the body's world.
+    use super::*;
+
+    #[test]
+    fn a_body_declaring_a_wider_world_than_the_checked_one_is_refused() {
+        for body in [
+            r#"#[aegix_sdk_macros::aegix_module(world = "automation-node")]
+               pub fn run(input: String) -> Result<String, String> { Ok(input) }"#,
+            r#"#[aegix_node(world = "automation-node")]
+               pub fn run(input: String) -> Result<String, String> { Ok(input) }"#,
+            r#"wit_bindgen::generate!({ world: "automation-node", path: "wit" });"#,
+        ] {
+            let err = required_world_declaration(body, "minimal-node").unwrap_err();
+            assert!(err.starts_with("world-mismatch:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_decoy_declaration_ahead_of_the_real_one_does_not_pass() {
+        let body = r##"
+            const NOTE: &str = r#"world = "minimal-node""#;
+            #[aegix_sdk_macros::aegix_module(world = "automation-node")]
+            pub fn run(input: String) -> Result<String, String> { Ok(input) }
+        "##;
+        assert!(required_world_declaration(body, "minimal-node").is_err());
+    }
+
+    #[test]
+    fn a_body_declaring_the_checked_world_in_either_spelling_compiles_for_it() {
+        let body = r#"#[aegix_sdk_macros::aegix_module(world = "http")]
+                      pub fn run(i: String) -> Result<String, String> { Ok(i) }"#;
+        assert_eq!(
+            required_world_declaration(body, "http-node").unwrap(),
+            "http-node"
+        );
+        // A body with no declaration is held to the required world by the
+        // post-compile reconciliation.
+        assert_eq!(
+            required_world_declaration("pub fn run() {}", "automation-node").unwrap(),
+            "automation-node"
+        );
+    }
+
+    #[test]
+    fn a_required_world_that_is_not_compilable_is_refused() {
+        assert!(required_world_declaration("pub fn run() {}", "llm-node").is_err());
+        assert!(required_world_declaration("pub fn run() {}", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_compile_entry_refuses_a_body_naming_another_world_before_any_build() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let (event_tx, _events) = tokio::sync::broadcast::channel(8);
+        let service = CompilationService::new(root.path().to_path_buf(), event_tx);
+        let body = r#"#[aegix_sdk_macros::aegix_module(world = "automation-node")]
+pub fn run(input: String) -> Result<String, String> { Ok(input) }"#;
+        let config = serde_json::json!({});
+        let direct = service
+            .compile_rust_for_world(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "m",
+                body,
+                &config,
+                None,
+                "minimal-node",
+            )
+            .await
+            .expect("a refusal is a failed result, not an error");
+        // The language router's Rust arm honours the override the same way
+        // (until 2026-10-14 it ignored it for Rust).
+        let routed = service
+            .compile_to_wasm_with_language_and_world(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "m",
+                body,
+                &config,
+                None,
+                None,
+                Some("minimal-node"),
+            )
+            .await
+            .expect("a refusal is a failed result, not an error");
+        for res in [direct, routed] {
+            assert!(!res.success);
+            assert!(res.wasm_bytes.is_none());
+            assert!(
+                res.errors[0].message.starts_with("world-mismatch:"),
+                "{}",
+                res.errors[0].message
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "the refusal came before any workspace was made"
+        );
+    }
+
+    fn result(world: CapabilityWorld) -> CompilationResult {
+        CompilationResult {
+            success: true,
+            wasm_bytes: Some(vec![]),
+            errors: vec![],
+            size_bytes: 0,
+            content_hash: String::new(),
+            capability_world: world,
+            imported_interfaces: vec![],
+        }
+    }
+
+    fn result_with(world: CapabilityWorld, imports: &[&str]) -> CompilationResult {
+        let mut r = result(world);
+        r.imported_interfaces = imports.iter().map(|s| s.to_string()).collect();
+        r
+    }
+
+    #[test]
+    fn the_recorded_world_is_the_binarys_never_wider_than_the_request() {
+        assert_eq!(
+            world_to_record("http-node", &result(CapabilityWorld::Minimal)).unwrap(),
+            "minimal"
+        );
+        assert_eq!(
+            world_to_record("automation-node", &result(CapabilityWorld::Trusted)).unwrap(),
+            "trusted"
+        );
+        // An import outside the request refuses, whatever the name.
+        assert!(world_to_record(
+            "minimal-node",
+            &result_with(CapabilityWorld::Secrets, &["aegix:core/secrets"])
+        )
+        .is_err());
+        assert!(world_to_record("http-node", &result(CapabilityWorld::Unknown)).is_err());
+        assert!(world_to_record("not-a-world", &result(CapabilityWorld::Minimal)).is_err());
+    }
+
+    /// 2026-10-16: a memory-only binary is NAMED `agent` (the narrowest
+    /// covering world) but fits `database-node` too. Built for
+    /// `database-node` it is recorded `database`, the world it was checked
+    /// at; built for `agent-node` it is recorded `agent`; built for
+    /// `secrets-node` it is refused, naming the interface.
+    #[test]
+    fn a_binary_that_fits_an_incomparable_request_is_recorded_at_the_request() {
+        let memory_only = result_with(CapabilityWorld::Agent, &["aegix:core/agent-memory"]);
+        assert_eq!(
+            world_to_record("database-node", &memory_only).unwrap(),
+            "database"
+        );
+        assert_eq!(
+            world_to_record("agent-node", &memory_only).unwrap(),
+            "agent"
+        );
+        let err = world_to_record("secrets-node", &memory_only).unwrap_err();
+        assert!(err.contains("aegix:core/agent-memory"), "{err}");
+        // A binary with no imports fits every world; it is recorded at the
+        // narrower of its name and the request.
+        assert_eq!(
+            world_to_record("minimal-node", &result(CapabilityWorld::Secrets)).unwrap(),
+            "minimal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconcile_declared_world_tests {
+    use super::*;
+    use aegix_wit_inspector::ComponentInspection;
+
+    fn inspection(world: CapabilityWorld) -> ComponentInspection {
+        ComponentInspection {
+            capability_world: world,
+            imported_interfaces: vec!["aegix:core/llm".to_string()],
+            is_aegix_node: true,
+            former_package_imports: vec![],
+        }
+    }
+
+    #[test]
+    fn a_node_suffixed_declaration_of_the_detected_world_compiles() {
+        let kept = reconcile_declared_world("m", "agent-node", inspection(CapabilityWorld::Agent))
+            .expect("same world, other spelling: not a mismatch");
+        assert_eq!(kept.capability_world, CapabilityWorld::Agent);
+    }
+
+    #[test]
+    fn an_over_declaration_compiles() {
+        assert!(
+            reconcile_declared_world("m", "agent-node", inspection(CapabilityWorld::Http)).is_ok()
+        );
+    }
+
+    #[test]
+    fn no_declaration_compiles() {
+        assert!(reconcile_declared_world("m", "", inspection(CapabilityWorld::Trusted)).is_ok());
+    }
+
+    #[test]
+    fn an_escalation_refuses_the_compile() {
+        let refused =
+            reconcile_declared_world("m", "minimal-node", inspection(CapabilityWorld::Http))
+                .expect_err("the binary needs more than the source declared");
+        assert!(!refused.success);
+        assert!(refused.wasm_bytes.is_none());
+        assert!(refused.errors[0].message.starts_with("world-mismatch:"));
+        assert_eq!(refused.capability_world, CapabilityWorld::Http);
+    }
+
+    #[test]
+    fn an_unknown_detected_world_refuses_the_compile() {
+        assert!(
+            reconcile_declared_world("m", "agent-node", inspection(CapabilityWorld::Unknown))
+                .is_err()
+        );
+    }
+
+    fn inspection_with(world: CapabilityWorld, imports: &[&str]) -> ComponentInspection {
+        ComponentInspection {
+            capability_world: world,
+            imported_interfaces: imports.iter().map(|s| s.to_string()).collect(),
+            is_aegix_node: true,
+            former_package_imports: vec![],
+        }
+    }
+
+    /// 2026-10-16: the verdict is on the imports. A memory-only binary is
+    /// named `agent`; declared `database-node` it compiles (over-declared,
+    /// not an escalation: `database-node` imports `agent-memory`); declared
+    /// `secrets-node` it is refused with the interface named; a declaration
+    /// that parses to no world is refused.
+    #[test]
+    fn the_verdict_is_on_the_import_set_not_the_classified_world() {
+        let memory_only = || inspection_with(CapabilityWorld::Agent, &["aegix:core/agent-memory"]);
+        assert!(reconcile_declared_world("m", "database-node", memory_only()).is_ok());
+        assert!(reconcile_declared_world("m", "agent-node", memory_only()).is_ok());
+        let refused = reconcile_declared_world("m", "secrets-node", memory_only())
+            .expect_err("secrets-node does not import agent-memory");
+        assert!(
+            refused.errors[0]
+                .message
+                .contains("outside the declared world: aegix:core/agent-memory"),
+            "{}",
+            refused.errors[0].message
+        );
+        assert!(reconcile_declared_world("m", "no-such-node", memory_only()).is_err());
+        // The classified world being `trusted` (the pre-fix name for this
+        // binary) changes nothing: the imports fit `agent-node`.
+        let misnamed = inspection_with(CapabilityWorld::Trusted, &["aegix:core/agent-memory"]);
+        assert!(reconcile_declared_world("m", "agent-node", misnamed).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod compile_switch_tests;
+
+#[cfg(test)]
+mod interpreted_component_bound_tests {
+    use super::*;
+
+    /// G-20 (2026-10-14): a JS or Python component has a size bound, wider
+    /// than a Rust module's only by its embedded runtime, and one over it is
+    /// refused before inspection.
+    #[test]
+    fn an_interpreted_component_is_bounded() {
+        assert_eq!(max_component_bytes(ModuleLanguage::Rust), 1_048_576);
+        assert!(
+            max_component_bytes(ModuleLanguage::JavaScript)
+                < max_component_bytes(ModuleLanguage::Python)
+        );
+        let mut over = b"\0asm\x0d\0\x01\0".to_vec();
+        over.resize(max_component_bytes(ModuleLanguage::JavaScript) + 1, 0);
+        let err = check_interpreted_component(&over, ModuleLanguage::JavaScript, "minimal-node")
+            .unwrap_err();
+        assert!(err.to_string().contains("over the"), "{err}");
+    }
+
+    /// A component that imports a wider world than the one requested is
+    /// refused: the interpreted paths are inspected as the Rust path is
+    /// (security review 2026-10-14, G-20).
+    #[test]
+    fn an_interpreted_component_wider_than_its_world_is_refused() {
+        let name = b"aegix:core/secrets";
+        let mut c = b"\0asm\x0d\0\x01\0".to_vec();
+        // Type section: one instance type with no declarations.
+        c.extend_from_slice(&[0x07, 0x03, 0x01, 0x42, 0x00]);
+        // Import section: `aegix:core/secrets` as an instance of type 0.
+        let body_len = 3 + name.len() + 2;
+        c.extend_from_slice(&[0x0a, u8::try_from(body_len).unwrap(), 0x01, 0x00]);
+        c.push(u8::try_from(name.len()).unwrap());
+        c.extend_from_slice(name);
+        c.extend_from_slice(&[0x05, 0x00]);
+        assert_ne!(
+            aegix_wit_inspector::inspect_component(&c)
+                .capability_world
+                .to_string(),
+            "unknown",
+            "the hand-built component must parse for this test to mean anything"
+        );
+        let err = check_interpreted_component(&c, ModuleLanguage::JavaScript, "minimal-node")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("wider than the requested"),
+            "{err}"
+        );
+        assert!(
+            check_interpreted_component(&c, ModuleLanguage::JavaScript, "automation-node").is_ok()
+        );
+    }
+}

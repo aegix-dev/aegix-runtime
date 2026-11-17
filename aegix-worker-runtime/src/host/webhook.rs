@@ -1,0 +1,752 @@
+//! `webhook` sender host interface.
+
+use super::*;
+
+use crate::reason_class;
+
+/// Latch `class` against the `sendfailed` discriminant and return it.
+///
+/// `wit_webhook::Error` is `{ invalidurl, sendfailed, timeout }` — no deny
+/// variant — so every refusal on this surface returns `Sendfailed` and all
+/// but ONE are deterministic: a write-ceiling refusal, four caps, a URL parse
+/// failure, the policy denials (host allowlist, SSRF, tier-1 egress, method
+/// allowlist, idempotency-key reuse), two rate-limits, a circuit-open, two
+/// cancellations and a secret-slot failure. Exactly ONE is the genuine
+/// transport failure.
+///
+/// Measured before it was written: `sendfailed` matches no arm in ANY of the
+/// four downstream classifiers, so every one of those 16 already read
+/// `unknown` / `runtime_error` / `other` — all NON-transient. That is why this
+/// surface is a pure diagnostic fix with **no retry consequence in either
+/// direction**, and why the transport site CLEARS rather than latching a
+/// transport class: `send-failed` / `connect-refused` / `dns` are all
+/// TRANSIENT in `aegix_retry_intelligence`, so latching one would newly GRANT
+/// controller-level re-dispatch to a mutating POST that has none today — on
+/// top of `send`'s own internal `1 + max_retries` loop. Granting a retry is
+/// not this change's business.
+fn webhook_deny(ctx: &AegixContext, class: &'static str) -> wit_webhook::Error {
+    ctx.record_http_denial(class, reason_class::WIT_SENDFAILED);
+    wit_webhook::Error::Sendfailed
+}
+
+// ============================================================================
+// Webhook sender
+// ============================================================================
+
+impl wit_webhook::Host for AegixContext {
+    async fn send(
+        &mut self,
+        req: wit_webhook::WebhookRequest,
+    ) -> Result<wit_webhook::WebhookResponse, wit_webhook::Error> {
+        self.host_call("webhook::send");
+        if self.rehearsal_refuses("webhook::send").await {
+            return Err(wit_webhook::Error::Sendfailed);
+        }
+        // MCP-785 (2026-05-14): pure-validation surfaces (URL parse,
+        // host allowlist, SSRF IP-literal classification, allowed_hosts
+        // pattern match, DNS-rebinding, Tier-1 LLM egress) MUST run
+        // BEFORE `check_rate_limit` charges `webhook_send_count`.
+        // Pre-fix the rate-limit charge ran first, so a guest could
+        // loop `send(url="http://127.0.0.1/x", ...)` (SSRF deny) or
+        // `send(url="https://blocked.example.com/x", ...)` (allowed-
+        // hosts deny) up to MAX_WEBHOOK_SENDS_PER_EXECUTION times and
+        // exhaust the per-execution webhook quota with zero outbound
+        // POSTs ever leaving the worker. Subsequent legitimate
+        // webhook sends were then blocked for the rest of the
+        // execution despite the rate-limit being conceptually unused.
+        // Same shape as MCP-770 (wit_files::write), MCP-783
+        // (wit_http::fetch_all batch CAS), MCP-784 (wit_messaging
+        // payload-size after rate-limit), and MCP-612 (the original
+        // counter-only-advances-when-admitted rule).
+        // MCP-537 (the original rate-limit add) is preserved — only
+        // the ordering moves; cancellation check also relocates to
+        // stay paired with the rate-limit charge.
+
+        let url = req.url.clone();
+        // Write-ceiling gate: an outbound webhook is a mutation/side effect —
+        // refuse for read-only actors. Inert unless enforcement is on.
+        if self
+            .write_ceiling_refuses(
+                aegix_workflow_job_protocol::CeilingAxis::Categorical,
+                "webhook-send",
+                &url,
+            )
+            .await
+        {
+            return Err(webhook_deny(self, reason_class::WRITE_CEILING));
+        }
+        // MCP-1148: cap URL bytes BEFORE invoking `url::Url::parse`
+        // below. Sibling-parity with wit_http::fetch / wit_graphql.
+        if url.len() > MAX_OUTBOUND_URL_BYTES {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                url_len = url.len(),
+                limit = MAX_OUTBOUND_URL_BYTES,
+                "wit_webhook::send rejected: URL length exceeds cap"
+            );
+            return Err(webhook_deny(self, reason_class::URL_TOO_LONG));
+        }
+        // MCP-1105: cap caller-supplied header count. See
+        // MAX_OUTBOUND_HEADERS doc-comment for the per-vault-resolve
+        // amplification rationale; wit_webhook::send's retry budget
+        // (1 + max_retries) further compounds it.
+        if req.headers.len() > MAX_OUTBOUND_HEADERS {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                header_count = req.headers.len(),
+                limit = MAX_OUTBOUND_HEADERS,
+                "wit_webhook::send rejected: header count exceeds cap"
+            );
+            return Err(webhook_deny(self, reason_class::REQUEST_HEADER_CAP));
+        }
+        let headers = req.headers.clone();
+        // MCP-1014 (2026-05-15): cap caller-supplied webhook body. Pre-fix
+        // `req.body` was unbounded — wasmtime-memory-budget the only
+        // ceiling, which is the FLOOR (not the ceiling) of what the host
+        // must defend against. A guest with a 100 MB memory budget could
+        // ship a 100 MB body per send(); the host then cloned it twice
+        // (into the local `body` binding and again into reqwest's
+        // `.body(body.clone())` on each retry) and held it across the
+        // network round-trip. With MAX_WEBHOOK_SENDS_PER_EXECUTION × the
+        // 1 + max_retries retry budget, the worst-case host-memory
+        // commitment compounds.
+        //
+        // The sibling response side already capped at
+        // `MAX_WEBHOOK_RESP_BYTES = 1 MB` (line 5026); 10 MB on the
+        // outbound matches the higher CSV/XML/template caps and is
+        // generous for normal webhook traffic (typical payloads are
+        // sub-100 KB). Same defense-in-depth class as MCP-1013
+        // (wit_data_transform XML/JSON caps) and MCP-784
+        // (wit_messaging payload-size).
+        // MCP-1076: canonical module-level MAX_OUTBOUND_HTTP_BODY_BYTES.
+        if req.body.len() > MAX_OUTBOUND_HTTP_BODY_BYTES {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                body_len = req.body.len(),
+                limit = MAX_OUTBOUND_HTTP_BODY_BYTES,
+                "wit_webhook::send rejected: body exceeds cap"
+            );
+            return Err(webhook_deny(self, reason_class::REQUEST_BODY_CAP));
+        }
+        let body = req.body.clone();
+        // MCP-583: cap caller-supplied retry config. Pre-fix
+        // `max_retries` and `retry_delay_ms` were `option<u32>` with
+        // no upper bound — a module could pass `u32::MAX` for either
+        // (or both) and a single send() with a non-timeout transport
+        // error (e.g. connection-refused) would loop until the WASM
+        // execution timeout, holding a worker slot. Sibling
+        // wit_graphql caps its backoff at 30s; this is the lone
+        // straggler. The design-doc "1+max_retries (default 4)
+        // actual POSTs" promise (in `webhook_cap_holds_at_one_hundred`)
+        // only holds with a bound here.
+        let max_retries = req
+            .max_retries
+            .unwrap_or(3)
+            .min(MAX_WEBHOOK_RETRIES_PER_SEND);
+        let retry_delay_ms = req
+            .retry_delay_ms
+            .unwrap_or(1_000)
+            .min(MAX_WEBHOOK_RETRY_DELAY_MS) as u64;
+
+        // SSRF protection: validate URL and enforce host allowlist (same as HTTP fetch).
+        let parsed_url: url::Url = url
+            .parse()
+            .map_err(|_| webhook_deny(self, reason_class::URL_PARSE))?;
+        let host = parsed_url.host_str().unwrap_or("").to_string();
+
+        // HTTPS-only by default. Webhook deliveries are the highest-
+        // value plaintext target since they carry a signed payload
+        // bound to a guest secret; intercepting the wire is enough to
+        // replay it. Operator opt-in only.
+        match classify_url_scheme(parsed_url.scheme(), self.dev_egress.insecure_http) {
+            UrlSchemeVerdict::Https => {}
+            UrlSchemeVerdict::InsecureAllowedByOptIn { scheme } => {
+                tracing::warn!(
+                    scheme = %scheme,
+                    host = %host,
+                    "webhook::send: insecure-scheme request allowed by WASM_ALLOW_INSECURE_HTTP=1"
+                );
+            }
+            UrlSchemeVerdict::InsecureRefused { scheme } => {
+                self.record_capability_denied(
+                    "webhook",
+                    "insecure-scheme",
+                    &format!("{scheme} {host}"),
+                )
+                .await;
+                tracing::warn!(
+                    scheme = %scheme,
+                    host = %host,
+                    "WASM module attempted non-https webhook send — denied."
+                );
+                return Err(webhook_deny(self, reason_class::INSECURE_SCHEME));
+            }
+        }
+
+        // Enforce the host allowlist. Empty list means DENY ALL.
+        if self.allowed_hosts.is_empty() {
+            self.record_capability_denied("webhook", "no-allowlist-configured", &host)
+                .await;
+            tracing::warn!(
+                host = %host,
+                "WASM module attempted webhook request but no host allowlist is configured — denying."
+            );
+            return Err(webhook_deny(self, reason_class::NO_ALLOWLIST));
+        }
+
+        // Block private/loopback/link-local IP addresses to prevent SSRF.
+        // Shared classifier — covers CGNAT and IPv4-mapped IPv6 the
+        // duplicated logic was missing.
+        if let Some((ip, policy)) = denied_ip_literal(&parsed_url) {
+            self.record_capability_denied("webhook", policy, &ip.to_string())
+                .await;
+            tracing::warn!(
+                ip = %ip,
+                policy,
+                "WASM module attempted webhook to a private IP literal — blocking"
+            );
+            return Err(webhook_deny(self, reason_class::PRIVATE_IP));
+        }
+
+        if !host_allowlist_match_at(
+            &self.allowed_hosts,
+            &host,
+            parsed_url.port_or_known_default(),
+        ) {
+            self.record_capability_denied("webhook", "allowed-hosts", &host)
+                .await;
+            tracing::warn!(
+                host = %host,
+                allowed_count = self.allowed_hosts.len(),
+                "WASM module attempted webhook to a forbidden host"
+            );
+            return Err(webhook_deny(self, reason_class::ALLOWED_HOSTS));
+        }
+
+        // Method allowlist. A webhook send is always a POST, and until 2026-09
+        // this surface never consulted `allowed_methods` at all — so a module
+        // declared `allowed_methods: ["GET"]` (the read-only shape the engine's
+        // method-aware retry default keys on) could still POST through
+        // `webhook::send`. Same rule `graphql::execute` applies to its own
+        // implicit POST. Since 2026-09-24 an EMPTY allowlist DENIES here too
+        // (`method_permitted`) — the sentence this comment used to end with,
+        // "empty = allow all", was the defect.
+        if !aegix_workflow_job_protocol::method_permitted(&self.allowed_methods, "POST") {
+            self.record_capability_denied_detailed(
+                "webhook",
+                "method-allowlist",
+                &format!("POST {host}"),
+                Some(aegix_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
+            )
+            .await;
+            tracing::warn!(
+                host = %host,
+                allowed_methods = ?self.allowed_methods,
+                "WASM module attempted a webhook POST but POST is not in allowed_methods"
+            );
+            return Err(webhook_deny(self, reason_class::METHOD_ALLOWLIST));
+        }
+
+        // DNS rebinding — for hostname-based URLs, resolve and reject when
+        // any answer falls in the private deny-list. Skipped for IP literals
+        // (already handled by classify_private_ip above).
+        if matches!(parsed_url.host(), Some(url::Host::Domain(_))) {
+            // The ONE mixed site — an SSRF answer (deterministic denial) and a
+            // resolver failure (transient, not a denial) share one `Err`. On
+            // this surface the resolver failure CLEARS instead of latching
+            // `dns`: `sendfailed` is non-transient today, and `dns` is in the
+            // transient bucket, so latching it would newly grant a retry to a
+            // mutating POST. See `webhook_deny`.
+            if let Err(e) = self.validate_no_dns_rebinding(&host, "webhook").await {
+                return Err(match reason_class::dns_rebinding_class(e) {
+                    Some(class) => webhook_deny(self, class),
+                    None => {
+                        self.record_network_outcome(None);
+                        wit_webhook::Error::Sendfailed
+                    }
+                });
+            }
+        }
+
+        // Tier-1 LLM egress ceiling — webhook dispatch is yet another
+        // arbitrary-host HTTP surface. Same deny-list applies.
+        // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
+        // public IP literals for ANY local-egress-only actor (a resolver never
+        // sees a literal) — one predicate, `egress_posture_deny_reason`.
+        {
+            let host_lower = host.to_ascii_lowercase();
+            if let Some(policy) =
+                egress_posture_deny_reason(&host_lower, self.max_llm_tier, self.local_egress_only)
+            {
+                self.record_capability_denied("webhook", policy, &host)
+                    .await;
+                tracing::warn!(
+                    host = %host,
+                    actor_id = ?self.actor_id,
+                    policy,
+                    "actor egress posture refused webhook egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
+                );
+                return Err(webhook_deny(self, reason_class::tier1_egress_class(policy)));
+            }
+        }
+
+        // MCP-537 (rate limit + cancellation): now charged AFTER all pure
+        // validation has passed — see MCP-785 reorder comment at top of
+        // this function.
+        if !self.check_rate_limit(&self.webhook_send_count, MAX_WEBHOOK_SENDS_PER_EXECUTION) {
+            tracing::warn!(module_id = ?self.module_id, "Webhook send rate limit exceeded");
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("webhook");
+            }
+            return Err(webhook_deny(self, reason_class::EXECUTION_RATE_LIMIT));
+        }
+        // Per-host limit, sharing `http_calls_per_host` with `http::fetch` /
+        // `fetch_all` so a module cannot use `webhook::send` as a second
+        // 200-call lane against one upstream. Charged after the global cap
+        // admits, for the reason `fetch` gives at its M-6 site.
+        let host_for_limit = match parsed_url.port_or_known_default() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.clone(),
+        };
+        if !self.check_per_host_rate_limit(&host_for_limit, MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION) {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                host = %host,
+                limit = MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION,
+                "webhook per-host rate limit exceeded — refusing to amplify load to a single upstream"
+            );
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("webhook_per_host");
+            }
+            return Err(webhook_deny(self, reason_class::PER_HOST_RATE_LIMIT));
+        }
+        if self.is_cancelled() {
+            tracing::info!(module_id = ?self.module_id, "Execution cancelled before webhook send");
+            if let Some(ref m) = self.metrics {
+                m.record_execution_cancelled();
+            }
+            return Err(webhook_deny(self, reason_class::CANCELLED));
+        }
+
+        // Dry-run mode: mock webhook POST calls
+        if self.dry_run {
+            tracing::info!(
+                url = %url,
+                "Dry-run: intercepted webhook send"
+            );
+            self.dry_run_ledger
+                .record(crate::dry_run::StubbedSurface::Webhook);
+            return Ok(wit_webhook::WebhookResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "__dry_run__": true,
+                    "intercepted_method": "POST",
+                    "intercepted_url": url,
+                })
+                .to_string(),
+                retries: 0,
+            });
+        }
+
+        let client = self.http_client.clone();
+
+        // Opt-in idempotency (Task 2): a webhook send is always a POST
+        // (mutating). When the engine stamped a key and the guest didn't set its
+        // own `Idempotency-Key` header, this send participates in the worker-side
+        // dedup store — belt-and-suspenders on top of the header for
+        // destinations that don't honor it. Compute the key ONCE before the
+        // retry loop; `None` (non-declaring send, or guest-provided key) opts
+        // out entirely.
+        let dedup_key: Option<String> = self.idempotency_key.as_ref().and_then(|idem| {
+            let guest_set = headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("idempotency-key"));
+            if guest_set {
+                None
+            } else {
+                // Tenancy-scoped, or `None` when the job carries no user_id
+                // (see `http::scoped_dedup_key`) — the header still goes out.
+                crate::host::http::scoped_dedup_key(self.user_id, self.actor_id, &host, idem)
+            }
+        });
+        // The request identity the record is bound to — a hit is served only
+        // for the same URL + body; the same key with a different request is
+        // REFUSED (mirrors the Redis store's request_hash).
+        let request_hash = crate::host::http::dedup_request_hash("POST", &url, body.as_bytes());
+        // Short-circuit if this key already completed successfully in-process.
+        if let Some(ref k) = dedup_key {
+            match crate::host::http::get_global_idempotency_store().check(k, &request_hash) {
+                aegix_idempotency::DedupCheck::Completed(cached) => {
+                    tracing::info!(
+                        "idempotent webhook send short-circuited: returning cached response \
+                         for a previously-completed idempotency key (worker-side dedup)"
+                    );
+                    return Ok(wit_webhook::WebhookResponse {
+                        status: cached.status,
+                        body: String::from_utf8_lossy(&cached.body).into_owned(),
+                        retries: 0,
+                    });
+                }
+                aegix_idempotency::DedupCheck::Mismatch => {
+                    // Same key, different request: refuse rather than replay
+                    // another request's response or double-send under a key
+                    // the destination already honoured. `sendfailed` is
+                    // non-transient in every classifier (see `webhook_deny`),
+                    // and no `reason_class` token is minted — `ALL` is a
+                    // closed set pinned cross-crate — so the cause travels on
+                    // the audit ledger + `[host:…]` diagnostic and the latch
+                    // is CLEARED.
+                    self.record_capability_denied("webhook", "idempotency-key-reuse", &host)
+                        .await;
+                    tracing::warn!(
+                        host = %host,
+                        module_id = ?self.module_id,
+                        "idempotency key reused for a different webhook request (url/body \
+                         differ from the completed send) — refusing rather than replaying"
+                    );
+                    self.record_network_outcome(None);
+                    return Err(wit_webhook::Error::Sendfailed);
+                }
+                aegix_idempotency::DedupCheck::Proceed => {}
+            }
+        }
+
+        // Resolve any `vault://` reference in a JSON body, under the SAME four
+        // rules and the same refusal as `http::fetch` — one home,
+        // `resolve_vault_json_body`. Until 2026-09-24 this surface resolved
+        // headers and sent the body VERBATIM, so a marker here was neither
+        // substituted nor refused: the vault PATH, which names the provider
+        // and (for gmail) the account address, went to the destination.
+        //
+        // ONCE, before the retry loop, for two reasons. A per-attempt resolve
+        // would re-read the vault on every retry, and a rotation landing
+        // mid-retry would split one logical delivery across two credentials.
+        //
+        // AFTER the dedup fingerprint above, which is computed from the
+        // PLACEHOLDER body deliberately: that is the stable, secret-free
+        // request identity, and hashing the resolved bytes would both put
+        // plaintext in the idempotency record and change the fingerprint
+        // whenever the credential rotates.
+        //
+        // `send` sets no content type of its own, so the JSON declaration must
+        // come from the guest's own headers. A body carrying the marker with no
+        // JSON content type is REFUSED rather than rewritten — a behaviour
+        // change from silently posting the placeholder, and the same direction
+        // `http::fetch` already takes.
+        let body: Vec<u8> = if body.is_empty() {
+            body.into_bytes()
+        } else {
+            let declared_content_type = headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.clone());
+            match self
+                .resolve_vault_json_body(
+                    crate::context::SecretUseSurface::WebhookJsonBody,
+                    &host,
+                    body.as_bytes(),
+                    declared_content_type.as_deref(),
+                )
+                .await
+            {
+                Ok(Some(substituted)) => substituted,
+                Ok(None) => body.into_bytes(),
+                // Same exit shape as the header loop's refusal below.
+                Err(_) => return Err(webhook_deny(self, reason_class::SECRET_LOOKUP)),
+            }
+        };
+
+        // Breaker target: `host:port` (see `BreakerTarget`). `send` uses a
+        // fixed 30 s client timeout, above the evidence floor, so here only
+        // the PORT rule can turn a transport failure into no-evidence.
+        let Some(breaker_target) = crate::circuit_breaker::BreakerTarget::from_url(&parsed_url)
+        else {
+            return Err(webhook_deny(self, reason_class::URL_PARSE));
+        };
+        /// `send`'s client timeout (below), named once so the breaker's
+        /// evidence rule reads the value the request actually used.
+        const WEBHOOK_SEND_TIMEOUT_MS: u64 = 30_000;
+
+        let mut retries = 0u32;
+        loop {
+            // Circuit breaker — one permit per ATTEMPT, settled with the
+            // status or the transport failure exactly as `http::fetch` does.
+            // Until 2026-09 this surface never consulted the breaker, so a
+            // dead webhook destination that `fetch` had already opened the
+            // circuit against was still POSTed to `1 + max_retries` times per
+            // send. Refused here = `sendfailed` (non-transient), latched
+            // `circuit-open` so the operator sees why nothing went out.
+            let Some(mut permit) = get_global_circuit_breaker().begin_request(&breaker_target)
+            else {
+                tracing::warn!(host = %host, "Circuit breaker open - rejecting webhook send");
+                self.emit_network_failure(
+                    reason_class::CIRCUIT_OPEN,
+                    reason_class::WIT_SENDFAILED,
+                    &format!(
+                        "circuit breaker open for '{host}' after recent failures — \
+                         webhook not sent; it closes automatically"
+                    ),
+                )
+                .await;
+                return Err(wit_webhook::Error::Sendfailed);
+            };
+            let mut req_builder = client
+                .post(&url)
+                .body(body.clone())
+                .timeout(std::time::Duration::from_millis(WEBHOOK_SEND_TIMEOUT_MS));
+            for (k, v) in &headers {
+                let resolved = self
+                    .resolve_vault_header(
+                        crate::context::SecretUseSurface::WebhookHeader,
+                        &host,
+                        k.as_str(),
+                        v.as_str(),
+                    )
+                    .await
+                    .map_err(|_| webhook_deny(self, reason_class::SECRET_LOOKUP))?;
+                req_builder = req_builder.header(k.as_str(), resolved.as_ref());
+            }
+            // Opt-in idempotency (Task 3): a webhook send is always a POST
+            // (mutating), so emit the engine-stamped `Idempotency-Key` header so
+            // a retried delivery is deduplicated at the destination. Reused
+            // verbatim across retry attempts of this dispatch (that IS the point
+            // — same key ⇒ the destination collapses duplicates). Skipped when
+            // the guest already set the header.
+            if let Some(ref idem) = self.idempotency_key {
+                let guest_set = headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("idempotency-key"));
+                if !guest_set {
+                    req_builder = req_builder.header("Idempotency-Key", idem.as_str());
+                }
+            }
+
+            match req_builder.send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    permit.settle_response(status);
+                    // Host + path LENGTH only — paths carry capability tokens
+                    // and presigned keys.
+                    tracing::info!(
+                        method = "POST",
+                        host = %parsed_url.host_str().unwrap_or("unknown"),
+                        path_len = parsed_url.path().len(),
+                        status = status,
+                        "HTTP audit"
+                    );
+                    const MAX_WEBHOOK_RESP_BYTES: usize = 1_000_000;
+                    let mut bytes = Vec::new();
+                    let mut stream = resp.bytes_stream();
+                    use futures_util::StreamExt;
+                    while let Some(chunk_result) = stream.next().await {
+                        if let Ok(chunk) = chunk_result {
+                            let remaining = MAX_WEBHOOK_RESP_BYTES.saturating_sub(bytes.len());
+                            if remaining > 0 {
+                                let take = chunk.len().min(remaining);
+                                bytes.extend_from_slice(&chunk[..take]);
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&bytes).into_owned();
+                    // Task 2: record a SUCCESSFUL (2xx) idempotent delivery so a
+                    // later send under the same engine-stamped key is
+                    // short-circuited. Only 2xx is cached — a non-2xx must stay
+                    // retryable. Non-declaring sends never touch the store.
+                    if let Some(ref k) = dedup_key {
+                        if crate::host::http::dedup_cacheable_status(status) {
+                            crate::host::http::get_global_idempotency_store().complete(
+                                k,
+                                &request_hash,
+                                aegix_idempotency::DedupResponse {
+                                    status,
+                                    headers: Vec::new(),
+                                    body: bytes.clone(),
+                                },
+                            );
+                        }
+                    }
+                    return Ok(wit_webhook::WebhookResponse {
+                        status,
+                        body,
+                        retries,
+                    });
+                }
+                Err(e) if retries < max_retries => {
+                    // Same accounting as `fetch`, from the same place: a
+                    // builder error or a non-default port is no evidence.
+                    permit.settle_send_error(
+                        e.is_builder(),
+                        e.is_timeout(),
+                        WEBHOOK_SEND_TIMEOUT_MS,
+                    );
+                    retries += 1;
+                    if e.is_timeout() {
+                        // Same reasoning as the terminal transport arm below:
+                        // decide the latch rather than inherit one.
+                        self.record_network_outcome(None);
+                        return Err(wit_webhook::Error::Timeout);
+                    }
+                    // MCP-583: re-check cancellation between retries so
+                    // worker shutdown / execution cancellation preempts
+                    // a long retry-sleep loop. Pre-fix the loop only
+                    // checked is_cancelled() at entry — a send that hit
+                    // a transient transport error would sleep the full
+                    // retry_delay_ms even after a shutdown signal.
+                    if self.is_cancelled() {
+                        tracing::info!(
+                            module_id = ?self.module_id,
+                            "Execution cancelled during webhook retry sleep"
+                        );
+                        if let Some(ref m) = self.metrics {
+                            m.record_execution_cancelled();
+                        }
+                        return Err(webhook_deny(self, reason_class::CANCELLED));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+                }
+                Err(e) => {
+                    permit.settle_send_error(
+                        e.is_builder(),
+                        e.is_timeout(),
+                        WEBHOOK_SEND_TIMEOUT_MS,
+                    );
+                    // THE transport site. It CLEARS rather than latching — the
+                    // totality rule requires every failing return to DECIDE
+                    // the latch, not that every one names a class. Clearing is
+                    // what stops a swallowed earlier denial being stamped onto
+                    // a real transport failure, and it is provably
+                    // transience-neutral here: with or without a marker,
+                    // `sendfailed` reads non-transient and `timeout` reads
+                    // transient in every classifier. Latching a transport
+                    // class instead would newly grant a retry to a mutating
+                    // POST — see `webhook_deny`.
+                    self.record_network_outcome(None);
+                    return Err(if e.is_timeout() {
+                        wit_webhook::Error::Timeout
+                    } else {
+                        wit_webhook::Error::Sendfailed
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod webhook_gate_tests {
+    //! E6 (2026-09): `webhook::send` had no `allowed_methods` gate, no per-host
+    //! limit and no circuit breaker. Public IP literals skip DNS, so each test
+    //! reaches its gate with no network.
+    use super::*;
+    use crate::bindings::aegix::core::webhook::Host as _;
+    use crate::circuit_breaker::get_global_circuit_breaker;
+    use crate::context::AegixContext;
+    use crate::wit_inspector::CapabilityWorld;
+    use aegix_workflow_job_protocol::LlmTier;
+    use std::collections::HashMap;
+
+    fn ctx(host: &str, allowed_methods: &[&str], dry_run: bool) -> AegixContext {
+        let mut c = AegixContext::new(
+            CapabilityWorld::Http,
+            vec![host.to_string()],
+            allowed_methods.iter().map(|s| s.to_string()).collect(),
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("test context");
+        c.dry_run = dry_run;
+        c
+    }
+
+    fn req(host: &str) -> wit_webhook::WebhookRequest {
+        wit_webhook::WebhookRequest {
+            url: format!("https://{host}/hook"),
+            headers: vec![],
+            body: "{}".to_string(),
+            max_retries: Some(0),
+            retry_delay_ms: Some(1),
+        }
+    }
+
+    fn latched(c: &AegixContext) -> Option<&'static str> {
+        c.network_reason_handle().lock().unwrap().map(|r| r.class)
+    }
+
+    #[tokio::test]
+    async fn post_not_in_allowed_methods_is_refused() {
+        let host = "1.0.0.1";
+        let mut c = ctx(host, &["GET"], true);
+        let r = c.send(req(host)).await;
+        assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
+        assert_eq!(latched(&c), Some(reason_class::METHOD_ALLOWLIST));
+
+        // CONTROL: POST listed passes the gate — dry-run mocks the send
+        // before any socket, so a pass here is the gate's verdict and not a
+        // network result.
+        let mut c = ctx(host, &["POST"], true);
+        let r = c.send(req(host)).await;
+        assert!(matches!(&r, Ok(resp) if resp.status == 200), "{r:?}");
+    }
+
+    /// An EMPTY `allowed_methods` REFUSES, and this test is the behaviour
+    /// change itself (2026-09-24).
+    ///
+    /// Until `method_permitted` existed this case was a CONTROL in the test
+    /// above, asserting that an undeclared module may POST — the assertion
+    /// that encoded "empty means allow all". `allowed_hosts` and
+    /// `allowed_secrets` have always denied on empty; this was the third
+    /// sibling disagreeing with both, so an undeclared module could POST
+    /// anywhere its host allowlist reached.
+    #[tokio::test]
+    async fn an_undeclared_method_list_refuses_the_send() {
+        let host = "1.0.0.3";
+        let mut c = ctx(host, &[], true);
+        let r = c.send(req(host)).await;
+        assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
+        assert_eq!(latched(&c), Some(reason_class::METHOD_ALLOWLIST));
+    }
+
+    #[tokio::test]
+    async fn per_host_limit_is_shared_with_http_fetch() {
+        let host = "1.0.0.2";
+        let mut c = ctx(host, &["POST"], true);
+        // Spend the host's budget the way `fetch` would.
+        for _ in 0..MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION {
+            assert!(c.check_per_host_rate_limit(
+                &format!("{host}:443"),
+                MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION
+            ));
+        }
+        let r = c.send(req(host)).await;
+        assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
+        assert_eq!(latched(&c), Some(reason_class::PER_HOST_RATE_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn an_open_circuit_refuses_the_send_before_it_leaves() {
+        let host = "1.0.0.3";
+        let cb = get_global_circuit_breaker();
+        cb.force_half_open(&crate::circuit_breaker::https_breaker_key(host), 0);
+        // dry_run = false: the breaker sits AFTER the dry-run mock, and a
+        // refusal returns before any socket is opened.
+        let mut c = ctx(host, &["POST"], false);
+        let r = c.send(req(host)).await;
+        assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
+        assert_eq!(latched(&c), Some(reason_class::CIRCUIT_OPEN));
+        assert_eq!(
+            cb.trial_tally(&crate::circuit_breaker::https_breaker_key(host)),
+            Some((0, 0))
+        );
+    }
+}

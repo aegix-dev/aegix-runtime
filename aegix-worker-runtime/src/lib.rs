@@ -1,0 +1,48 @@
+//! Aegix worker runtime library — the wasmtime WASM host.
+//!
+//! Extracted from the `worker` crate (July 2026) so controller-side
+//! consumers (aegix-api, aegix-mcp-handlers, aegix-replay-service,
+//! aegix-google-calendar, controller) depend on a library crate instead
+//! of the deployable worker binary. The `worker` bin crate keeps a thin
+//! re-export shim (`worker/src/lib.rs`) so `worker::runtime::AegixRuntime`
+//! style paths remain valid; bin-only modules (`main.rs`, `self_register`,
+//! `metrics_server`, `secret_claim`) stay in `worker/`.
+
+pub mod audit;
+pub mod bindings;
+pub mod cancel_registry;
+pub mod circuit_breaker;
+pub mod context;
+pub mod dry_run;
+pub mod epoch_budget;
+pub mod error_sanitize;
+pub mod expose_fallback;
+pub mod fuel_profile;
+pub mod host;
+pub mod host_impl;
+pub mod http_replay;
+pub mod inference_wait;
+pub mod job_idempotency;
+pub mod job_span;
+pub mod local_llm_fleet;
+pub mod memory_rehearsal;
+pub mod metrics;
+pub mod module_fetcher;
+pub mod provider_options;
+pub mod reason_class;
+pub mod rehearsal;
+pub mod result_cache_seal;
+pub mod runtime;
+pub mod s3_signer;
+pub mod sql_validator;
+pub mod ssrf_resolver;
+pub mod trace_nats;
+pub mod tracing;
+pub mod wit_inspector;
+pub mod worker_identity;
+
+pub use runtime::AegixRuntime;
+pub use wit_inspector::{
+    inspect_component, validate_capability_level, CapabilityWorld, ComponentInspection,
+};
+pub use worker_identity::worker_identity;

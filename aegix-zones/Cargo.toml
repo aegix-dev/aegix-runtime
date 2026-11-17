@@ -1,0 +1,27 @@
+[package]
+name = "aegix-zones"
+description = "The one home of the two questions asked of a time zone: is this a zone, and what is its offset at this instant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A leaf: `jiff` for the zone rules, `chrono` for the trait the cron library
+# takes a zone as. Both of the runtime's own date types are already below the
+# runtime boundary; this crate links nothing else.
+#
+# The rules are the IANA database compiled into the binary (`jiff-tzdb`,
+# through jiff's `tzdb-bundle-always`), never the host's zone files: jiff's
+# default features are off, so nothing here reads `/usr/share/zoneinfo`, the
+# `TZ` variable or the host's local zone, and the answer is the same on every
+# machine that built the same `Cargo.lock`. `jiff-tzdb` is named directly only
+# to report which release that is (`database_release`).
+
+[dependencies]
+chrono.workspace = true
+jiff = { workspace = true, features = ["std", "tzdb-bundle-always"] }
+jiff-tzdb.workspace = true
+
+[lints]
+workspace = true

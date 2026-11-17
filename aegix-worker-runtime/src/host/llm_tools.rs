@@ -1,0 +1,416 @@
+//! `llm-tools` (function calling / structured output) host interface.
+
+use super::*;
+
+// ============================================================================
+// LLM Tool Use (function calling / structured output)
+// ============================================================================
+
+impl wit_llm_tools::Host for AegixContext {
+    #[::tracing::instrument(name = "llm.complete_with_tools", skip_all)]
+    async fn complete_with_tools(
+        &mut self,
+        req: wit_llm_tools::ToolCompletionRequest,
+    ) -> Result<wit_llm_tools::ToolCompletionResponse, wit_llm_tools::Error> {
+        self.host_call("llm-tools::complete-with-tools");
+        // MCP-609 (2026-05-12): per-method capability gate. WIT linkage
+        // restricts `aegix:core/llm-tools` to llm-node, secrets-node,
+        // database-node, agent-node, automation-node (verified by grep
+        // `import llm-tools` in wit/aegix.wit). The wit_inspector
+        // `classify_world` collapses llm-node to `CapabilityWorld::Secrets`,
+        // so the runtime set is {Secrets, Database, Agent, Trusted}.
+        // Pre-fix: same gap as MCP-607 (wit_llm_streaming) — Tier-1
+        // privacy check exists for external providers but Ollama
+        // branch (`is_local_tools`) skips all key resolution, letting
+        // a Minimal-world module that linked invoke local LLM tools.
+        use crate::wit_inspector::CapabilityWorld;
+        if !matches!(
+            self.capability_world,
+            CapabilityWorld::Secrets
+                | CapabilityWorld::Database
+                | CapabilityWorld::Agent
+                | CapabilityWorld::Trusted
+        ) {
+            // MCP-697 (2026-05-13): audit-ledger parity. Sibling Tier-1
+            // denial branches in this same impl audit via
+            // `record_capability_denied`; capability-world denial branch
+            // was silent (`tracing::warn!` only). Both denial classes
+            // should produce a WORM ledger entry. Target encodes the
+            // provider so operators can correlate the audit row with the
+            // policy that should have caught it.
+            let provider = format!(
+                "{:?}",
+                req.provider.unwrap_or(wit_llm_tools::Provider::Anthropic)
+            );
+            self.record_capability_denied(
+                "wit_llm_tools::complete_with_tools",
+                "capability-world",
+                &provider,
+            )
+            .await;
+            tracing::warn!(
+                world = ?self.capability_world,
+                "WASM module attempted wit_llm_tools::complete_with_tools but lacks Secrets/Database/Agent/Trusted capability"
+            );
+            return Err(wit_llm_tools::Error::NotConfigured(
+                "capability_world does not permit LLM tools".to_string(),
+            ));
+        }
+        // 1. Check cancellation before making an expensive API call.
+        if self.is_cancelled() {
+            tracing::info!(module_id = ?self.module_id, "Execution cancelled");
+            return Err(wit_llm_tools::Error::BudgetExhausted);
+        }
+
+        // 2. Resolve provider and look up the API key from secrets.
+        // Ollama (Tier 1) needs no API key — it runs locally.
+        let provider = req.provider.unwrap_or(wit_llm_tools::Provider::Anthropic);
+        let is_local_tools = matches!(provider, wit_llm_tools::Provider::Ollama);
+        let provider_name = match provider {
+            wit_llm_tools::Provider::Anthropic => "anthropic",
+            wit_llm_tools::Provider::Openai => "openai",
+            wit_llm_tools::Provider::Gemini => "gemini",
+            wit_llm_tools::Provider::Ollama => "ollama",
+        };
+
+        let api_key = if is_local_tools {
+            String::new()
+        } else {
+            match self.get_llm_api_key_by_name(provider_name).await {
+                Some(k) => k,
+                None => {
+                    return Err(wit_llm_tools::Error::NotConfigured(
+                        self.llm_key_unavailable_message(provider_name),
+                    ));
+                }
+            }
+        };
+
+        // 3. Select default model per provider.
+        let model = req.model.unwrap_or_else(|| match provider {
+            wit_llm_tools::Provider::Anthropic => "claude-sonnet-4-20250514".to_string(),
+            wit_llm_tools::Provider::Openai => "gpt-4o".to_string(),
+            wit_llm_tools::Provider::Gemini => "gemini-1.5-pro".to_string(),
+            wit_llm_tools::Provider::Ollama => "mistral".to_string(),
+        });
+
+        // A tier-1 actor's local call must reach a model that runs HERE.
+        if is_local_tools {
+            self.admit_local_model("llm-tools-local-model", &model)
+                .await
+                .map_err(wit_llm_tools::Error::NotConfigured)?;
+        }
+
+        // 4. Convert the WIT rich messages + tool defs into canonical form
+        //    and let the provider adapter build its own wire body.
+        //    Pre-trait, every provider received the ANTHROPIC tools shape
+        //    (`input_schema` tools, `content[]` block messages) — on
+        //    OpenAI-format wires the tools were silently ignored and no
+        //    tool call ever parsed back.
+        let adapter = llm_providers::adapter_for(provider_name);
+
+        let messages: Vec<llm_providers::ToolMessage> = req
+            .messages
+            .iter()
+            .map(|msg| llm_providers::ToolMessage {
+                role: match msg.role {
+                    wit_llm_tools::Role::System => llm_providers::ChatRole::System,
+                    wit_llm_tools::Role::Assistant => llm_providers::ChatRole::Assistant,
+                    wit_llm_tools::Role::User | wit_llm_tools::Role::Tool => {
+                        llm_providers::ChatRole::User
+                    }
+                },
+                is_tool_result_turn: matches!(msg.role, wit_llm_tools::Role::Tool),
+                content: msg
+                    .content
+                    .iter()
+                    .map(|block| match block {
+                        wit_llm_tools::ContentBlock::Text(t) => {
+                            llm_providers::ToolContentBlock::Text(t.clone())
+                        }
+                        wit_llm_tools::ContentBlock::ToolUse(tc) => {
+                            llm_providers::ToolContentBlock::ToolUse {
+                                call_id: tc.call_id.clone(),
+                                tool_name: tc.tool_name.clone(),
+                                arguments: tc.arguments.clone(),
+                            }
+                        }
+                        wit_llm_tools::ContentBlock::ToolResult(tr) => {
+                            llm_providers::ToolContentBlock::ToolResult {
+                                call_id: tr.call_id.clone(),
+                                output: tr.output.clone(),
+                                is_error: tr.is_error,
+                            }
+                        }
+                        wit_llm_tools::ContentBlock::Image(img) => {
+                            llm_providers::ToolContentBlock::Image {
+                                media_type: img.media_type.clone(),
+                                data: img.data.clone(),
+                            }
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let tools: Vec<llm_providers::ToolDef> = req
+            .tools
+            .iter()
+            .map(|t| llm_providers::ToolDef {
+                name: &t.name,
+                description: &t.description,
+                input_schema: serde_json::from_str::<serde_json::Value>(&t.input_schema)
+                    .unwrap_or(serde_json::json!({})),
+            })
+            .collect();
+
+        let mut body = adapter
+            .build_tools_body(&llm_providers::ToolCompletionParams {
+                model: &model,
+                messages: &messages,
+                tools: &tools,
+                system_prompt: req.system_prompt.as_deref(),
+                max_tokens: req.max_tokens.unwrap_or(4096),
+                temperature: req.temperature,
+                force_tool: req.force_tool.as_deref(),
+            })
+            .map_err(wit_llm_tools::Error::NotConfigured)?;
+
+        // RFC 0014 P1: a LOCAL exchange streams so it can be bounded by
+        // progress; the chunks are reassembled before the adapter parses them.
+        if is_local_tools {
+            super::llm_local_stream::request_streaming(&mut body);
+        }
+
+        let url = adapter.completion_url(&model);
+        let auth_headers = adapter.auth_headers(&api_key);
+
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            wit_llm_tools::Error::InvalidRequest(format!("Failed to serialize request body: {e}"))
+        })?;
+
+        tracing::info!(
+            module_id = ?self.module_id,
+            model = %model,
+            tool_count = req.tools.len(),
+            message_count = req.messages.len(),
+            "LLM tool-use completion request"
+        );
+
+        // 8. Send the HTTP request to the LLM provider.
+        // MCP-1213 (2026-05-18): single timeout over the full exchange
+        // (send + body read), bounded body read, sibling fix to the
+        // bare `complete` path above. See helper
+        // `read_llm_response_body_bounded` and constants
+        // `EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS` / `MAX_LLM_BODY_BYTES`.
+        //
+        // Local provider (Ollama) bypasses the guest SSRF resolver —
+        // mirrors `complete_impl` / `spawn_llm_stream`. Pre-2026-07-10
+        // this path used the SSRF-filtered per-execution client for ALL
+        // providers, so local tool-use died at connect with "Network
+        // error" (the RFC1918 filter blocks the in-cluster/host Ollama
+        // address). Masked pre-#456 because the tools wire itself was
+        // broken; found live-probing the fixed wire through real worker
+        // dispatch (the controller-embedded runtime's client resolves
+        // differently, so test_module alone could not catch it).
+        let client = if is_local_tools {
+            local_llm_http_client().clone()
+        } else {
+            self.http_client.clone()
+        };
+        // Local-LLM in-flight gate — sibling of the `complete_impl` site; see
+        // `crate::host::llm_gate`. Taken BEFORE the exchange timeout so queue
+        // time is not charged to a budget that measures one call's own service
+        // time. BOUND, never `_`: dropping the value releases the permit.
+        let _llm_slot_tools = if is_local_tools {
+            let (slot, waited) = crate::host::llm_gate::acquire_local_llm_slot(
+                self.inference_wait.as_deref(),
+                &model,
+            )
+            .await;
+            if let Some(ref m) = self.metrics {
+                m.record_llm_gate(slot.outcome_label(), waited.as_secs_f64() * 1000.0);
+            }
+            Some(slot)
+        } else {
+            None
+        };
+        let mut http_req_tools = client.post(&url).header("Content-Type", "application/json");
+        // Adapter-owned auth + protocol-version headers (empty for local
+        // providers). Values may embed the API key — never logged.
+        for (name, value) in &auth_headers {
+            http_req_tools = http_req_tools.header(*name, value);
+        }
+        let resp_bytes: Vec<u8> = if is_local_tools {
+            // RFC 0014 P1: bounded by PROGRESS, not one total clock.
+            super::llm_local_stream::exchange_local_stream(
+                http_req_tools.body(body_bytes),
+                super::llm_local_stream::ProgressDeadlines::LOCAL,
+                MAX_LLM_BODY_BYTES,
+            )
+            .await
+            .map_err(|e| {
+                // RFC 0014 P4a: which deadline fired reaches the retry decision.
+                if let super::llm_local_stream::LocalExchangeError::Timeout(kind) = &e {
+                    self.record_inference_timeout(*kind);
+                }
+                local_tools_exchange_failure(e)
+            })?
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS),
+                async move {
+                    let response = http_req_tools.body(body_bytes).send().await.map_err(|e| {
+                        tracing::error!(error = %e, "LLM tool-use API request failed");
+                        wit_llm_tools::Error::ApiError(format!("Network error: {e}"))
+                    })?;
+
+                    if !response.status().is_success() {
+                        let status = response.status().as_u16();
+                        tracing::warn!(status, "LLM tool-use API returned error status");
+                        if status == 429 {
+                            return Err(wit_llm_tools::Error::RateLimited);
+                        }
+                        let preview_bytes =
+                            read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                                .await
+                                .unwrap_or_default();
+                        let body_preview = String::from_utf8_lossy(&preview_bytes);
+                        let preview_truncated: String = body_preview.chars().take(500).collect();
+                        let preview_redacted = aegix_dlp_provider::redact_str(&preview_truncated);
+                        tracing::warn!(
+                            status,
+                            body_len = preview_bytes.len(),
+                            body_preview = %preview_redacted,
+                            "LLM tool-use API returned error"
+                        );
+                        return Err(wit_llm_tools::Error::ApiError(format!(
+                            "LLM API returned HTTP {status}"
+                        )));
+                    }
+
+                    read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                        .await
+                        .ok_or_else(|| {
+                            wit_llm_tools::Error::ApiError(format!(
+                                "LLM tool-use response exceeded {} bytes; aborted body read",
+                                MAX_LLM_BODY_BYTES
+                            ))
+                        })
+                },
+            )
+            .await
+            .map_err(|_| wit_llm_tools::Error::Timeout)??
+        };
+
+        // 9. Adapter-owned parse into canonical blocks. `arguments` is
+        //    ALWAYS the JSON string form here — the native-Ollama wire
+        //    returns an object and its adapter re-serializes it.
+        let parsed = adapter
+            .parse_tool_completion(&resp_bytes)
+            .map_err(wit_llm_tools::Error::ApiError)?;
+
+        // R2 token ledger: fold provider-reported usage into the per-job
+        // accumulator (drained into the signed JobResult at completion).
+        crate::context::record_llm_call(
+            &self.llm_usage,
+            crate::context::LlmCallRecord {
+                provider: adapter.name().to_string(),
+                model: model.clone(),
+                prompt_tokens: parsed.input_tokens,
+                completion_tokens: parsed.output_tokens,
+                stop_reason: parsed.stop_reason.clone(),
+                // This path does not time the exchange.
+                duration_ms: None,
+            },
+        );
+
+        // A local prompt Ollama silently truncated (see `complete_inner`).
+        if is_local_tools {
+            if let aegix_local_inference::context::PromptFit::Truncated {
+                evaluated,
+                context_length,
+            } = aegix_local_inference::context::check_prompt_fit(
+                local_llm_http_client(),
+                ollama_base_url(),
+                &model,
+                parsed.input_tokens,
+            )
+            .await
+            {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    model = %model,
+                    evaluated,
+                    context_length,
+                    "local LLM tool-call prompt truncated by Ollama; answer refused"
+                );
+                return Err(wit_llm_tools::Error::InvalidRequest(
+                    aegix_local_inference::context::truncation_message(
+                        &model,
+                        evaluated,
+                        context_length,
+                    ),
+                ));
+            }
+        }
+
+        let content_blocks: Vec<wit_llm_tools::ContentBlock> = parsed
+            .blocks
+            .into_iter()
+            .map(|b| match b {
+                llm_providers::ParsedToolBlock::Text(t) => wit_llm_tools::ContentBlock::Text(t),
+                llm_providers::ParsedToolBlock::ToolUse {
+                    call_id,
+                    tool_name,
+                    arguments,
+                } => wit_llm_tools::ContentBlock::ToolUse(wit_llm_tools::ToolCall {
+                    tool_name,
+                    call_id,
+                    arguments,
+                }),
+            })
+            .collect();
+
+        // MCP-1008: saturate-on-overflow; `usage` stays `None` when the
+        // provider sent no counts at all.
+        let usage = match (parsed.input_tokens, parsed.output_tokens) {
+            (None, None) => None,
+            (i, o) => Some(wit_llm_tools::TokenUsage {
+                input_tokens: u32::try_from(i.unwrap_or(0)).unwrap_or(u32::MAX),
+                output_tokens: u32::try_from(o.unwrap_or(0)).unwrap_or(u32::MAX),
+            }),
+        };
+
+        Ok(wit_llm_tools::ToolCompletionResponse {
+            content: content_blocks,
+            model,
+            usage,
+            stop_reason: parsed.stop_reason,
+        })
+    }
+}
+
+/// Map a local exchange's failure onto `llm-tools`' WIT error — the same
+/// classification as `llm::complete*` (RFC 0014 P1); the provider's own text
+/// is never returned to the guest.
+fn local_tools_exchange_failure(
+    e: super::llm_local_stream::LocalExchangeError,
+) -> wit_llm_tools::Error {
+    use super::llm_local_stream::LocalExchangeError as E;
+    match e {
+        E::Network(m) => wit_llm_tools::Error::ApiError(format!("Network error: {m}")),
+        E::Timeout(_) => wit_llm_tools::Error::Timeout,
+        E::RateLimited => wit_llm_tools::Error::RateLimited,
+        E::HttpStatus(status) => {
+            wit_llm_tools::Error::ApiError(format!("LLM API returned HTTP {status}"))
+        }
+        E::ProviderError => {
+            wit_llm_tools::Error::ApiError("LLM API reported an error mid-response".to_string())
+        }
+        E::Oversized => wit_llm_tools::Error::ApiError(format!(
+            "LLM tool-use response exceeded {MAX_LLM_BODY_BYTES} bytes; aborted body read"
+        )),
+        E::Decode(m) => wit_llm_tools::Error::ApiError(m),
+    }
+}

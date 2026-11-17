@@ -1,0 +1,1350 @@
+//! `llm` (completion) host interface plus shared LLM plumbing: local
+//! Ollama client, tier-decision policy, provider key lookup paths,
+//! bounded response reads, response parsing, `context-window` token
+//! estimation and the standalone `embedding` interface.
+
+use super::*;
+
+/// Cached Ollama base URL (read once from OLLAMA_URL env var).
+///
+/// MCP-630 (2026-05-12): treat `OLLAMA_URL=""` (a Helm placeholder
+/// pattern) as unset and fall through to the in-cluster default. Pre-fix
+/// the bare `unwrap_or_else(|_| default)` returned `""`, producing a
+/// base-URL-less `format!("{}/v1/chat/completions", "")` that failed at
+/// request time with a confusing url-parse error rather than using the
+/// default. Sibling to MCP-615/620/621/623 (empty-env-var class). The
+/// worker is credential-free and doesn't depend on `aegix-config`, so
+/// the helper is inlined here.
+pub(crate) fn ollama_base_url() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| {
+        std::env::var("OLLAMA_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://ollama:11434".to_string())
+    })
+}
+
+/// Dedicated HTTP client for LOCAL LLM-provider calls (Ollama).
+///
+/// The per-execution `self.http_client` carries the guest SSRF resolver, which
+/// filters private/RFC1918 IPs to stop a guest's `http::fetch` from reaching
+/// internal services. But the local LLM provider (Ollama) IS an internal service
+/// on a private IP (`ollama:11434` → 172.x), so routing the `llm::complete` call
+/// through that client makes a Tier-2 actor's local inference fail with
+/// "every resolved IP was filtered". The provider URL here is host-configured
+/// (`OLLAMA_URL`, fixed), NOT guest-supplied, and the per-provider tier ceiling
+/// is already enforced upstream by `decide_llm_tier_access` (Tier-1 ⇒ Ollama
+/// only), so this dedicated client safely bypasses the guest SSRF filter for the
+/// local provider only. Redirects are disabled so a compromised local endpoint
+/// can't bounce the request elsewhere. External providers keep using the
+/// SSRF-filtered `self.http_client`.
+pub(crate) fn local_llm_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Aegix-Worker/1.0")
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            // The whole point of this client is that it talks to the LOCAL
+            // provider; an `HTTPS_PROXY` on the pod would route the request
+            // — prompt included — off-host through the proxy.
+            .no_proxy()
+            .build()
+            .expect("worker: failed to build local-LLM reqwest client")
+    })
+}
+
+// Every test in the file counts through the rendered Prometheus exposition
+// (`get_prometheus_metrics`), which exists only with the crate's `prometheus`
+// feature; the workspace build (the worker binary turns it on) runs them.
+#[cfg(all(test, feature = "prometheus"))]
+#[path = "llm_failure_metrics_tests.rs"]
+mod llm_failure_metrics_tests;
+
+#[cfg(test)]
+mod llm_tier_decision_tests {
+    use super::{decide_llm_tier_access, LlmTierDecision};
+    use aegix_workflow_job_protocol::LlmTier;
+
+    #[test]
+    fn ollama_always_needs_no_key_regardless_of_tier() {
+        // Ollama is local — no vault lookup, no tier gate.
+        assert_eq!(
+            decide_llm_tier_access("ollama", LlmTier::Tier1),
+            LlmTierDecision::NoKeyNeeded
+        );
+        assert_eq!(
+            decide_llm_tier_access("ollama", LlmTier::Tier2),
+            LlmTierDecision::NoKeyNeeded
+        );
+    }
+
+    #[test]
+    fn tier1_refuses_every_external_provider() {
+        // The security contract: a tier-1 ceiling MUST block every
+        // non-Ollama provider. Adding a new external provider and
+        // forgetting to add a tier check here would regress privacy.
+        for provider in ["anthropic", "openai", "gemini", "future-provider"] {
+            assert_eq!(
+                decide_llm_tier_access(provider, LlmTier::Tier1),
+                LlmTierDecision::Refused,
+                "tier1 must refuse `{provider}`"
+            );
+        }
+    }
+
+    #[test]
+    fn tier2_allows_every_external_provider() {
+        for provider in ["anthropic", "openai", "gemini"] {
+            assert_eq!(
+                decide_llm_tier_access(provider, LlmTier::Tier2),
+                LlmTierDecision::Allowed,
+                "tier2 must allow `{provider}`"
+            );
+        }
+    }
+
+    #[test]
+    fn tier1_blocks_unknown_provider_conservatively() {
+        // Unknown providers under tier1 must be refused — `provider_tier`
+        // in job-protocol defaults unknown providers to Tier2 (external),
+        // so tier-1 actors should never reach them.
+        assert_eq!(
+            decide_llm_tier_access("cohere", LlmTier::Tier1),
+            LlmTierDecision::Refused
+        );
+    }
+
+    #[test]
+    fn default_tier_is_tier2() {
+        // Backward-compat default — existing workflows without an
+        // explicit ceiling continue to reach external providers.
+        let default_tier = LlmTier::default();
+        assert_eq!(
+            decide_llm_tier_access("anthropic", default_tier),
+            LlmTierDecision::Allowed,
+            "default tier must allow external providers for backward compat"
+        );
+    }
+}
+
+#[cfg(test)]
+mod external_llm_host_tests {
+    use aegix_workflow_job_protocol::{is_external_llm_host, is_tier2_llm_vault_path};
+
+    #[test]
+    fn canonical_llm_hosts_are_blocked() {
+        // The C3-bypass closers. If any of these return false, a
+        // tier-1 guest reaches that provider via wit_http::fetch and
+        // the privacy ceiling is broken.
+        for host in [
+            "api.anthropic.com",
+            "api.openai.com",
+            "generativelanguage.googleapis.com",
+            "aiplatform.googleapis.com",
+        ] {
+            assert!(
+                is_external_llm_host(host),
+                "{host} must be on the external-LLM deny list"
+            );
+        }
+    }
+
+    #[test]
+    fn region_subdomains_are_blocked() {
+        // Region subdomains (eu.api.openai.com, eu.api.anthropic.com)
+        // must also trigger — attackers can use them to reach the
+        // same provider via a regional endpoint.
+        assert!(is_external_llm_host("eu.api.openai.com"));
+        assert!(is_external_llm_host("us-east-1.api.anthropic.com"));
+        assert!(is_external_llm_host(
+            "us-central1.aiplatform.googleapis.com"
+        ));
+    }
+
+    #[test]
+    fn benign_hosts_are_not_blocked() {
+        // Obvious false-positive check — the deny-list must not
+        // accidentally catch user APIs.
+        for host in [
+            "api.example.com",
+            "httpbin.org",
+            "api.github.com",
+            "slack.com",
+            "api.notion.com",
+        ] {
+            assert!(
+                !is_external_llm_host(host),
+                "{host} must not be on the external-LLM deny list"
+            );
+        }
+    }
+
+    #[test]
+    fn case_insensitive_and_trailing_dot_safe() {
+        // Wasm-security review 2026-05-23: the helper now normalises
+        // both trailing-dot AND case at the matcher entry as
+        // defense-in-depth against an upstream caller forgetting
+        // to lowercase or strip the dot. Pre-fix the contract was
+        // "callers MUST pass lowercased / dot-stripped host";
+        // post-fix the contract is "matcher hardens what you give it"
+        // — same correctness, smaller surface for upstream regressions.
+        assert!(is_external_llm_host("api.anthropic.com"));
+        assert!(
+            is_external_llm_host("API.ANTHROPIC.COM"),
+            "matcher now lowercases internally (defense in depth)"
+        );
+        assert!(
+            is_external_llm_host("api.anthropic.com."),
+            "matcher now strips trailing dot (defense in depth)"
+        );
+        assert!(
+            is_external_llm_host("EU.API.OPENAI.COM."),
+            "matcher handles uppercase + trailing dot together"
+        );
+    }
+
+    #[test]
+    fn tier2_vault_paths_recognised() {
+        // Complements the host-deny-list: the vault:// header path
+        // must also refuse external LLM credentials for tier-1 jobs.
+        for path in ["anthropic/api_key", "openai/api_key", "gemini/api_key"] {
+            assert!(is_tier2_llm_vault_path(path));
+        }
+        assert!(!is_tier2_llm_vault_path("oauth/gmail/user/access_token"));
+        assert!(!is_tier2_llm_vault_path("my-app/secret"));
+    }
+}
+
+/// MCP-1008 (2026-05-15): saturating u64→u32 conversion for parsing
+/// LLM provider `input_tokens` / `output_tokens` fields out of the
+/// untrusted response JSON. Same defense-in-depth pattern as MCP-962
+/// closed for `workflow_chains` config — the legacy
+/// `.as_u64().unwrap_or(0) as u32` shape silently wraps any value
+/// above `u32::MAX` (~4.29 billion), producing under-counted token
+/// totals in metrics + cost-attribution dashboards.
+///
+/// A misbehaving / compromised LLM provider returning
+/// `input_tokens: 5_000_000_000` would have wrapped to ~705 M tokens,
+/// charging the user ~705 M tokens of cost-attribution for a request
+/// that actually consumed 5 B. Saturating to `u32::MAX` preserves the
+/// "something weird happened" signal — `u32::MAX` in a token-count
+/// dashboard is visibly absurd and triggers operator investigation.
+///
+/// Returns `default` when the JSON field is missing or wrong-typed
+/// (preserves the pre-fix behaviour for that case).
+pub(crate) fn json_token_count_as_u32(field: Option<&serde_json::Value>, default: u32) -> u32 {
+    match field.and_then(|v| v.as_u64()) {
+        Some(n) => u32::try_from(n).unwrap_or(u32::MAX),
+        None => default,
+    }
+}
+
+/// Map a local exchange's failure onto `llm::complete*`'s WIT error and
+/// `wasm_llm_failures_total` outcome. The classification is the one the
+/// non-streaming exchange used (RFC 0014 P1): an error line mid-stream is the
+/// same provider failure that arrived as an HTTP 500 before, and its text is
+/// never returned to the guest.
+fn local_exchange_failure(e: super::llm_local_stream::LocalExchangeError) -> LlmCallFailure {
+    use super::llm_local_stream::LocalExchangeError as E;
+    use crate::metrics::LlmFailure as F;
+    match e {
+        E::Network(m) => LlmCallFailure::new(
+            F::Network,
+            wit_llm::Error::ApiError(format!("Network error: {m}")),
+        ),
+        E::Timeout(_) => LlmCallFailure::new(F::Timeout, wit_llm::Error::Timeout),
+        E::RateLimited => LlmCallFailure::new(F::RateLimited, wit_llm::Error::RateLimited),
+        E::HttpStatus(status) => LlmCallFailure::new(
+            F::HttpStatus,
+            wit_llm::Error::ApiError(format!("LLM API returned HTTP {status}")),
+        ),
+        E::ProviderError => LlmCallFailure::new(
+            F::HttpStatus,
+            wit_llm::Error::ApiError("LLM API reported an error mid-response".to_string()),
+        ),
+        E::Oversized => LlmCallFailure::new(
+            F::OversizedResponse,
+            wit_llm::Error::ApiError(format!(
+                "LLM response exceeded {MAX_LLM_BODY_BYTES} bytes; aborted body read"
+            )),
+        ),
+        E::Decode(m) => LlmCallFailure::new(F::Decode, wit_llm::Error::ApiError(m)),
+    }
+}
+
+/// MCP-1213 (2026-05-18): bounded-body read for LLM responses.
+/// Streams chunks from `response.bytes_stream()` until either the body
+/// completes or `max_bytes` is exceeded.  Returns `Some(body_bytes)`
+/// on success, `None` if the body exceeds the cap (caller decides how
+/// to surface — typically as `ApiError`).
+///
+/// Pre-fix `response.json()` / `response.text()` had no size limit:
+/// a 1 GB body from a misbehaving / compromised provider would buffer
+/// in worker memory, OOMing the pod. This helper paired with an
+/// outer `tokio::time::timeout` over the WHOLE exchange replaces both
+/// `.json()` and `.text()` at the LLM call sites — bytes-then-parse
+/// is a wider-net pattern that catches both the size class AND the
+/// hang class in a single helper.
+pub(crate) async fn read_llm_response_body_bounded(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    use futures_util::StreamExt;
+    let content_length = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    // Pre-allocate at the smaller of (Content-Length, max_bytes) — saves
+    // allocator churn on legitimate responses (typical 1-100 KiB) while
+    // refusing to honour a hostile Content-Length larger than the cap.
+    let capacity = std::cmp::min(content_length, max_bytes);
+    let mut buf = Vec::with_capacity(capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.ok()?;
+        if buf.len() + chunk.len() > max_bytes {
+            tracing::warn!(
+                limit = max_bytes,
+                buffered = buf.len(),
+                chunk_size = chunk.len(),
+                "LLM response exceeded size cap; aborting body read"
+            );
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
+}
+
+/// Canonical (vault-path, env-var-name) tuple for each LLM provider.
+/// Returns `None` for Ollama (no key required) or unknown providers.
+pub(crate) fn llm_key_lookup_paths(provider: &str) -> Option<(&'static str, &'static str)> {
+    match provider.to_ascii_lowercase().as_str() {
+        "anthropic" => Some(("anthropic/api_key", "ANTHROPIC_API_KEY")),
+        "openai" => Some(("openai/api_key", "OPENAI_API_KEY")),
+        "gemini" => Some(("gemini/api_key", "GEMINI_API_KEY")),
+        _ => None,
+    }
+}
+
+/// Outcome of the tier-ceiling check for an `llm::*` host call.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LlmTierDecision {
+    /// Provider is `ollama` — no key needed, always allowed.
+    NoKeyNeeded,
+    /// External provider allowed by the ceiling.
+    Allowed,
+    /// External provider blocked by a Tier-1 ceiling. Caller MUST NOT
+    /// resolve any vault or env value for this provider.
+    Refused,
+}
+
+/// Pure, testable tier check. Returns the decision for `(provider, ceiling)`
+/// without touching vault or env. The live `get_llm_api_key` uses this,
+/// as do the tier-enforcement tests.
+pub(crate) fn decide_llm_tier_access(
+    provider_lower: &str,
+    ceiling: aegix_workflow_job_protocol::LlmTier,
+) -> LlmTierDecision {
+    if provider_lower == "ollama" {
+        return LlmTierDecision::NoKeyNeeded;
+    }
+    match ceiling {
+        aegix_workflow_job_protocol::LlmTier::Tier1 => LlmTierDecision::Refused,
+        aegix_workflow_job_protocol::LlmTier::Tier2 => LlmTierDecision::Allowed,
+        // `LlmTier` is `#[non_exhaustive]` upstream. Fail-closed for any
+        // future variant — we'd rather refuse than silently allow data
+        // egress to a yet-unclassified provider tier.
+        _ => LlmTierDecision::Refused,
+    }
+}
+
+/// Why an external provider's key was not handed back.
+///
+/// `get_llm_api_key*` answers `None` both when the actor's ceiling refused the
+/// provider and when no key exists, and every caller used to render the second
+/// meaning ("set vault path …") for both — so a tier-1 actor calling Anthropic
+/// was told to add a key, the one remedy that must not be taken. The ceiling
+/// decision is the pure [`decide_llm_tier_access`], so the caller can recover
+/// the reason exactly, without a second lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LlmKeyUnavailable {
+    /// The actor's `max_llm_tier` forbids this external provider.
+    CeilingRefused { provider: String },
+    /// No key is configured for the provider.
+    Missing {
+        vault_path: &'static str,
+        env_name: &'static str,
+    },
+}
+
+impl LlmKeyUnavailable {
+    /// Classify a `None` from `get_llm_api_key*` for `provider` under `ceiling`.
+    pub(crate) fn classify(provider: &str, ceiling: aegix_workflow_job_protocol::LlmTier) -> Self {
+        let lower = provider.to_ascii_lowercase();
+        if decide_llm_tier_access(&lower, ceiling) == LlmTierDecision::Refused {
+            return Self::CeilingRefused { provider: lower };
+        }
+        let (vault_path, env_name) =
+            llm_key_lookup_paths(&lower).unwrap_or(("<unknown>", "<unknown>"));
+        Self::Missing {
+            vault_path,
+            env_name,
+        }
+    }
+
+    /// The sentence handed to the guest. Each names the remedy that applies.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::CeilingRefused { provider } => format!(
+                "LLM provider `{provider}` is external, and this actor's max_llm_tier is tier1 \
+                 (data must not leave the host), so no key was resolved. Use provider `ollama` \
+                 with a locally pulled model, or raise the actor's ceiling with \
+                 set_actor_llm_tier_ceiling."
+            ),
+            Self::Missing {
+                vault_path,
+                env_name,
+            } => format!(
+                "LLM API key not configured. Set vault path `{vault_path}` in the dashboard \
+                 (Settings → Secrets), or export {env_name} in the worker environment as a \
+                 fallback."
+            ),
+        }
+    }
+}
+
+impl AegixContext {
+    /// The guest-facing sentence for a `None` from `get_llm_api_key*`, logging
+    /// a missing key. A ceiling refusal is NOT logged again here: the key
+    /// lookup already recorded it (capability denial + WARN) where it refused.
+    pub(crate) fn llm_key_unavailable_message(&self, provider: &str) -> String {
+        let why = LlmKeyUnavailable::classify(provider, self.max_llm_tier);
+        if let LlmKeyUnavailable::Missing {
+            vault_path,
+            env_name,
+        } = &why
+        {
+            tracing::warn!(
+                vault_path = %aegix_workflow_job_protocol::redact_vault_path_for_log(vault_path),
+                env_name,
+                module_id = ?self.module_id,
+                "LLM API key not configured"
+            );
+        }
+        why.message()
+    }
+}
+
+/// The provider name a cloud-served Ollama model is judged as by
+/// [`decide_llm_tier_access`]: an EXTERNAL provider, so a tier-1 ceiling
+/// refuses it and a tier-2 one allows it — the same answer, from the same
+/// function, as Anthropic or OpenAI.
+pub(crate) const OLLAMA_CLOUD_PROVIDER: &str = "ollama-cloud";
+
+/// Longest model name recorded in a denial target. The name is guest-supplied.
+const MAX_MODEL_TARGET_CHARS: usize = 128;
+
+/// Why a local-Ollama call was refused before it was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalModelRefusal {
+    /// The model is served off the host (an Ollama cloud model).
+    Remote { host: String },
+    /// Ollama's listing does not contain the model, so the gate cannot vouch
+    /// for where it runs.
+    Unlisted,
+    /// The listing could not be read.
+    Unreadable(String),
+}
+
+impl LocalModelRefusal {
+    /// The `policy` field of the capability denial.
+    pub(crate) fn policy(&self) -> &'static str {
+        match self {
+            Self::Remote { .. } => "tier1-llm-egress",
+            Self::Unlisted | Self::Unreadable(_) => "tier1-llm-locality-unverified",
+        }
+    }
+
+    /// The guest-visible sentence. Names the model and the rule; never a URL
+    /// or response body.
+    pub(crate) fn message(&self, model: &str) -> String {
+        let model = bounded_model_target(model);
+        match self {
+            Self::Remote { host } => format!(
+                "Ollama model `{model}` is served by {host}, not on this host, and this actor's \
+                 max_llm_tier is tier1 (data must not leave the host). Use a model whose weights \
+                 are pulled locally, or raise the actor's ceiling with set_actor_llm_tier_ceiling."
+            ),
+            Self::Unlisted => format!(
+                "Ollama model `{model}` is not in the local Ollama's model list, so a tier1 actor \
+                 cannot be shown to keep its data on this host. Pull the model locally, or check \
+                 the model name."
+            ),
+            Self::Unreadable(reason) => format!(
+                "Refusing Ollama model `{model}` for a tier1 actor: {reason}, so the model cannot \
+                 be shown to run on this host. Retry once Ollama is reachable."
+            ),
+        }
+    }
+}
+
+fn bounded_model_target(model: &str) -> String {
+    model.trim().chars().take(MAX_MODEL_TARGET_CHARS).collect()
+}
+
+/// Whether `ceiling` requires a local-Ollama call's model to be proven local.
+///
+/// False exactly when [`decide_llm_tier_access`] would allow an EXTERNAL
+/// provider (tier-2): a cloud model there is an external provider the actor
+/// may already use. Any other ceiling, including a future unclassified one,
+/// requires proof — the same fail-closed direction as that function.
+pub(crate) fn ceiling_requires_local_model(ceiling: aegix_workflow_job_protocol::LlmTier) -> bool {
+    decide_llm_tier_access(OLLAMA_CLOUD_PROVIDER, ceiling) != LlmTierDecision::Allowed
+}
+
+/// What a locality answer means for a call that must stay local: `None` = send.
+pub(crate) fn local_model_refusal(
+    locality: Result<
+        aegix_local_inference::locality::ModelLocality,
+        aegix_local_inference::locality::LocalityUnreadable,
+    >,
+) -> Option<LocalModelRefusal> {
+    use aegix_local_inference::locality::ModelLocality;
+    match locality {
+        Ok(ModelLocality::Local) => None,
+        Ok(ModelLocality::Remote { host }) => Some(LocalModelRefusal::Remote { host }),
+        Ok(ModelLocality::Unlisted) => Some(LocalModelRefusal::Unlisted),
+        Err(e) => Some(LocalModelRefusal::Unreadable(e.0)),
+    }
+}
+
+impl AegixContext {
+    /// Admission for every worker call to the LOCAL Ollama: a tier-1 actor's
+    /// call is sent only when the model provably runs on this host.
+    ///
+    /// Called by all four local paths — `complete*` (via `complete_inner`),
+    /// `complete-with-tools`, `start-stream` and `start-tool-stream` — before
+    /// the local-inference gate is taken, so a refused call never queues.
+    /// On refusal it records a capability denial (`capability` names the
+    /// surface, `target` the bounded model name) and returns the sentence the
+    /// caller hands the guest.
+    pub(crate) async fn admit_local_model(
+        &mut self,
+        capability: &'static str,
+        model: &str,
+    ) -> Result<(), String> {
+        if !ceiling_requires_local_model(self.max_llm_tier) {
+            return Ok(());
+        }
+        let locality = aegix_local_inference::locality::model_locality(
+            local_llm_http_client(),
+            ollama_base_url(),
+            model,
+        )
+        .await;
+        let Some(refusal) = local_model_refusal(locality) else {
+            return Ok(());
+        };
+        let target = bounded_model_target(model);
+        self.record_capability_denied(capability, refusal.policy(), &target)
+            .await;
+        tracing::warn!(
+            module_id = ?self.module_id,
+            model = %target,
+            policy = refusal.policy(),
+            "tier-1 actor's local LLM call refused: model not proven local"
+        );
+        Err(refusal.message(model))
+    }
+}
+
+// ============================================================================
+// LLM
+// ============================================================================
+
+/// Structured-output mode for `complete_impl` — `Off` for plain
+/// `complete`, `On(schema)` for `complete_json` (adapters own the
+/// provider-specific spelling: OpenAI `response_format`, native Ollama
+/// `format`, Gemini `generationConfig.responseMimeType`; Anthropic has
+/// no knob and degrades to prompt-level JSON).
+enum JsonMode {
+    Off,
+    On(Option<String>),
+}
+
+impl wit_llm::Host for AegixContext {
+    #[::tracing::instrument(name = "llm.complete", skip_all)]
+    async fn complete(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        self.host_call("llm::complete");
+        self.complete_impl(req, JsonMode::Off, None).await
+    }
+
+    /// Structured-output completion — see the WIT doc on `complete-json`.
+    /// `json_schema = None` → JSON mode (valid JSON, any shape);
+    /// `Some(schema)` → response constrained to that JSON Schema. Each
+    /// provider adapter owns its structured-output spelling; Anthropic
+    /// has none and behaves like `complete`.
+    #[::tracing::instrument(name = "llm.complete_json", skip_all)]
+    async fn complete_json(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        json_schema: Option<String>,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        self.host_call("llm::complete-json");
+        self.complete_impl(req, JsonMode::On(json_schema), None)
+            .await
+    }
+
+    /// Flexible provider-feature passthrough — see the WIT doc on
+    /// `complete-with-options`. Parses `options` into a JSON object and
+    /// merges it into the outbound provider body (guardrailed in
+    /// `complete_impl`). A missing/empty `options` is equivalent to
+    /// `complete`; a malformed or non-object `options` is a hard
+    /// `invalid-request` (the caller set it explicitly and expects it to
+    /// apply).
+    #[::tracing::instrument(name = "llm.complete_with_options", skip_all)]
+    async fn complete_with_options(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        options: Option<String>,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        self.host_call("llm::complete-with-options");
+        // One rule for what `options` may be, shared with the operator's
+        // `local_llm_complete` tool (`crate::provider_options`).
+        let extra = crate::provider_options::parse_provider_options(options.as_deref())
+            .map_err(wit_llm::Error::InvalidRequest)?
+            .map(serde_json::Value::Object);
+        self.complete_impl(req, JsonMode::Off, extra).await
+    }
+}
+
+/// Metric/adapter label for a WIT provider. Total over the closed enum, so
+/// `normalize_llm_provider`'s `"other"` fold is unreachable from here.
+pub(crate) const fn llm_provider_label(provider: wit_llm::Provider) -> &'static str {
+    match provider {
+        wit_llm::Provider::Anthropic => "anthropic",
+        wit_llm::Provider::Openai => "openai",
+        wit_llm::Provider::Gemini => "gemini",
+        wit_llm::Provider::Ollama => "ollama",
+    }
+}
+
+/// An exit from `complete_inner` that did not produce a completion: the
+/// guest-visible `wit_llm::Error` plus the closed metric outcome for it.
+///
+/// The pairing is the point. Before 2026-08-14 `complete_impl` returned
+/// `wit_llm::Error` directly and the only metric call sat below every early
+/// return, so every failure exit incremented nothing. **Nine exits, not the
+/// eight the grounding note counted** — the eight call failures below, plus the
+/// pre-flight cancellation abort, which was excluded there because it already
+/// had a metric of its own (`wasm_executions_cancelled_total`). It is counted
+/// here as well so that `llm_requests + llm_failures` has no unaccounted gap.
+///
+/// Classifying from the error variant afterwards would not have fixed it — four
+/// distinct outcomes (network, non-2xx, oversized body, decode) all surface as
+/// `Error::ApiError(String)`, and the only thing separating them is a
+/// provider-supplied string that must never reach a Prometheus label.
+///
+/// Carrying the outcome out of the site that knows it makes the classification
+/// exhaustive BY CONSTRUCTION: `complete_inner`'s error type is this struct, so
+/// a new early return cannot be added without naming an `LlmFailure`. That is a
+/// compiler guarantee, not a code-review one.
+struct LlmCallFailure {
+    outcome: crate::metrics::LlmFailure,
+    error: wit_llm::Error,
+}
+
+impl LlmCallFailure {
+    fn new(outcome: crate::metrics::LlmFailure, error: wit_llm::Error) -> Self {
+        Self { outcome, error }
+    }
+}
+
+impl AegixContext {
+    /// Shared completion kernel behind `complete` (no overlay),
+    /// `complete_json` (structured-output overlay), and
+    /// `complete_with_options` (arbitrary provider-options overlay).
+    ///
+    /// This wrapper owns exactly one concern: turning every non-success exit of
+    /// `complete_inner` into a `wasm_llm_failures_total` increment before
+    /// handing the error back to the guest unchanged. All the logic is in
+    /// `complete_inner`.
+    async fn complete_impl(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        json_mode: JsonMode,
+        extra_options: Option<serde_json::Value>,
+    ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        // Resolved HERE, above everything that can fail, so that even the
+        // pre-flight cancellation exit — which returns before the provider is
+        // otherwise needed — carries a real provider label instead of an
+        // "unknown" bucket. Both lines are pure; hoisting them changes no
+        // behaviour.
+        let provider = req.provider.unwrap_or(wit_llm::Provider::Anthropic);
+        let provider_label = llm_provider_label(provider);
+
+        match self
+            .complete_inner(req, provider, provider_label, json_mode, extra_options)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(LlmCallFailure { outcome, error }) => {
+                if let Some(ref m) = self.metrics {
+                    m.record_llm_failure(provider_label, outcome);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Provider-INDEPENDENT concerns live here in exactly one place —
+    /// tier gate, key resolution, SSRF client selection, timeouts,
+    /// bounded body read, metrics — while every wire format (body shape,
+    /// structured-output spelling, options guardrails, response parse)
+    /// is delegated to the provider's `llm_providers::ProviderAdapter`.
+    async fn complete_inner(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        provider: wit_llm::Provider,
+        provider_label: &'static str,
+        json_mode: JsonMode,
+        extra_options: Option<serde_json::Value>,
+    ) -> Result<wit_llm::CompletionResponse, LlmCallFailure> {
+        // Check cancellation before making an expensive API call.
+        if self.is_cancelled() {
+            tracing::info!(module_id = ?self.module_id, "Execution cancelled");
+            if let Some(ref m) = self.metrics {
+                m.record_execution_cancelled();
+            }
+            return Err(LlmCallFailure::new(
+                crate::metrics::LlmFailure::Cancelled,
+                wit_llm::Error::BudgetExhausted,
+            ));
+        }
+
+        let llm_start = std::time::Instant::now();
+
+        // Ollama (Tier 1) runs locally and needs no API key.
+        let is_local = matches!(provider, wit_llm::Provider::Ollama);
+
+        let api_key = if is_local {
+            String::new()
+        } else {
+            match self.get_llm_api_key(provider).await {
+                Some(k) => k,
+                None => {
+                    // Also the Tier-1-refusal exit: `get_llm_api_key` returns
+                    // `None` for a ceiling denial too. The MESSAGE tells the
+                    // two apart (`LlmKeyUnavailable`); the metric label
+                    // deliberately does not — see `LlmFailure::NotConfigured`.
+                    let msg = self.llm_key_unavailable_message(provider_label);
+                    return Err(LlmCallFailure::new(
+                        crate::metrics::LlmFailure::NotConfigured,
+                        wit_llm::Error::NotConfigured(msg),
+                    ));
+                }
+            }
+        };
+
+        let adapter = llm_providers::adapter_for(provider_label);
+
+        let model = req.model.unwrap_or_else(|| match provider {
+            wit_llm::Provider::Anthropic => "claude-sonnet-4-20250514".to_string(),
+            wit_llm::Provider::Openai => "gpt-4o".to_string(),
+            wit_llm::Provider::Gemini => "gemini-1.5-pro".to_string(),
+            wit_llm::Provider::Ollama => "mistral".to_string(),
+        });
+
+        // A tier-1 actor's local call must reach a model that runs HERE: an
+        // Ollama cloud model forwards the prompt off the host.
+        if is_local {
+            if let Err(msg) = self.admit_local_model("llm-local-model", &model).await {
+                return Err(LlmCallFailure::new(
+                    crate::metrics::LlmFailure::NotConfigured,
+                    wit_llm::Error::NotConfigured(msg),
+                ));
+            }
+        }
+
+        // Canonical messages — each adapter owns its wire role mapping
+        // (e.g. Anthropic folds System into `user` + a top-level `system`
+        // field; Gemini calls the assistant `model`).
+        let messages: Vec<llm_providers::ChatMessage> = req
+            .messages
+            .iter()
+            .map(|msg| llm_providers::ChatMessage {
+                role: match msg.role {
+                    wit_llm::Role::System => llm_providers::ChatRole::System,
+                    wit_llm::Role::User => llm_providers::ChatRole::User,
+                    wit_llm::Role::Assistant => llm_providers::ChatRole::Assistant,
+                },
+                content: msg.content.clone(),
+            })
+            .collect();
+
+        let mut body = adapter.build_completion_body(&llm_providers::CompletionParams {
+            model: &model,
+            messages: &messages,
+            system_prompt: req.system_prompt.as_deref(),
+            max_tokens: req.max_tokens.unwrap_or(4096),
+            temperature: req.temperature,
+        });
+
+        // Structured-output constraint (from complete_json) — the adapter
+        // owns the spelling (`response_format` / `format` /
+        // `generationConfig`); Anthropic has none and degrades to
+        // prompt-level JSON, exactly like `complete`.
+        if let JsonMode::On(ref schema) = json_mode {
+            adapter.apply_response_format(&mut body, schema.as_deref());
+        }
+
+        // Flexible provider-feature passthrough (from complete_with_options).
+        // The adapter merges the caller-supplied options object, then
+        // re-asserts the fields that carry prompt integrity + transport
+        // correctness. Net effect: options can only TUNE the request (seed,
+        // top_p, stop, think, num_ctx, …) — they can never replace the
+        // SPOTLIGHTING-wrapped prompt or switch on streaming. Auth + URL live
+        // in headers / worker config and are never in the body, so options
+        // can't reach them.
+        if let Some(serde_json::Value::Object(opts)) = extra_options {
+            adapter.apply_provider_options(&mut body, opts);
+        }
+        // RFC 0014 P1: a LOCAL exchange streams, so it can be bounded by
+        // progress instead of a total clock. The host decides this after the
+        // options merge, never the guest; the chunks are reassembled into the
+        // single-shot body before the adapter parses it.
+        if is_local {
+            super::llm_local_stream::request_streaming(&mut body);
+        }
+
+        let url = adapter.completion_url(&model);
+        let auth_headers = adapter.auth_headers(&api_key);
+
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            LlmCallFailure::new(
+                crate::metrics::LlmFailure::InvalidRequest,
+                wit_llm::Error::InvalidRequest(format!("Failed to serialize request body: {e}")),
+            )
+        })?;
+        tracing::info!(
+            module_id = ?self.module_id,
+            model = %model,
+            provider = provider_label,
+            message_count = req.messages.len(),
+            "LLM completion request"
+        );
+
+        // Local provider (Ollama) bypasses the guest SSRF resolver — see
+        // local_llm_http_client(). External providers keep the SSRF-filtered
+        // per-execution client (public IPs, retains the guest egress gate).
+        let client = if is_local {
+            local_llm_http_client().clone()
+        } else {
+            self.http_client.clone()
+        };
+        // MCP-1213 (2026-05-18): one timeout for the FULL exchange
+        // (send + body read), not just `.send()`. Pre-fix the outer
+        // timeout wrapped only header receipt — once headers arrived,
+        // `.json()` / `.text()` could hang indefinitely on a slow
+        // body stream. Real prod symptom: daily-brief synthesize hung
+        // 5+ minutes after the MCP-1212 re-sign fix unmasked it.
+        // Local-LLM in-flight gate. Taken BEFORE the exchange deadlines start,
+        // which is the entire point: the exchange's deadlines (then one 60 s
+        // total, now RFC 0014's progress deadlines) bound ONE call's own
+        // service time, and while this
+        // worker could issue unbounded simultaneous requests to a backend that
+        // serves them one at a time it was nothing of the sort — a call could
+        // spend the whole 60 s waiting for somebody else's inference and time
+        // out having been sent nothing. See `crate::host::llm_gate` for the
+        // measured queueing curve and for why the gate queues rather than
+        // refuses. `_llm_slot` is BOUND, never `_`: the permit is released on
+        // drop, so `let _ = …` would hold the slot for zero time and gate
+        // nothing.
+        let _llm_slot = if is_local {
+            let (slot, waited) = crate::host::llm_gate::acquire_local_llm_slot(
+                self.inference_wait.as_deref(),
+                &model,
+            )
+            .await;
+            if let Some(ref m) = self.metrics {
+                m.record_llm_gate(slot.outcome_label(), waited.as_secs_f64() * 1000.0);
+            }
+            Some(slot)
+        } else {
+            None
+        };
+        let mut http_req = client.post(&url).header("Content-Type", "application/json");
+        // Adapter-owned auth + protocol-version headers (empty for local
+        // providers). Values may embed the API key — never logged.
+        for (name, value) in &auth_headers {
+            http_req = http_req.header(*name, value);
+        }
+        let resp_bytes: Vec<u8> = if is_local {
+            // RFC 0014 P1: bounded by PROGRESS (first byte, then between
+            // chunks, under a ceiling) rather than one total clock.
+            super::llm_local_stream::exchange_local_stream(
+                http_req.body(body_bytes),
+                super::llm_local_stream::ProgressDeadlines::LOCAL,
+                MAX_LLM_BODY_BYTES,
+            )
+            .await
+            .map_err(|e| {
+                // RFC 0014 P4a: which deadline fired reaches the retry decision.
+                if let super::llm_local_stream::LocalExchangeError::Timeout(kind) = &e {
+                    self.record_inference_timeout(*kind);
+                }
+                local_exchange_failure(e)
+            })?
+        } else {
+            tokio::time::timeout(
+            std::time::Duration::from_secs(EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS),
+            async move {
+                let response = http_req
+                    .body(body_bytes)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, provider = provider_label, "LLM API request failed");
+                        LlmCallFailure::new(
+                            crate::metrics::LlmFailure::Network,
+                            wit_llm::Error::ApiError(format!("Network error: {e}")),
+                        )
+                    })?;
+
+                if !response.status().is_success() {
+                    let status = response.status().as_u16();
+                    tracing::warn!(status, "LLM API returned error status");
+                    if status == 429 {
+                        return Err(LlmCallFailure::new(
+                            crate::metrics::LlmFailure::RateLimited,
+                            wit_llm::Error::RateLimited,
+                        ));
+                    }
+                    // MCP-528 + MCP-1213: DLP-scrub the body preview AND
+                    // bound it by MAX_LLM_BODY_BYTES. Pre-fix `.text()`
+                    // had no size limit — a misbehaving provider could
+                    // stream multi-GB error bodies into worker memory.
+                    let preview_bytes = read_llm_response_body_bounded(
+                        response,
+                        MAX_LLM_BODY_BYTES,
+                    )
+                    .await
+                    .unwrap_or_default();
+                    let body_preview = String::from_utf8_lossy(&preview_bytes);
+                    let preview_truncated: String =
+                        body_preview.chars().take(500).collect();
+                    let preview_redacted =
+                        aegix_dlp_provider::redact_str(&preview_truncated);
+                    tracing::warn!(
+                        status,
+                        body_len = preview_bytes.len(),
+                        body_preview = %preview_redacted,
+                        "LLM API returned error"
+                    );
+                    return Err(LlmCallFailure::new(
+                        crate::metrics::LlmFailure::HttpStatus,
+                        wit_llm::Error::ApiError(format!("LLM API returned HTTP {status}")),
+                    ));
+                }
+
+                // MCP-1213: bounded streaming body read, NOT unbounded
+                // `.json()`. Caps response at MAX_LLM_BODY_BYTES. Parsing
+                // happens OUTSIDE the timeout closure — the bytes are in
+                // memory at that point, so parse time isn't network time.
+                read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+                    .await
+                    .ok_or_else(|| {
+                        LlmCallFailure::new(
+                            crate::metrics::LlmFailure::OversizedResponse,
+                            wit_llm::Error::ApiError(format!(
+                                "LLM response exceeded {} bytes; aborted body read",
+                                MAX_LLM_BODY_BYTES
+                            )),
+                        )
+                    })
+            },
+        )
+        .await
+        .map_err(|_| {
+            LlmCallFailure::new(crate::metrics::LlmFailure::Timeout, wit_llm::Error::Timeout)
+        })??
+        };
+
+        // Typed, adapter-owned parse (2026-05-28 audit Perf#1 lineage:
+        // format-specific serde structs, no full `Value` tree). The
+        // adapter error is a plain description — wrap, never echo bodies.
+        let parsed = adapter.parse_completion(&resp_bytes).map_err(|e| {
+            LlmCallFailure::new(
+                crate::metrics::LlmFailure::Decode,
+                wit_llm::Error::ApiError(e),
+            )
+        })?;
+
+        // R2 token ledger: fold provider-reported usage into the per-job
+        // accumulator (drained into the signed JobResult at completion).
+        // The call is also kept, in order, with the provider's own reason for
+        // stopping: a module that asked for JSON and got nothing back needs
+        // to see that the SECOND of its two calls stopped for `length`.
+        crate::context::record_llm_call(
+            &self.llm_usage,
+            crate::context::LlmCallRecord {
+                provider: adapter.name().to_string(),
+                model: model.clone(),
+                prompt_tokens: parsed.input_tokens,
+                completion_tokens: parsed.output_tokens,
+                stop_reason: parsed.stop_reason.clone(),
+                duration_ms: Some(
+                    u64::try_from(llm_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
+            },
+        );
+
+        // A local prompt Ollama silently truncated to fit the loaded context:
+        // the answer was written without the prompt's start (the system
+        // prompt). Checked AFTER the usage fold — those tokens were spent.
+        if is_local {
+            if let aegix_local_inference::context::PromptFit::Truncated {
+                evaluated,
+                context_length,
+            } = aegix_local_inference::context::check_prompt_fit(
+                local_llm_http_client(),
+                ollama_base_url(),
+                &model,
+                parsed.input_tokens,
+            )
+            .await
+            {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    model = %model,
+                    evaluated,
+                    context_length,
+                    "local LLM prompt truncated by Ollama; answer refused"
+                );
+                return Err(LlmCallFailure::new(
+                    crate::metrics::LlmFailure::PromptTruncated,
+                    wit_llm::Error::InvalidRequest(
+                        aegix_local_inference::context::truncation_message(
+                            &model,
+                            evaluated,
+                            context_length,
+                        ),
+                    ),
+                ));
+            }
+        }
+
+        let text = parsed.text;
+        let stop_reason = parsed.stop_reason;
+        // MCP-1008: saturate-on-overflow to surface malicious / corrupted
+        // provider responses as visible spikes. `usage` is `None` when
+        // BOTH counts are absent — a deliberate (small) change from the
+        // pre-trait code, which mapped a bare `"usage": {}` to
+        // `Some({0,0})` and recorded fake zero-token metric samples;
+        // `None` = "unknown" is the faithful WIT `option<token-usage>`
+        // encoding. Real providers always send both counts non-streaming.
+        let usage = match (parsed.input_tokens, parsed.output_tokens) {
+            (None, None) => None,
+            (i, o) => Some(wit_llm::TokenUsage {
+                input_tokens: u32::try_from(i.unwrap_or(0)).unwrap_or(u32::MAX),
+                output_tokens: u32::try_from(o.unwrap_or(0)).unwrap_or(u32::MAX),
+            }),
+        };
+        if let Some(ref m) = self.metrics {
+            let duration_ms = llm_start.elapsed().as_millis() as f64;
+            m.record_llm_request(provider_label, duration_ms);
+            if let Some(ref u) = usage {
+                m.record_llm_tokens("input", u.input_tokens as u64);
+                m.record_llm_tokens("output", u.output_tokens as u64);
+            }
+        }
+
+        Ok(wit_llm::CompletionResponse {
+            text,
+            model,
+            usage,
+            stop_reason,
+        })
+    }
+}
+
+// ============================================================================
+// Context Window (token estimation)
+// ============================================================================
+
+impl wit_context_window::Host for AegixContext {
+    async fn estimate_tokens(&mut self, text: String, model: Option<String>) -> u32 {
+        self.host_call("context-window::estimate-tokens");
+        // Model-aware token estimation using character-class heuristics.
+        // More accurate than naive len/4 -- handles code, CJK, and whitespace.
+
+        let model_name = model.as_deref().unwrap_or("claude-sonnet-4-20250514");
+
+        // Count different character classes for weighted estimation
+        let mut ascii_words = 0u32;
+        let mut cjk_chars = 0u32;
+        let mut code_tokens = 0u32;
+        let mut other_chars = 0u32;
+        let mut in_word = false;
+
+        for ch in text.chars() {
+            if ch.is_ascii_whitespace() {
+                if in_word {
+                    ascii_words += 1;
+                    in_word = false;
+                }
+            } else if ch.is_ascii_alphanumeric() {
+                in_word = true;
+            } else if ('\u{4e00}'..='\u{9fff}').contains(&ch)
+                || ('\u{3400}'..='\u{4dbf}').contains(&ch)
+            {
+                // CJK characters: roughly 1 token each
+                cjk_chars += 1;
+                if in_word {
+                    ascii_words += 1;
+                    in_word = false;
+                }
+            } else if "{}[]()=><;:,.!?+-*/&|^~#@$%\\\"'`".contains(ch) {
+                code_tokens += 1;
+                if in_word {
+                    ascii_words += 1;
+                    in_word = false;
+                }
+            } else {
+                other_chars += 1;
+            }
+        }
+        if in_word {
+            ascii_words += 1;
+        }
+
+        // Weighted estimation:
+        // - English words: ~1.3 tokens per word (BPE splits some words)
+        // - CJK characters: ~1 token each
+        // - Code punctuation: ~1 token per 1-2 chars
+        // - Other: ~0.5 tokens per char
+        let estimate = (ascii_words as f64 * 1.3)
+            + (cjk_chars as f64)
+            + (code_tokens as f64 * 0.7)
+            + (other_chars as f64 * 0.5);
+
+        // Apply model-specific multiplier (GPT models tokenize slightly differently)
+        let multiplier = if model_name.contains("gpt") { 1.1 } else { 1.0 };
+
+        (estimate * multiplier).ceil() as u32
+    }
+
+    async fn get_context_info(&mut self, model: Option<String>) -> wit_context_window::ContextInfo {
+        self.host_call("context-window::get-context-info");
+        let model_name = model.as_deref().unwrap_or("claude-sonnet-4-20250514");
+
+        // Model-specific context windows
+        let max_tokens = if model_name.contains("claude-3")
+            || model_name.contains("claude-sonnet-4")
+            || model_name.contains("claude-opus-4")
+        {
+            200_000
+        } else if model_name.contains("gpt-4o") || model_name.contains("gpt-4-turbo") {
+            128_000
+        } else if model_name.contains("gpt-4") {
+            8_192
+        } else if model_name.contains("gpt-3.5") {
+            16_385
+        } else if model_name.contains("gemini-1.5-pro") {
+            2_097_152 // 2M tokens
+        } else if model_name.contains("gemini") {
+            1_048_576
+        } else {
+            200_000 // default to Claude
+        };
+
+        wit_context_window::ContextInfo {
+            max_tokens,
+            used_tokens: 0, // Would need conversation tracking to be accurate
+            available_tokens: max_tokens,
+        }
+    }
+}
+
+// ============================================================================
+// Embedding (standalone vector generation via OpenAI API)
+// ============================================================================
+
+impl wit_embedding::Host for AegixContext {
+    async fn generate(
+        &mut self,
+        text: String,
+        model: Option<String>,
+    ) -> Result<Vec<f32>, wit_embedding::Error> {
+        self.host_call("embedding::generate");
+        if self.is_cancelled() {
+            return Err(wit_embedding::Error::BudgetExhausted);
+        }
+        use crate::wit_inspector::CapabilityWorld;
+        if !matches!(
+            self.capability_world,
+            CapabilityWorld::Secrets
+                | CapabilityWorld::Database
+                | CapabilityWorld::Agent
+                | CapabilityWorld::Trusted
+        ) {
+            // MCP-697 (2026-05-13): audit-ledger parity. The Tier-1 LLM-egress
+            // denial branch below (MCP-687) audits via record_capability_denied;
+            // capability-world denial was silent. Probing the embedding
+            // surface from Minimal world should leave a WORM trail.
+            self.record_capability_denied(
+                "wit_embedding::generate",
+                "capability-world",
+                model.as_deref().unwrap_or(""),
+            )
+            .await;
+            return Err(wit_embedding::Error::NotConfigured(
+                "Embedding requires secrets-node or higher capability world".into(),
+            ));
+        }
+
+        // MCP-687 (2026-05-13): defense-in-depth Tier-1 surface. Pre-fix
+        // the only barrier was `get_llm_api_key_by_name("openai")`
+        // returning None on Tier-1; a future regression that lets a key
+        // leak through would silently POST the prompt to api.openai.com
+        // because this function bypasses `wit_http::fetch` (the
+        // documented 3rd of five Tier-1 surfaces) and uses
+        // `self.http_client` directly. The function IS an LLM-egress
+        // surface — it makes outbound POSTs to api.openai.com with the
+        // caller's `text` as the body — so the Tier-1 ceiling MUST be
+        // enforced here independently, the same shape as
+        // `wit_http_stream::connect` (5th surface, line ~8341) and
+        // `wit_webhook::send` / `wit_graphql::execute`. CLAUDE.md's
+        // "Five enforcement surfaces" enumeration should be amended to
+        // include `wit_embedding::generate` as the sixth surface (and
+        // any future wit_embedding methods that add new providers).
+        if matches!(
+            self.max_llm_tier,
+            aegix_workflow_job_protocol::LlmTier::Tier1
+        ) {
+            self.record_capability_denied(
+                "wit_embedding::generate",
+                "tier1-llm-egress",
+                "api.openai.com",
+            )
+            .await;
+            tracing::warn!(
+                actor_id = ?self.actor_id,
+                "tier-1 actor attempted wit_embedding::generate; refused (external LLM-host egress)"
+            );
+            return Err(wit_embedding::Error::NotConfigured(
+                "Tier-1 actors cannot use external embedding providers. \
+                 Reconfigure the actor with `max_llm_tier=tier2` or run \
+                 embeddings via a local-only provider in a future release."
+                    .into(),
+            ));
+        }
+
+        // MCP-585: cap caller-supplied text size BEFORE building the
+        // outbound JSON body. Pre-fix the input was unbounded; a
+        // module could ship a 100 MB string through the worker's
+        // outbound network buffer (plus a serde_json clone for the
+        // body) before the upstream OpenAI API returned 400 for
+        // exceeding its 8192-token limit. The 64 KiB cap above
+        // already covers worst-case multi-byte UTF-8 input that
+        // still falls within the model's token window.
+        if text.len() > MAX_EMBEDDING_TEXT_BYTES {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                bytes = text.len(),
+                cap = MAX_EMBEDDING_TEXT_BYTES,
+                "wit_embedding::generate text exceeds size cap; refusing before outbound dispatch"
+            );
+            return Err(wit_embedding::Error::ApiError(format!(
+                "Embedding input text exceeds {MAX_EMBEDDING_TEXT_BYTES}-byte cap"
+            )));
+        }
+
+        let api_key = match self.get_llm_api_key_by_name("openai").await {
+            Some(k) => k,
+            None => {
+                return Err(wit_embedding::Error::NotConfigured(
+                    self.llm_key_unavailable_message("openai"),
+                ));
+            }
+        };
+
+        let model_name = model.unwrap_or_else(|| "text-embedding-3-small".to_string());
+        let body = serde_json::json!({
+            "model": model_name,
+            "input": text,
+        });
+
+        let client = self.http_client.clone();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client
+                .post("https://api.openai.com/v1/embeddings")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| wit_embedding::Error::ApiError("Embedding request timed out".into()))?
+        .map_err(|e| wit_embedding::Error::ApiError(format!("Network error: {e}")))?;
+
+        let status = response.status().as_u16();
+        if status == 429 {
+            return Err(wit_embedding::Error::RateLimited);
+        }
+        if !response.status().is_success() {
+            tracing::warn!(status, "Embedding API returned error");
+            return Err(wit_embedding::Error::ApiError(format!(
+                "Embedding API returned HTTP {status}"
+            )));
+        }
+
+        // MCP-1213 sibling: bounded streaming body read + parse, NOT
+        // unbounded `.json()`. This was the last uncapped outbound `.json()`
+        // in the worker — same OOM class the LLM completion path closed.
+        // OpenAI is a trusted endpoint, but a compromised/MITM'd upstream or
+        // an upstream bug returning a 1 GB body would buffer in worker memory
+        // and OOM the pod; the cap is defense-in-depth on a hardcoded host.
+        let body_bytes = read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
+            .await
+            .ok_or_else(|| {
+                wit_embedding::Error::ApiError(format!(
+                    "Embedding response exceeded {MAX_LLM_BODY_BYTES} bytes; aborted body read"
+                ))
+            })?;
+        let resp_body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+            wit_embedding::Error::ApiError(format!("Failed to parse response: {e}"))
+        })?;
+
+        let embedding = resp_body
+            .get("data")
+            .and_then(|d| d.get(0))
+            .and_then(|e| e.get("embedding"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                wit_embedding::Error::ApiError("Missing embedding in response".into())
+            })?;
+
+        let vec: Vec<f32> = embedding
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect();
+
+        if vec.is_empty() {
+            return Err(wit_embedding::Error::ApiError(
+                "Empty embedding vector returned".into(),
+            ));
+        }
+
+        Ok(vec)
+    }
+}

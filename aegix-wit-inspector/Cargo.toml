@@ -1,0 +1,20 @@
+[package]
+name = "aegix-wit-inspector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+aegix-capability-world = { path = "../aegix-capability-world" }
+wasmparser = "0.224"
+
+[dev-dependencies]
+proptest.workspace = true
+# A real component for the sentinel test (E2-7).
+wat.workspace = true
+
+[lints]
+workspace = true
