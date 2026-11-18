@@ -493,7 +493,14 @@ pub struct SecurityPolicy {
 ///             components). No engine config changed; the fingerprint's
 ///             wasmtime line did. V13 blobs are rejected by header and
 ///             recompile on next use.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV14";
+///   TALOSV15 — 2026-11-18: memory protection keys are no longer asked of
+///             the pooling allocator (`pooling.memory_protection_keys`:
+///             `auto` on Linux x86_64 → wasmtime's default, `no`). An engine
+///             config change with no wasmtime bump: on a Linux x86_64 machine
+///             with keys a V14 blob was compiled for an engine whose memories
+///             had no guard regions between them. V14 blobs are rejected by
+///             header and recompile on next use.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV15";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -680,7 +687,7 @@ const ENGINE_CONFIG_FINGERPRINT: &[u8] = concat!(
     pooling.table_keep_resident=20000\n\
     pooling.decommit_batch_size=8\n\
     pooling.max_unused_warm_slots=50\n\
-    pooling.memory_protection_keys=auto-linux-x86_64\n\
+    pooling.memory_protection_keys=no\n\
     parallel_compilation=true\n\
     cranelift_opt_level=speed\n"
 )
@@ -1147,7 +1154,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
         // or the wasmtime= line). See test doc for the update procedure.
-        const EXPECTED: &str = "7e949a5e9a9e012244ada00dbdaec03e4bb077652b90da2f7c2481c41f2f0785";
+        const EXPECTED: &str = "8663ff9e33792ea4a57ae9b49d6b5b90588ae3823824f85f8caeed26f4aa97d0";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,
@@ -1155,6 +1162,31 @@ mod aot_hmac_input_tests {
              AND consider whether to bump AOT_VERSION_HDR so operators see a clean \
              version-mismatch error in their logs instead of an HMAC verification \
              failure on stale cached blobs."
+        );
+    }
+
+    /// The pooling allocator is not asked for memory protection keys, on any
+    /// platform. The option is experimental in wasmtime, removes the guard
+    /// regions between modules' memories, and was on only where no gate runs
+    /// on a processor that has keys; the engine builder says why at length.
+    /// Read from the source, because a test of behaviour would need such a
+    /// processor: no call of the setter anywhere in this file, and the
+    /// fingerprint says `no`.
+    #[test]
+    fn pooling_asks_for_no_memory_protection_keys() {
+        // Written in two pieces so this line is not itself a match.
+        let setter = concat!(".memory_protection", "_keys(");
+        let source = include_str!("runtime.rs");
+        assert_eq!(
+            source.matches(setter).count(),
+            0,
+            "the engine asks the pooling allocator for memory protection keys; \
+             that path has no gate (see the engine builder's remark)"
+        );
+        let fingerprint = std::str::from_utf8(super::ENGINE_CONFIG_FINGERPRINT).unwrap();
+        assert!(
+            fingerprint.contains("pooling.memory_protection_keys=no\n"),
+            "the fingerprint must say what the engine is built with"
         );
     }
 
@@ -3696,15 +3728,30 @@ impl AegixRuntime {
                 // warm slot avoids page faults on the first access.
                 .max_unused_warm_slots(50);
 
-            // ── Memory Protection Keys (Linux x86-64 only) ──────────────────
-            // MPK striping dramatically reduces virtual address space consumption
-            // by the pooling allocator — multiple instances share the same VA
-            // range, switching protection via WRPKRU instead of mmap.
-            // MpkEnabled::Auto detects hardware support at runtime.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            {
-                pooling_config.memory_protection_keys(wasmtime::Enabled::Auto);
-            }
+            // ── Memory protection keys: not asked for ───────────────────────
+            // Until 2026-11-18 this asked for `Enabled::Auto` on Linux x86_64.
+            // With keys the pool lays memories out with NO guard region
+            // between them and relies on the processor's key register to keep
+            // one module out of the next one's memory. wasmtime leaves the
+            // option off by default and documents it as experimental ("you
+            // may observe segmentation faults"). It was on for exactly the
+            // one platform no gate of this code runs on with such a processor
+            // (the development machine is arm64 and hosted x86_64 runners
+            // expose no keys), and the first outside review of this runtime
+            // reported `cancellation_preempts_a_compute_bound_module` dying of
+            // a segmentation fault in the pooling allocator there, five runs
+            // in five. What it saved was address space, which is not short:
+            // 2,000 slots of 128 MiB with their 32 MiB guards reserve about
+            // 313 GiB of a 128 TiB address space, and the most keys could
+            // take off that is the guards, a fifth.
+            //
+            // So the setting is left at wasmtime's default and every platform
+            // takes the path the tests take. `pooling_asks_for_no_memory_
+            // protection_keys` holds it. When to ask again (one process near
+            // its address-space limit: about 800,000 slots at this slot size,
+            // far fewer with a larger slot) and what must be true first (a
+            // gate on a processor with keys, among others) are in
+            // docs/wasmtime-version-tracking.md, "Memory protection keys".
 
             config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
         }

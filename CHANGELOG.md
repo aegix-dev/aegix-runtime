@@ -27,13 +27,22 @@ Answers the first outside review of 0.1.0.
   lengths of two whole renders, and on Linux a render carries the process
   collector, whose values change width. It now measures its own two metric
   families.
-- **The review reported a crash on Linux x86_64** in a worker test
-  (`cancellation_preempts_a_compute_bound_module`), in the pooling
-  allocator. It could not be reproduced where this release was written,
-  which has no x86_64 machine. `ci.yml` now runs that test on x86_64 for
-  every commit and prints whether the runner's processor has memory
-  protection keys, the path only x86_64 takes. This release exists because
-  it passed there.
+- **Changed: the worker no longer asks for memory protection keys.** The
+  review reported a worker test
+  (`cancellation_preempts_a_compute_bound_module`) dying of a segmentation
+  fault on Linux x86_64, in the allocator that hands modules their memory.
+  It has not been reproduced: `ci.yml` runs that test on x86_64 and it
+  passes, but the hosted runner's processor has no memory protection keys,
+  and neither has any machine this tree is developed on. The worker asked
+  wasmtime to use them where a processor had them, which lays modules'
+  memories out with no guard region between them; wasmtime leaves that
+  option off and calls it experimental. It is off here now, so every
+  platform takes the path the tests take. Compiled modules cached by an
+  earlier worker are compiled again on first use.
+- **Fixed: a test of `aegix-trace` replaced the process's tracer provider**
+  under the tests beside it, and they failed whenever the tests of that
+  crate shared a process, as `cargo test` runs them. The first run of
+  `ci.yml` found it, on both architectures.
 - **Documents corrected.** `docs/limits.md` and `docs/threat-model.md` said
   the answers to a worker's data calls were signed. They are not: what keeps
   a made-up answer out of a worker's inbox is the broker's permissions. The

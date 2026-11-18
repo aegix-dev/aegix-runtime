@@ -2,11 +2,11 @@
 # lints, and every test that needs no service, on Linux x86_64 and on Linux
 # arm64.
 #
-# Both architectures, because they do not run the same code: on x86_64 the
-# worker's allocator turns memory protection keys on where the processor has
-# them, and on Linux a metrics registry carries the process collector. Until
-# this workflow existed (0.1.1) the tests had only ever been run on arm64, and
-# the first outside review found two that did not pass on x86_64.
+# Both architectures, because they do not run the same code: wasmtime compiles
+# a module for the processor it runs on, and on Linux a metrics registry
+# carries the process collector. Until this workflow existed (0.1.1) the tests
+# had only ever been run on arm64, and the first outside review found two that
+# did not pass on x86_64.
 #
 # The demo is not run here. The release workflow runs it in full, from the
 # image, on each architecture, before anything is pushed; `make demo` runs it
@@ -100,8 +100,9 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           cargo --version --verbose
-      # Which processor ran the tests: whether it has memory protection keys
-      # (`pku`) decides which allocator path the worker's tests take.
+      # Which processor ran the tests. The worker asks for no memory protection
+      # keys (`pku`), so the line is for the record: a crash reported on a
+      # processor that has them was never reproduced on one that has not.
       - name: The processor
         run: |
           uname -m

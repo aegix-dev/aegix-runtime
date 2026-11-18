@@ -156,8 +156,108 @@ likely to need a corresponding change:
 * `PoolingAllocationConfig` field set — same shape. New tuning knobs
   may need to be set explicitly to retain current behaviour.
 
+* Memory protection keys — read what the new release's documentation of
+  `PoolingAllocationConfig::memory_protection_keys` says: whether the option
+  is still called experimental, and whether its default is still `no`. A
+  release that turns it on by default would turn it on here. See "Memory
+  protection keys" below.
+
 * `wasmtime-wasi` API drift — `add_to_linker_async`, etc. The async
   vs sync split has moved between wasmtime point releases before.
+
+## Memory protection keys: off, and when to ask again
+
+The pooling allocator is not asked for memory protection keys (wasmtime's
+`PoolingAllocationConfig::memory_protection_keys`, "MPK"; Linux calls the
+processor feature `pku`). Until 2026-11-18 the engine asked for `auto` on
+Linux x86_64 and nowhere else.
+`aegix-worker-runtime/src/runtime.rs` now leaves it at wasmtime's default,
+`no`, and the test `pooling_asks_for_no_memory_protection_keys` holds that.
+
+### What the option does
+
+Each memory slot in the pool is followed by a guard region no module can
+touch. With keys, wasmtime gives neighbouring slots different keys and lets
+a slot's neighbours stand in for its guard region, so the slots can sit
+closer together. The saving is reserved address space and nothing else: it
+commits no less memory, and a module runs no faster (the key register is
+written on every switch between the host and a module, a small cost).
+
+### Why it is off
+
+* wasmtime 49 documents it as "still experimental--use at your own risk" and
+  says "you may observe segmentation faults if anything is misconfigured".
+  Its default is `no`.
+* With it on, what keeps one module out of the next one's memory is the
+  key register, not an unmapped region. That is the sandbox boundary resting
+  on an experimental option.
+* No gate runs on a processor that has keys. The machines this code is
+  developed and tested on are arm64, and the hosted x86_64 runner the public
+  tree's CI uses reports no `pku`. It was on for exactly the platform nothing
+  tested.
+* The first outside review of the runtime (0.1.0, on Linux x86_64) reported
+  `cancellation_preempts_a_compute_bound_module` dying of a segmentation
+  fault in the pooling allocator, five runs in five. It was not reproduced
+  on a processor without keys. Whether keys were the cause is not known.
+
+### What it would save here, measured from the configuration
+
+| | today |
+|---|---|
+| memory slots (`total_memories`) | 2,000 |
+| slot size (`memory_reservation` = `max_memory_size`) | 128 MiB |
+| guard region per slot (wasmtime's default, not overridden) | 32 MiB |
+| address space reserved by the pool's memories | 2,000 × 160 MiB ≈ 313 GiB |
+| address space of a Linux x86_64 process (47 bits) | 128 TiB |
+| share used | about 0.24% |
+
+Because a slot here is already cut down to the largest memory a module may
+have, the most keys could remove is the guard region: 32 MiB of every
+160 MiB, about a fifth. (wasmtime's own example saves far more because it
+keeps the default 4 GiB reservation with a 128 MiB maximum, and packs many
+memories into one reservation. That is not this configuration.)
+
+### When to ask again
+
+Address space is the only thing the option buys, so the question is whether
+one worker process is running out of it:
+
+* **At today's slot size the pool's memories reach the 47-bit limit at
+  roughly 800,000 slots** (128 TiB ÷ 160 MiB), not at tens of thousands:
+  50,000 slots would reserve about 7.6 TiB, 6% of the space. Other
+  mappings (tables, stacks, the compiled code of cached modules) take some
+  of the rest.
+* **A larger slot moves the limit down in proportion.** If modules were
+  allowed 4 GiB memories, a slot with its guard would be about 4 GiB and the
+  limit would be near 32,000 slots. That is the case in which this option
+  is worth reading about again.
+* **A reservation the kernel refuses is how it would show**: the engine
+  fails to build at worker start (the pool is reserved up front), or a
+  process limit on address space (`ulimit -v`, a container's) is hit. The
+  `AEGIX_DISABLE_POOLING=true` (memory on demand, slightly slower to start
+  a module) is the way round that today.
+
+Before turning it on, all of these, in one change:
+
+1. **Try more worker processes first.** Each has its own address space,
+   the platform already runs several, and it needs no experimental option.
+   The pool is sized for 500 instances at once in one process; tens of
+   thousands of slots in one process is a different design from the one
+   that exists.
+2. A gate that runs the worker's tests on a processor with `pku`, and
+   passes with the option on. Without one the option is untested on the
+   only platform it does anything on, which is the state it was removed
+   from.
+3. wasmtime no longer calls the option experimental (see "What to check at
+   upgrade time").
+4. The reported crash is either reproduced and explained, or shown on that
+   gate not to happen.
+5. The engine fingerprint, its pinned hash and `AOT_VERSION_HDR` move
+   together, as for any engine configuration change: a module compiled for
+   an engine without keys must not be loaded by one with them.
+
+It is deliberately not a setting. A switch nobody can test is the defect
+that was removed.
 
 ## Test-runner contract
 

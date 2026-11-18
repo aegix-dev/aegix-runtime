@@ -49,6 +49,15 @@ name another to the server, and a secret granted for the first went with
 the request. The header is refused now, with the fields that belong to the
 connection (`docs/threat-model.md`, section A).
 
+The same review reported a worker test dying of a segmentation fault on
+Linux x86_64, in the allocator that hands modules their memory. That has
+not been reproduced. The worker asked wasmtime to use memory protection
+keys where a processor had them, and no machine this tree is tested on has
+such a processor, the hosted x86_64 runner included. The worker no longer
+asks, so every platform takes the path the tests take; whether that was the
+cause is not known. A test of this tree that crashes on your machine is a
+flaw to report.
+
 ## Defaults are for development
 
 A worker started without `RUST_ENV`, or with a development one, leaves

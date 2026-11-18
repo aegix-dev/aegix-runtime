@@ -940,6 +940,64 @@ impl ExecutionSpan {
     }
 }
 
+/// The one tracer provider a test binary of this crate installs.
+///
+/// The provider is process-wide and `cargo test` runs every test of the crate
+/// in one process. A test that installed a provider of its own took the
+/// exporter away from every test still running: `new_with_parent_inherits_
+/// parent_trace_id` did, and the redaction tests then found none of their
+/// spans. It showed only where tests share a process (the public tree's
+/// `cargo test`, on both architectures of its first CI run); a runner that
+/// gives each test a process never saw it. A test that needs a real provider,
+/// or needs to read what was exported, asks here. `one_provider_is_installed_
+/// by_this_crates_tests` holds that nothing else installs one.
+#[cfg(test)]
+mod test_provider {
+    use std::sync::OnceLock;
+
+    use opentelemetry::global;
+    use opentelemetry_sdk::trace::{
+        InMemorySpanExporter, InMemorySpanExporterBuilder, SdkTracerProvider,
+    };
+
+    /// Installs the provider on first use and returns its exporter. The
+    /// exporter is shared by every test in the process, so a test reads its
+    /// own spans by an id it made up, never by count and never after a
+    /// `reset()`.
+    pub(crate) fn exporter() -> &'static InMemorySpanExporter {
+        static EXPORTER: OnceLock<InMemorySpanExporter> = OnceLock::new();
+        EXPORTER.get_or_init(|| {
+            let exp = InMemorySpanExporterBuilder::new().build();
+            let provider = SdkTracerProvider::builder()
+                .with_simple_exporter(exp.clone())
+                .build();
+            global::set_tracer_provider(provider);
+            exp
+        })
+    }
+
+    /// The install above is the only one in this crate's test code. A second
+    /// one passes wherever each test has a process to itself and fails where
+    /// they share one, so it is refused here, in every runner, by reading the
+    /// source.
+    #[test]
+    fn one_provider_is_installed_by_this_crates_tests() {
+        // Written in two pieces so this line is not itself a match.
+        let install = concat!("global::set_tracer", "_provider(");
+        let source = include_str!("lib.rs");
+        let test_code = source
+            .split_once("#[cfg(test)]")
+            .map(|(_, rest)| rest)
+            .expect("this file has test code");
+        assert_eq!(
+            test_code.matches(install).count(),
+            1,
+            "a test installs a tracer provider of its own; ask \
+             `crate::test_provider::exporter()` instead"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,9 +1049,10 @@ mod tests {
 
         // A concrete SDK provider is required — the global no-op tracer yields
         // an all-zero span context, so parent propagation is only observable
-        // against a real provider.
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        global::set_tracer_provider(provider);
+        // against a real provider. It is the one every test of this crate
+        // shares: installing another here would take the exporter away from
+        // the redaction tests running beside this one.
+        let _ = crate::test_provider::exporter();
 
         let parent_trace_id = TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap();
         let parent_sc = SpanContext::new(
@@ -1274,10 +1333,10 @@ mod span_sink_redaction_tests {
     // Sink 1 — the exported span (`error.message` attribute + status).
     // ------------------------------------------------------------------
 
-    /// Install a real SDK tracer provider backed by an in-memory exporter, so
-    /// the assertions read what `ExecutionSpan` genuinely emitted rather than
-    /// what we believe it emitted. Global provider state is process-wide, so
-    /// this is installed exactly once per test binary.
+    /// The assertions read what `ExecutionSpan` genuinely emitted, from the
+    /// in-memory exporter of the one provider this crate's tests install
+    /// (`test_provider`), rather than what we believe it emitted.
+    ///
     /// A process-unique execution id, so a test can pick ITS OWN spans out of
     /// the shared in-memory exporter. The exporter is global (the provider is
     /// process-wide) and libtest runs these tests in parallel with the other
@@ -1306,15 +1365,7 @@ mod span_sink_redaction_tests {
     }
 
     fn exporter() -> &'static opentelemetry_sdk::trace::InMemorySpanExporter {
-        static EXPORTER: OnceLock<opentelemetry_sdk::trace::InMemorySpanExporter> = OnceLock::new();
-        EXPORTER.get_or_init(|| {
-            let exp = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_simple_exporter(exp.clone())
-                .build();
-            global::set_tracer_provider(provider);
-            exp
-        })
+        crate::test_provider::exporter()
     }
 
     #[test]
