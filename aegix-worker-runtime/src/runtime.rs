@@ -49,6 +49,15 @@ pub const EPOCH_TICK_INTERVAL_MS: u64 = 100;
 /// AOT-cache invalidation silently. Bump both together.
 pub const TOTAL_COMPONENT_INSTANCES: u32 = 500;
 
+/// Core-module instances the pooling allocator holds across all components.
+/// Keep in sync with the `pooling.total_core_instances` fingerprint line.
+pub const TOTAL_CORE_INSTANCES: u32 = 2000;
+
+/// Core-module instances one component may hold. With
+/// [`TOTAL_CORE_INSTANCES`] this bounds how many worst-case components fit at
+/// once; the worker checks its job concurrency against both pools at boot.
+pub const MAX_CORE_INSTANCES_PER_COMPONENT: u32 = 20;
+
 /// Convert a wall-clock duration into the equivalent number of epoch
 /// ticks (rounded UP so we never trip the interrupt before the
 /// wall-clock timeout would have fired). Returns at least 1 — a
@@ -341,6 +350,23 @@ mod epoch_helper_tests {
     }
 }
 
+/// How long one `call_async` may take in elapsed time, waits included.
+///
+/// A module that can use Governance (human-in-the-loop) may park for days on
+/// an approval, so those worlds get a week; every other world gets `timeout`.
+/// How long the guest may EXECUTE is `timeout` for all of them — that is the
+/// epoch tick budget, which a parked guest does not spend. One function so
+/// the `call_async` wrapper and the epoch callback cannot hold different
+/// answers (they did: the callback used `timeout` for every world).
+pub(crate) fn call_wall_clock_bound(cap: &CapabilityWorld, timeout: Duration) -> Duration {
+    const PARKED_APPROVAL_BOUND: Duration = Duration::from_secs(86400 * 7);
+    if matches!(cap, CapabilityWorld::Governance | CapabilityWorld::Trusted) {
+        PARKED_APPROVAL_BOUND.max(timeout)
+    } else {
+        timeout
+    }
+}
+
 /// Per-execution security policy carried from the controller.
 /// Threaded through the runtime call chain and applied to `AegixContext`.
 #[derive(Clone, Debug, Default)]
@@ -500,7 +526,13 @@ pub struct SecurityPolicy {
 ///             with keys a V14 blob was compiled for an engine whose memories
 ///             had no guard regions between them. V14 blobs are rejected by
 ///             header and recompile on next use.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV15";
+///   TALOSV16 — 2026-11-18: engine config change, same wasmtime. The
+///             exceptions proposal and the component-model async ABI are
+///             now off (both were guest-reachable), `concurrency_support`
+///             is off (nothing used it), and the core-instance pool is
+///             sized explicitly. V15 blobs are rejected by header and
+///             recompile on next use.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV16";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -649,7 +681,7 @@ const ENGINE_CONFIG_FINGERPRINT: &[u8] = concat!(
      wasmtime=",
     wasmtime_version!(),
     "\n\
-    concurrency_support=true\n\
+    concurrency_support=false\n\
     consume_fuel=true\n\
     op_cost.memory_grow=255\n\
     op_cost.table_grow=128\n\
@@ -665,17 +697,20 @@ const ENGINE_CONFIG_FINGERPRINT: &[u8] = concat!(
     wasm_memory64=false\n\
     wasm_gc=false\n\
     wasm_function_references=false\n\
+    wasm_exceptions=false\n\
     wasm_tail_call=false\n\
     wasm_component_model_memory64=false\n\
+    wasm_component_model_async=false\n\
     wasm_wide_arithmetic=false\n\
     wasm_bulk_memory=true\n\
-    wasm_reference_types=true\n\
+    wasm_reference_types=baseline\n\
     epoch_interruption=true\n\
     async_stack_size=4194304\n\
     max_wasm_stack=2097152\n\
     memory_reservation=134217728\n\
     pooling.total_component_instances=500\n\
     pooling.max_component_instance_size=10485760\n\
+    pooling.total_core_instances=2000\n\
     pooling.max_core_instances_per_component=20\n\
     pooling.max_memories_per_component=20\n\
     pooling.total_memories=2000\n\
@@ -1154,7 +1189,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
         // or the wasmtime= line). See test doc for the update procedure.
-        const EXPECTED: &str = "8663ff9e33792ea4a57ae9b49d6b5b90588ae3823824f85f8caeed26f4aa97d0";
+        const EXPECTED: &str = "deb2a89d0deaa4f9c842e8fab1f718e47a56e85c5f68153662d78040c4a4128f";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,
@@ -2154,6 +2189,46 @@ mod retry_policy_constructor_tests {
     }
 }
 
+/// The modules being compiled right now, each behind the mutex its waiters
+/// queue on. Keyed by tier as well as hash: a tier has its own linker and its
+/// own component cache.
+type CompileGates = Arc<DashMap<(InstanceCacheTier, [u8; 32]), Arc<tokio::sync::Mutex<()>>>>;
+
+/// One caller's hold on a module's compile gate. Dropping it removes the
+/// gate from the map once nobody else holds it — on every exit, including a
+/// job future dropped mid-compile, so the map holds only modules actually
+/// being compiled.
+struct CompileGate {
+    gates: CompileGates,
+    key: (InstanceCacheTier, [u8; 32]),
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl CompileGate {
+    fn enter(gates: &CompileGates, key: (InstanceCacheTier, [u8; 32])) -> Self {
+        let gate = gates.entry(key).or_default().clone();
+        Self {
+            gates: gates.clone(),
+            key,
+            gate,
+        }
+    }
+
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+}
+
+impl Drop for CompileGate {
+    fn drop(&mut self) {
+        // Two references = the map's and this one: no other caller is waiting.
+        // A caller that arrives after the removal takes a fresh gate and finds
+        // the component cached.
+        self.gates
+            .remove_if(&self.key, |_, gate| Arc::strong_count(gate) <= 2);
+    }
+}
+
 /// Bounded eviction for one InstancePre tier cache.
 ///
 /// When `cache.len() > max`, remove about a quarter of `max` entries in
@@ -2891,6 +2966,15 @@ pub struct AegixRuntime {
     /// mechanism with zero producers. Entries are RAII-scoped; see
     /// [`crate::cancel_registry`].
     cancel_registry: Arc<crate::cancel_registry::CancelRegistry>,
+    /// What [`crate::wit_inspector::inspect_component`] found, by module hash.
+    /// Inspection parses the whole binary and scans it for world markers; it
+    /// ran on every job, ahead of the component cache, so a module compiled
+    /// once was still re-read in full each time it ran. Bounded like the
+    /// component caches.
+    inspection_cache: Arc<DashMap<[u8; 32], Arc<crate::wit_inspector::ComponentInspection>>>,
+    /// One gate per module being compiled, so concurrent jobs for a module
+    /// that is not cached yet compile it once ([`Self::instance_pre_for`]).
+    compile_gates: CompileGates,
     /// The engine's epoch ticker, started by the constructor. Held only for
     /// its `Drop`; see [`EpochTicker`] for why no caller starts one any more.
     _epoch_ticker: EpochTicker,
@@ -3371,6 +3455,66 @@ impl AegixRuntime {
     /// test can drive it without a compiled component; this method owns the
     /// two things that need the runtime — the per-tier counter and the log
     /// line (package DR, 2026-09-22: an eviction used to be a log line only).
+    /// [`crate::wit_inspector::inspect_component`], once per distinct binary.
+    fn inspect_cached(
+        &self,
+        module_hash: [u8; 32],
+        wasm_bytes: &[u8],
+    ) -> Arc<crate::wit_inspector::ComponentInspection> {
+        if let Some(hit) = self.inspection_cache.get(&module_hash) {
+            return hit.clone();
+        }
+        let inspection = Arc::new(crate::wit_inspector::inspect_component(wasm_bytes));
+        self.inspection_cache
+            .insert(module_hash, inspection.clone());
+        // Ten component caches of `instance_cache_max_per_tier` each can hold
+        // that many distinct modules between them; an inspection is a few
+        // hundred bytes.
+        evict_over_capacity(
+            &self.inspection_cache,
+            self.instance_cache_max_per_tier.saturating_mul(10),
+        );
+        inspection
+    }
+
+    /// The pre-linked component for `key` in `cache`, compiling it at most
+    /// once however many jobs ask at the same time.
+    ///
+    /// Before this a miss went straight to the compiler, so N concurrent jobs
+    /// for one uncached module were N copies of its bytes and N Cranelift
+    /// runs, each spread over every core — the cold start of a busy module
+    /// was the most expensive moment to be that wasteful. A job that waited
+    /// for another's compile reports a cache hit: it compiled nothing.
+    ///
+    /// A failed compile is not remembered. The next waiter tries again, one
+    /// at a time, so a module that cannot compile costs one compile per job
+    /// in sequence rather than all of them at once.
+    async fn instance_pre_for(
+        &self,
+        linker: &Linker<AegixContext>,
+        cache: &DashMap<[u8; 32], wasmtime::component::InstancePre<AegixContext>>,
+        tier: InstanceCacheTier,
+        key: [u8; 32],
+        wasm_bytes: &[u8],
+        cap: &CapabilityWorld,
+    ) -> Result<(wasmtime::component::InstancePre<AegixContext>, bool)> {
+        // No DashMap `Ref` may be alive across the awaits below.
+        if let Some(hit) = cache.get(&key).map(|entry| entry.clone()) {
+            return Ok((hit, true));
+        }
+        let gate = CompileGate::enter(&self.compile_gates, (tier, key));
+        let _compiling = gate.lock().await;
+        if let Some(hit) = cache.get(&key).map(|entry| entry.clone()) {
+            return Ok((hit, true));
+        }
+        let component = self
+            .compile_component_guarded(wasm_bytes, cap.clone())
+            .await?;
+        let pre = linker.instantiate_pre(&component)?;
+        self.cache_insert_instance_pre(tier, cache, key, pre.clone());
+        Ok((pre, false))
+    }
+
     fn cache_insert_instance_pre(
         &self,
         tier: InstanceCacheTier,
@@ -3522,10 +3666,16 @@ impl AegixRuntime {
         let mut config = Config::new();
 
         // ── Async / Concurrency ─────────────────────────────────────────────
-        // In wasmtime ≥42 `Config::async_support` was removed.
-        // `concurrency_support(true)` enables fiber stacks for call_async /
-        // instantiate_async (same runtime semantics as the old async_support).
-        config.concurrency_support(true);
+        // `concurrency_support` prepares every store to run several guest
+        // tasks at once (async WIT functions, streams, concurrent host
+        // functions). Nothing here uses that: jobs are concurrent across
+        // stores, one store per job. It is NOT what makes `call_async` /
+        // `instantiate_async` work — those run on a fiber either way — and
+        // leaving it on cost a few microseconds of setup per store and routed
+        // every call through the concurrent event loop. Off until native
+        // async is adopted (docs/wasmtime-version-tracking.md, "Planned:
+        // native async"), when it comes back on with the async ABI.
+        config.concurrency_support(false);
 
         // ── Debug / Backtrace ───────────────────────────────────────────────
         // In dev/test: enable full backtrace details and DWARF debug info so trap
@@ -3608,17 +3758,37 @@ impl AegixRuntime {
         //
         // Pinning these makes the policy explicit regardless of upstream
         // default changes between wasmtime point releases.
-        config.wasm_threads(false);
+        // Threads, function-references and exceptions are switched off by
+        // feature flag rather than through their named methods: those methods
+        // exist only in a wasmtime built with the `threads` / `gc` cargo
+        // features, which this build leaves out — and leaving `gc` out does
+        // NOT turn function-references off (it stays in wasmtime's default
+        // set), so the pin has to be explicit either way. Exceptions were ON
+        // until 2026-11-18: this list never named them.
+        config.wasm_features(wasmtime::WasmFeatures::THREADS, false);
+        config.wasm_features(wasmtime::WasmFeatures::FUNCTION_REFERENCES, false);
+        config.wasm_features(wasmtime::WasmFeatures::EXCEPTIONS, false);
+        config.wasm_features(wasmtime::WasmFeatures::LEGACY_EXCEPTIONS, false);
         config.wasm_simd(false);
         config.wasm_relaxed_simd(false);
         config.wasm_multi_memory(false);
         config.wasm_memory64(false);
         config.wasm_gc(false);
-        config.wasm_function_references(false);
         config.wasm_tail_call(false);
         // Wasmtime 48: new knob, off by default ("very incomplete" upstream).
         // Pinned off so a future default flip cannot widen the surface.
         config.wasm_component_model_memory64(false);
+        // The component-model async ABI (`stream`, `future`, async lift/lower,
+        // `waitable-set.*`, `backpressure.*`). It defaults to whatever
+        // `concurrency_support` is, so it was ON, and upstream calls its
+        // support "very incomplete". No Aegix world has an async function and
+        // no host function is registered as concurrent, so a guest gains
+        // nothing from it but the surface.
+        //
+        // NOT permanent: the decision (2026-11-18) is to adopt native async
+        // once it is stable in WASIp3. See "Planned: native async (WASIp3)"
+        // in docs/wasmtime-version-tracking.md, checked at every bump.
+        config.wasm_component_model_async(false);
         // Wasmtime 49 turned wide-arithmetic (`i64.add128`, `i64.mul_wide_*`)
         // ON by default — exactly the silent codegen widening this list exists
         // to stop. No module needs it: rustc's wasm32-wasip2 target does not
@@ -3626,7 +3796,9 @@ impl AegixRuntime {
         // it (measured 2026-09-29).
         config.wasm_wide_arithmetic(false);
         config.wasm_bulk_memory(true);
-        config.wasm_reference_types(true);
+        // reference-types is part of wasmtime's baseline feature set and stays
+        // on; its `Config` switch exists only in a build with the `gc` cargo
+        // feature, which this one leaves out.
 
         // M1 (2026-05-22): epoch interruption enabled as a third
         // independent kill switch alongside fuel + wall-clock timeout.
@@ -3710,7 +3882,12 @@ impl AegixRuntime {
                 // fingerprint line above; see `TOTAL_COMPONENT_INSTANCES`.
                 .total_component_instances(TOTAL_COMPONENT_INSTANCES)
                 .max_component_instance_size(10 * 1024 * 1024)
-                .max_core_instances_per_component(20)
+                // Wasmtime's default is 1000 — two core instances per
+                // component slot, where a wasip2 component is three or four
+                // (module, adapter, shims), so the core pool ran out long
+                // before the 500 component slots did.
+                .total_core_instances(TOTAL_CORE_INSTANCES)
+                .max_core_instances_per_component(MAX_CORE_INSTANCES_PER_COMPONENT)
                 .max_memories_per_component(20)
                 .total_memories(2000)
                 // Must be ≤ memory_reservation set above.
@@ -3935,6 +4112,8 @@ impl AegixRuntime {
             result_cache_seal: None,
             global_expose_fallback: Arc::new(crate::expose_fallback::ExposeFallback::new()),
             cancel_registry: Arc::new(crate::cancel_registry::CancelRegistry::new()),
+            inspection_cache: Arc::new(DashMap::new()),
+            compile_gates: Arc::new(DashMap::new()),
             _epoch_ticker,
         })
     }
@@ -4249,7 +4428,7 @@ impl AegixRuntime {
         // skipped inspection and no hint linked whatever the binary imported.
         let cap = crate::wit_inspector::link_world(
             capability_world_hint.as_ref(),
-            &crate::wit_inspector::inspect_component(wasm_bytes),
+            &self.inspect_cached(module_hash_bytes, wasm_bytes),
         )
         .map_err(|reason| {
             tracing::warn!(
@@ -4866,7 +5045,12 @@ impl AegixRuntime {
         // what makes a compute-bound module (one crossing no host-call
         // boundary, and therefore reaching none of the ~20 `is_cancelled()`
         // guards) preemptible at all. See `crate::epoch_budget`.
-        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout);
+        //
+        // The epoch's wall-clock bound is the SAME bound wrapped around
+        // `call_async` below (`call_wall_clock_bound`), so the two agree on
+        // how long a parked module may wait.
+        let actual_timeout = call_wall_clock_bound(&cap, timeout);
+        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout, actual_timeout);
 
         // Derive string hash from pre-computed bytes (avoids recomputing)
         let module_hash_str = hex::encode(module_hash_bytes);
@@ -4929,33 +5113,22 @@ impl AegixRuntime {
         // ── InstancePre cache lookup ─────────────────────────────────────────
         // On cache hit:  zero compilation, zero linking — just instantiate.
         // On cache miss: compile → link → pre-instantiate → cache.
-        // The cache lookup is resolved to an owned value BEFORE the miss arm,
-        // which now awaits the off-executor compile: a DashMap `Ref` must not
-        // be alive across that await.
-        let cached = cache.get(&module_hash_bytes).map(|entry| entry.clone());
-        let instance_pre = {
-            if let Some(entry) = cached {
-                metrics.cache_hit = true;
-                metrics.compilation_ms = 0;
-                span.add_event("cache_hit");
-                span.set_attribute_bool("cache_hit", true);
-                entry
-            } else {
-                metrics.cache_hit = false;
-                span.add_event("compilation_started");
-                span.set_attribute_bool("cache_hit", false);
-                let compilation_start = std::time::Instant::now();
-                let component = self
-                    .compile_component_guarded(wasm_bytes, cap.clone())
-                    .await?;
-                let pre = linker.instantiate_pre(&component)?;
-                metrics.compilation_ms = compilation_start.elapsed().as_millis() as u64;
-                span.add_event("compilation_completed");
-                span.set_attribute_int("compilation_ms", metrics.compilation_ms as i64);
-                self.cache_insert_instance_pre(tier, cache, module_hash_bytes, pre.clone());
-                pre
-            }
-        };
+        // A miss compiles once however many jobs want the module
+        // (`instance_pre_for`).
+        let compilation_start = std::time::Instant::now();
+        let (instance_pre, cache_hit) = self
+            .instance_pre_for(linker, cache, tier, module_hash_bytes, wasm_bytes, &cap)
+            .await?;
+        metrics.cache_hit = cache_hit;
+        span.set_attribute_bool("cache_hit", cache_hit);
+        if cache_hit {
+            metrics.compilation_ms = 0;
+            span.add_event("cache_hit");
+        } else {
+            metrics.compilation_ms = compilation_start.elapsed().as_millis() as u64;
+            span.add_event("compilation_completed");
+            span.set_attribute_int("compilation_ms", metrics.compilation_ms as i64);
+        }
 
         // Instantiate directly from the pre-linked component.
         //
@@ -5017,14 +5190,6 @@ impl AegixRuntime {
             },
             "--> PASSING TO WASM NODE"
         );
-
-        // If the module can use Governance (human-in-the-loop), it might park for days.
-        let actual_timeout =
-            if matches!(cap, CapabilityWorld::Governance | CapabilityWorld::Trusted) {
-                std::time::Duration::from_secs(86400 * 7) // 7 days
-            } else {
-                timeout
-            };
 
         let execution_start = std::time::Instant::now();
         let fuel_limit_for_calc = effective_fuel_limit;
@@ -5387,7 +5552,15 @@ impl AegixRuntime {
         stdout_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     ) -> Result<String> {
         // Inspect capability world so we use the correct tiered linker + cache.
-        let cap = crate::wit_inspector::inspect_component(wasm_bytes).capability_world;
+        let cache_key: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(wasm_bytes);
+            hasher.finalize().into()
+        };
+        let cap = self
+            .inspect_cached(cache_key, wasm_bytes)
+            .capability_world
+            .clone();
         // Only specific worlds are granted raw WASI network access (TCP/UDP sockets).
         // allow-wasi-network-no-tier: run_sandbox / test_module path — operator-invoked,
         // actor-less, runs Tier2-default (no max_llm_tier param). Not a tier-1 actor
@@ -5439,30 +5612,15 @@ impl AegixRuntime {
         // the same chokepoint as every other store so no dispatch shape can
         // drift into being un-preemptible; this path registers no execution
         // id, so its flag stays `false` and the behaviour is unchanged.
-        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout);
+        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout, timeout);
 
         // Provide fuel to cap CPU usage
         store.set_fuel(self.fuel_limit)?;
 
         // Get or compile InstancePre with caching
-        let mut hasher = Sha256::new();
-        hasher.update(wasm_bytes);
-        let cache_key: [u8; 32] = hasher.finalize().into();
-
-        // Owned before the awaiting miss arm — see the sibling site above.
-        let cached = cache.get(&cache_key).map(|entry| entry.clone());
-        let instance_pre = {
-            if let Some(entry) = cached {
-                entry
-            } else {
-                let component = self
-                    .compile_component_guarded(wasm_bytes, cap.clone())
-                    .await?;
-                let pre = linker.instantiate_pre(&component)?;
-                self.cache_insert_instance_pre(tier, cache, cache_key, pre.clone());
-                pre
-            }
-        };
+        let (instance_pre, _cache_hit) = self
+            .instance_pre_for(linker, cache, tier, cache_key, wasm_bytes, &cap)
+            .await?;
 
         let instance = instance_pre.instantiate_async(&mut store).await?;
         let run_func = instance.get_func(&mut store, "run").ok_or_else(|| {
@@ -5864,12 +6022,12 @@ impl AegixRuntime {
     ///
     /// Turn raw module bytes into a `Component`, panic-guarded.
     ///
-    /// The single chokepoint for both load paths: AOT blobs (integrity-
-    /// verified deserialize via [`Self::load_precompiled`]) and JIT
-    /// compilation ([`wasmtime::component::Component::new`], which runs
-    /// Cranelift codegen). Both run inside [`guard_codegen_panic`] so a
-    /// backend panic (see that function) becomes a clean per-job error
-    /// instead of crashing the worker. Every `Component::new` call site in
+    /// The single chokepoint for compiling module bytes
+    /// ([`wasmtime::component::Component::new`], which runs Cranelift
+    /// codegen), inside [`guard_codegen_panic`] so a backend panic (see that
+    /// function) becomes a clean per-job error instead of crashing the
+    /// worker. A precompiled blob is NOT accepted here; it has its own entry
+    /// point, [`Self::load_precompiled`]. Every `Component::new` call site in
     /// this file routes through here — do not call `Component::new`
     /// directly (an unguarded site reopens the worker-DoS surface; the
     /// structural lint `no_unguarded_component_new` enforces this).
@@ -5908,7 +6066,10 @@ impl AegixRuntime {
         precompiled_bytes: &[u8],
         expected_cap: crate::wit_inspector::CapabilityWorld,
     ) -> Result<Component> {
-        load_precompiled_on(&self.engine, precompiled_bytes, expected_cap)
+        // Deserialization is the other place the engine can panic on bytes.
+        guard_codegen_panic("aot_deserialize", || {
+            load_precompiled_on(&self.engine, precompiled_bytes, expected_cap)
+        })
     }
 }
 
@@ -5923,23 +6084,39 @@ fn compile_component_guarded_on(
     wasm_bytes: &[u8],
     cap: crate::wit_inspector::CapabilityWorld,
 ) -> Result<Component> {
-    let is_aot = wasm_bytes.starts_with(AOT_VERSION_HDR);
-    let phase = if is_aot {
-        "aot_deserialize"
-    } else {
-        "jit_compile"
-    };
-    guard_codegen_panic(phase, || {
-        if is_aot {
-            load_precompiled_on(engine, wasm_bytes, cap)
-        } else {
-            // THIS is the guarded chokepoint (wrapped by guard_codegen_panic
-            // above); all other sites route here. Check 53 is a clippy
-            // `disallowed-methods` rule: the allow on this function is the one
-            // sanctioned exception.
-            Component::new(engine, wasm_bytes).map_err(Into::into)
-        }
+    // Bytes that arrive as a module are compiled, never deserialized. This
+    // used to route anything starting with the AOT header to
+    // `Component::deserialize` — native code, loaded on the strength of one
+    // fleet-shared HMAC key, reachable from every job's module bytes. A
+    // precompiled blob is now loaded only where a caller asks for exactly
+    // that ([`AegixRuntime::execute_precompiled`] / `load_precompiled`).
+    if is_precompiled_blob(wasm_bytes) {
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "aot_blob_on_module_path",
+            capability_world = %cap.as_str(),
+            "refused a precompiled blob submitted as module bytes"
+        );
+        anyhow::bail!(
+            "module bytes are a precompiled blob, which is not accepted as a module; \
+             submit the WebAssembly component"
+        );
+    }
+    guard_codegen_panic("jit_compile", || {
+        // THIS is the guarded chokepoint (wrapped by guard_codegen_panic
+        // above); all other sites route here. Check 53 is a clippy
+        // `disallowed-methods` rule: the allow on this function is the one
+        // sanctioned exception.
+        Component::new(engine, wasm_bytes).map_err(Into::into)
     })
+}
+
+/// Whether `bytes` carry an AOT header of ANY version (`TALOSV<n>`), so a
+/// stale blob is refused with the same message as a current one rather than
+/// handed to the compiler as if it were WebAssembly.
+fn is_precompiled_blob(bytes: &[u8]) -> bool {
+    const AOT_HDR_PREFIX: &[u8] = b"TALOSV";
+    bytes.starts_with(AOT_HDR_PREFIX)
 }
 
 /// Verify an AOT blob's integrity tag and deserialize it on `engine`. See
@@ -6143,7 +6320,7 @@ impl AegixRuntime {
 
         store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
         // M1: epoch interruption deadline, through the shared chokepoint.
-        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout);
+        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout, timeout);
         store.set_fuel(self.fuel_limit)?;
 
         // Defense-in-depth: pick the linker for the DECLARED capability world
@@ -6872,6 +7049,168 @@ mod tests {
                  local.get 0 local.get 1 local.get 2 local.get 3 i64.add128))"
             ),
             "wide-arithmetic is on by default in Wasmtime 49 and must be pinned off"
+        );
+        assert!(
+            !compiles(
+                "(module (tag $e (param i32)) (func (result i32) \
+                 (block $h (result i32) (try_table (catch $e $h) \
+                 (throw $e (i32.const 7))) (i32.const 0))))"
+            ),
+            "exceptions are on by default wherever wasmtime's `gc` feature is built in"
+        );
+        assert!(
+            !compiles("(module (memory 1 1 shared))"),
+            "threads (shared memories) stay locked down"
+        );
+        assert!(
+            !compiles("(module (type $t (func)) (func (param (ref $t))))"),
+            "typed function references stay locked down"
+        );
+
+        // The component-model async ABI follows `concurrency_support` unless
+        // it is pinned off, and every one of these compiled before it was.
+        let component_compiles = |wat: &str| {
+            compile_component_guarded_on(&engine, wat.as_bytes(), CapabilityWorld::Minimal).is_ok()
+        };
+        assert!(
+            component_compiles("(component)"),
+            "control: an ordinary component compiles"
+        );
+        for async_only in [
+            "(component (type (stream u8)))",
+            "(component (type (future u8)))",
+            "(component (core func (canon backpressure.inc)))",
+            "(component (core func (canon waitable-set.new)))",
+            "(component (core func (canon subtask.cancel)))",
+        ] {
+            assert!(
+                !component_compiles(async_only),
+                "component-model async must be pinned off: {async_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_precompiled_blob_is_refused_as_module_bytes() {
+        let rt = AegixRuntime::new().expect("runtime");
+        let blob = rt
+            .precompile_module(b"(component)", CapabilityWorld::Minimal)
+            .expect("precompile");
+        assert!(blob.starts_with(AOT_VERSION_HDR));
+
+        // The module path compiles; it does not deserialize, whatever the
+        // bytes claim to be and however valid their tag is.
+        let err = compile_component_guarded_on(&rt.engine, &blob, CapabilityWorld::Minimal)
+            .expect_err("a blob on the module path must be refused");
+        assert!(err.to_string().contains("precompiled blob"), "got: {err}");
+        // A blob of another version is the same refusal, not a parse error.
+        assert!(is_precompiled_blob(b"TALOSV3-anything"));
+        assert!(!is_precompiled_blob(b"\0asm\x0d\0\x01\0"));
+
+        // The explicit entry point still loads it, for the world it was
+        // signed for only.
+        rt.load_precompiled(&blob, CapabilityWorld::Minimal)
+            .expect("the explicit AOT entry point loads a valid blob");
+        assert!(rt
+            .load_precompiled(&blob, CapabilityWorld::Trusted)
+            .is_err());
+    }
+
+    #[test]
+    fn inspection_is_done_once_per_binary() {
+        let rt = AegixRuntime::new().expect("runtime");
+        let bytes = b"not a component";
+        let first = rt.inspect_cached([7; 32], bytes);
+        // Same key, different bytes: the stored inspection is returned, so
+        // the bytes were not read again.
+        let second = rt.inspect_cached([7; 32], b"other bytes entirely");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(rt.inspection_cache.len(), 1);
+    }
+
+    #[test]
+    fn the_inspection_cache_is_bounded() {
+        let rt = AegixRuntime::new().expect("runtime");
+        let bound = rt.instance_cache_max_per_tier * 10;
+        for i in 0..(bound as u32 + 50) {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_le_bytes());
+            rt.inspect_cached(key, b"x");
+        }
+        assert!(rt.inspection_cache.len() <= bound);
+    }
+
+    #[tokio::test]
+    async fn a_compile_gate_is_shared_and_leaves_no_entry_behind() {
+        let gates: CompileGates = Arc::new(DashMap::new());
+        let key = (InstanceCacheTier::Minimal, [1u8; 32]);
+        let first = CompileGate::enter(&gates, key);
+        let second = CompileGate::enter(&gates, key);
+        assert!(
+            Arc::ptr_eq(&first.gate, &second.gate),
+            "one gate per module"
+        );
+        assert_eq!(gates.len(), 1);
+
+        let held = first.lock().await;
+        assert!(
+            second.gate.try_lock().is_err(),
+            "a second caller waits while the first compiles"
+        );
+        drop(held);
+        drop(first);
+        assert_eq!(gates.len(), 1, "kept while another caller still holds it");
+        drop(second);
+        assert!(gates.is_empty(), "removed once nobody holds it");
+
+        // Another tier is another linker and another cache: its own gate.
+        let other = CompileGate::enter(&gates, (InstanceCacheTier::Network, [1u8; 32]));
+        let same = CompileGate::enter(&gates, key);
+        assert!(!Arc::ptr_eq(&other.gate, &same.gate));
+    }
+
+    #[tokio::test]
+    async fn concurrent_jobs_for_an_uncached_module_compile_it_once() {
+        let rt = Arc::new(AegixRuntime::new().expect("runtime"));
+        let cap = CapabilityWorld::Minimal;
+        let key = [9u8; 32];
+        let mut jobs = Vec::new();
+        for _ in 0..8 {
+            let rt = rt.clone();
+            let cap = cap.clone();
+            jobs.push(tokio::spawn(async move {
+                let (linker, cache, tier) = rt.select_tier(&cap).expect("tier");
+                rt.instance_pre_for(linker, cache, tier, key, b"(component)", &cap)
+                    .await
+                    .map(|(_, hit)| hit)
+            }));
+        }
+        let mut compiled = 0;
+        for job in jobs {
+            if !job.await.expect("join").expect("instance_pre") {
+                compiled += 1;
+            }
+        }
+        assert_eq!(
+            compiled, 1,
+            "exactly one job compiled; the rest waited for it"
+        );
+        assert!(rt.compile_gates.is_empty());
+    }
+
+    #[test]
+    fn a_parking_world_waits_for_days_and_every_other_world_for_its_timeout() {
+        let t = Duration::from_secs(30);
+        assert_eq!(call_wall_clock_bound(&CapabilityWorld::Minimal, t), t);
+        assert_eq!(call_wall_clock_bound(&CapabilityWorld::Network, t), t);
+        let week = Duration::from_secs(86400 * 7);
+        assert_eq!(call_wall_clock_bound(&CapabilityWorld::Governance, t), week);
+        assert_eq!(call_wall_clock_bound(&CapabilityWorld::Trusted, t), week);
+        // Never SHORTER than the job's own timeout.
+        let long = week * 2;
+        assert_eq!(
+            call_wall_clock_bound(&CapabilityWorld::Governance, long),
+            long
         );
     }
 

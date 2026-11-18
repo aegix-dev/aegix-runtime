@@ -335,7 +335,24 @@ impl EpochBudget {
 /// (`run_sandbox` / `test_module` / the AOT path all pass no execution id), the
 /// flag simply stays `false` for the life of the job and the behaviour is the
 /// pre-callback behaviour, tick for tick.
-pub(crate) fn arm_epoch_deadline(store: &mut Store<AegixContext>, timeout: Duration) {
+///
+/// Two bounds, deliberately separate:
+///
+/// * `timeout` becomes the TICK budget. A slice is granted per callback, and
+///   a callback only happens while the guest runs, so this bounds how long the
+///   guest EXECUTES — a guest suspended in a host call spends one tick however
+///   long it waits.
+/// * `wall_clock` bounds elapsed time, waits included, and must be the same
+///   bound the caller wraps around `call_async`. For most worlds it is
+///   `timeout` again. A world that parks on a human approval is given days
+///   around the call; with `timeout` here too it was trapped on its first
+///   instruction after any approval that took longer than `timeout`, however
+///   long the call was allowed to wait.
+pub(crate) fn arm_epoch_deadline(
+    store: &mut Store<AegixContext>,
+    timeout: Duration,
+    wall_clock: Duration,
+) {
     let total = crate::runtime::epoch_ticks_for_timeout(timeout);
     // Same Arc as the registry's — see the doc comment above.
     let cancelled: Arc<AtomicBool> = store.data().cancelled.clone();
@@ -344,7 +361,10 @@ pub(crate) fn arm_epoch_deadline(store: &mut Store<AegixContext>, timeout: Durat
     // this bound either (the tick budget is untouched — ticks only burn while the
     // guest runs, one slice per callback, so a wait costs one slice at most).
     let inference_wait = store.data().inference_wait.clone();
-    let wall_clock_deadline = Instant::now() + timeout;
+    // `checked_add`: a caller-supplied bound must not be able to overflow
+    // `Instant` and panic the worker. An unrepresentable deadline is one that
+    // never arrives; the tick budget still ends the job.
+    let wall_clock_deadline = Instant::now().checked_add(wall_clock);
 
     let (first_slice, mut budget) = EpochBudget::new(total);
     store.set_epoch_deadline(first_slice);
@@ -378,11 +398,9 @@ pub(crate) fn arm_epoch_deadline(store: &mut Store<AegixContext>, timeout: Durat
         // subtraction. No allocation, no lock, no logging.
         let decision = budget.decide(
             cancelled.load(Ordering::Relaxed),
-            wall_clock_expired(
-                Instant::now(),
-                wall_clock_deadline,
-                inference_wait.as_deref(),
-            ),
+            wall_clock_deadline.is_some_and(|deadline| {
+                wall_clock_expired(Instant::now(), deadline, inference_wait.as_deref())
+            }),
         );
         match decision {
             // `Yield`, never `Continue`: see the module docs. The ticks

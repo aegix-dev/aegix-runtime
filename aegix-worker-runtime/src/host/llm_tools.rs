@@ -216,7 +216,7 @@ impl wit_llm_tools::Host for AegixContext {
         let client = if is_local_tools {
             local_llm_http_client().clone()
         } else {
-            self.http_client.clone()
+            self.http_client.client().clone()
         };
         // Local-LLM in-flight gate — sibling of the `complete_impl` site; see
         // `crate::host::llm_gate`. Taken BEFORE the exchange timeout so queue

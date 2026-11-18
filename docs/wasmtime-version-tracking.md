@@ -138,9 +138,27 @@ When bumping wasmtime, the following Aegix-side surfaces are most
 likely to need a corresponding change:
 
 * `aegix-worker-runtime/src/runtime.rs::with_resources` — explicit
-  `wasm_threads/simd/memory64/gc/tail_call/multi_memory/function_references(false)`.
+  `wasm_simd/memory64/gc/tail_call/multi_memory(false)`, the component-model
+  async ABI (`wasm_component_model_async(false)`), and threads,
+  function-references and exceptions switched off by feature flag
+  (`Config::wasm_features`), because their named methods exist only in a
+  wasmtime built with the `threads` / `gc` cargo features, which this
+  workspace leaves out. Leaving a cargo feature out does not by itself turn
+  its proposal off: without `gc`, function-references stays in wasmtime's
+  default set. Exceptions and the async ABI were both guest-reachable until
+  2026-11-18 because the list never named them.
+  `the_production_engine_refuses_locked_down_proposals` compiles one module
+  per locked-down proposal against the production engine; add a case there
+  for every proposal a release adds.
   Each disabled proposal removes Cranelift attack surface; verify the
   list still matches what's available in the new wasmtime release.
+
+* The wasmtime cargo feature lists in `aegix-worker-runtime/Cargo.toml` and
+  `worker/Cargo.toml` name only what the host uses (no `gc*`, `threads`,
+  `stack-switching`, `profiling`, `coredump`, `debug*`; `wat` is a
+  dev-dependency), and `wasmtime-wasi` / `wasmtime-wasi-http` build with
+  `p2` only. A new default feature upstream is not picked up; check whether
+  one is needed.
   Adding a new proposal in a wasmtime point release that defaults to
   ON would silently expand the codegen surface — `lint-structural.sh`
   check **#20** catches the regression. (This said "#8" until 2026-07-31;
@@ -164,6 +182,43 @@ likely to need a corresponding change:
 
 * `wasmtime-wasi` API drift — `add_to_linker_async`, etc. The async
   vs sync split has moved between wasmtime point releases before.
+
+## Planned: native async (WASIp3)
+
+Decided 2026-11-18: Aegix adopts native component-model async as soon as it
+is stable in WASIp3. Until then it stays off — `wasm_component_model_async(false)`
+in the engine config — because upstream still describes its support as very
+incomplete and it accounts for many of the advisories in the table above.
+
+**At every wasmtime bump, check whether this has changed**: WASIp3 released
+as stable, and wasmtime's `Config::wasm_component_model_async` documentation
+no longer calling the support incomplete. When both hold, open the adoption
+work rather than re-pinning it off by habit.
+
+What adoption involves, so the work can be sized when the time comes:
+
+* Engine: `wasm_component_model_async(true)` and `concurrency_support(true)`
+  (both off today; `concurrency_support` was switched off on 2026-11-18)
+  (the latter is what initialises a store for concurrent guest tasks; it
+  buys nothing while the async ABI is off). Both are fingerprint lines, so
+  the AOT header moves.
+* WIT and guests: host functions that do I/O become `async` in
+  `wit/aegix.wit`; modules are rebuilt with async bindings; the SDK macros
+  and `aegix-compilation`'s toolchain move to the WASIp3 target.
+* Host functions: rewritten in wasmtime's concurrent style, where a host
+  function does not hold the store across an await.
+* Per-execution state that assumes one host call at a time and must be made
+  safe for overlapping calls: rate-limit counters, the audit ledger's
+  ordering, the dry-run ledger, the network-failure latch, cancellation,
+  and the fuel profile's per-call attribution.
+* `the_production_engine_refuses_locked_down_proposals` asserts today that
+  the async ABI is refused; that assertion flips with the decision.
+
+What it buys: concurrency inside one job (a module awaiting several host
+calls together, or streaming a body while working). Throughput across jobs
+is unaffected — jobs already run concurrently, one store each. Until
+adoption, a module that needs overlapping calls uses a host-side batch
+function such as `fetch-all`.
 
 ## Memory protection keys: off, and when to ask again
 

@@ -37,15 +37,22 @@ async-nats.workspace = true
 # Pinning to the exact version ensures reproducible builds. The version
 # itself is in the root Cargo.toml's [workspace.dependencies], with
 # wasmtime-wasi and wasmtime-wasi-http (2026-10-06).
-# wasmtime's defaults without `cache` (see the root manifest), plus
-# memory-protection-keys.
+# Only what the host uses. Left out on purpose, so the code is not in the
+# production binary at all: `gc*` (the GC runtime, and with it the exceptions
+# proposal — a proposal with no compile-time support cannot be enabled by a
+# default flip), `threads`, `stack-switching`, `wat` (text-format parsing of
+# job bytes; tests get it as a dev-dependency), `profiling`, `coredump`,
+# `debug*`, `compile-time-builtins`, `wit-parser`.
+# `component-model-async` stays so the engine config can name the async ABI
+# and pin it off (`Config::wasm_component_model_async`), and for the day it is
+# adopted. `call-hook` is the fuel profile's guest/host transition hook; it
+# used to arrive through `memory-protection-keys`, which is no longer asked for.
 wasmtime = { workspace = true, features = [
-  "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat", "profiling",
-  "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump",
-  "debug-builtins", "runtime", "component-model", "component-model-async", "threads",
-  "stack-switching", "std", "debug", "compile-time-builtins", "wit-parser", "memory-protection-keys",
+  "anyhow", "async", "backtrace", "parallel-compilation", "cranelift", "pooling-allocator",
+  "demangle", "addr2line", "runtime", "component-model", "component-model-async", "std",
+  "call-hook",
 ] }
-wasmtime-wasi.workspace = true
+wasmtime-wasi = { workspace = true, features = ["p2"] }
 
 # Core utilities
 anyhow.workspace = true
@@ -143,7 +150,7 @@ prometheus = { workspace = true, features = ["process"], optional = true } # ope
                     # is removed. worker's metrics_server.rs still enforces 4KB max request size, auth
                     # tokens, and rate limiting as defence-in-depth.
 tracing-opentelemetry.workspace = true
-wasmtime-wasi-http.workspace = true
+wasmtime-wasi-http = { workspace = true, features = ["p2"] }
 # The OCI registry client behind `module_fetcher::fetch`'s `oci://` path is this
 # crate's `oci` feature, OFF by default (2026-11-02, the record above): an
 # embedder that runs modules from bytes links no registry client and its 23
@@ -170,6 +177,11 @@ name = "metrics_shape"
 required-features = ["prometheus"]
 
 [dev-dependencies]
+# Test-only wasmtime surface: `wat` so engine tests can compile text-format
+# fixtures, and upstream's default send path, which one wasi:http test compares
+# the hardened path against. Neither is in a production build.
+wasmtime = { workspace = true, features = ["wat"] }
+wasmtime-wasi-http = { workspace = true, features = ["default-send-request"] }
 # `test-util` for `tokio::time::pause`/`advance`. The LLM failure-counter
 # tests drive the real `complete_impl` against a loopback mock provider, and
 # one of its exits is the 60 s `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` wrapper —

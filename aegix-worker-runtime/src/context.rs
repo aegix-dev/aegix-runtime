@@ -665,12 +665,12 @@ pub struct AegixContext {
 
     /// Shared HTTP client for all outbound requests in this execution.
     ///
-    /// Built once per execution with security defaults (no redirects, user-agent).
-    /// Reused across `fetch`, `fetch_all`, `graphql`, `webhook`, `email`, `llm`,
+    /// Built on first use with security defaults (no redirects, user-agent);
+    /// see [`EgressClient`]. Reused across `fetch`, `fetch_all`, `graphql`, `webhook`, `email`, `llm`,
     /// and `object_storage` calls to enable TCP/TLS connection reuse via the
     /// internal connection pool. Per-call timeouts are set on the request builder,
     /// not the client.
-    pub http_client: reqwest::Client,
+    pub http_client: EgressClient,
 
     /// S3-compatible endpoint URL (e.g., "http://minio:9000" or "https://s3.amazonaws.com").
     /// Configured via S3_ENDPOINT env var or secrets.
@@ -1264,6 +1264,70 @@ impl std::fmt::Debug for EnvProviderKeys {
     }
 }
 
+/// One execution's hardened HTTP client, built the first time something sends.
+///
+/// Building it — TLS configuration, connection pool, the scoped resolver —
+/// is most of a millisecond, and it used to be paid by every execution,
+/// including the pure-compute worlds that link no egress interface and the
+/// many network-world runs that never make a call. The posture is fixed when
+/// the execution is created (the inputs are captured here and cannot change);
+/// only the construction is deferred. Clones share the one client, so
+/// `aegix:core/http` and the `wasi:http` send path still connect through the
+/// same resolver.
+#[derive(Clone)]
+pub struct EgressClient(Arc<EgressClientInner>);
+
+struct EgressClientInner {
+    client: std::sync::OnceLock<reqwest::Client>,
+    allowed_hosts: Vec<String>,
+    local_egress_only: bool,
+    private_host_targets: bool,
+}
+
+impl EgressClient {
+    fn new(allowed_hosts: &[String], local_egress_only: bool, private_host_targets: bool) -> Self {
+        Self(Arc::new(EgressClientInner {
+            client: std::sync::OnceLock::new(),
+            allowed_hosts: allowed_hosts.to_vec(),
+            local_egress_only,
+            private_host_targets,
+        }))
+    }
+
+    /// The client, built on first use.
+    pub fn client(&self) -> &reqwest::Client {
+        self.0.client.get_or_init(|| {
+            build_per_execution_http_client(
+                &self.0.allowed_hosts,
+                self.0.local_egress_only,
+                self.0.private_host_targets,
+            )
+        })
+    }
+
+    /// Whether anything has sent through this execution's client yet.
+    #[cfg(test)]
+    pub(crate) fn is_built(&self) -> bool {
+        self.0.client.get().is_some()
+    }
+}
+
+impl std::ops::Deref for EgressClient {
+    type Target = reqwest::Client;
+
+    fn deref(&self) -> &reqwest::Client {
+        self.client()
+    }
+}
+
+impl std::fmt::Debug for EgressClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EgressClient")
+            .field("built", &self.0.client.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The two egress clients one execution owns: the hardened reqwest client and
 /// the `wasi:http` send hooks that share it. Built here for
 /// [`AegixContext::new`] and for the test-only
@@ -1273,11 +1337,8 @@ fn build_egress_clients(
     allowed_hosts: &[String],
     local_egress_only: bool,
     dev_egress: DevEgressOptIns,
-) -> (
-    reqwest::Client,
-    crate::host::wasi_http::HardenedWasiHttpHooks,
-) {
-    let http_client = build_per_execution_http_client(
+) -> (EgressClient, crate::host::wasi_http::HardenedWasiHttpHooks) {
+    let http_client = EgressClient::new(
         allowed_hosts,
         local_egress_only,
         dev_egress.private_host_targets,
@@ -2317,6 +2378,20 @@ pub(crate) fn memory_growth_admitted(
 ) -> Option<usize> {
     let next = committed.checked_add(desired.saturating_sub(current))?;
     (next <= max).then_some(next)
+}
+
+#[cfg(test)]
+mod egress_client_tests {
+    use super::*;
+
+    #[test]
+    fn the_client_is_built_on_first_use_and_shared_by_clones() {
+        let lazy = EgressClient::new(&["example.com".to_string()], false, false);
+        let clone = lazy.clone();
+        assert!(!lazy.is_built(), "creating an execution builds no client");
+        let _ = clone.client();
+        assert!(lazy.is_built(), "a clone's first use builds the one client");
+    }
 }
 
 #[cfg(test)]
