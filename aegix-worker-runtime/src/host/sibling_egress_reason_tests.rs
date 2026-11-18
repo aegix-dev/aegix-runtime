@@ -618,6 +618,63 @@ fn no_class_webhook_latches_can_make_a_message_transient() {
     }
 }
 
+/// A module's `Host` header on the three sibling surfaces (2026-11-17). Each
+/// copied a module's headers onto the request by name, so a module granted
+/// one name on a shared front end named another tenant's to the server, and
+/// a granted `vault://` secret went with it. Each now asks
+/// `request_headers_refusal`, and the refusal is its own class: the fix is in
+/// the module's source, not in a grant.
+///
+/// The target is a public address literal, so nothing is resolved and no
+/// earlier gate answers first; the refusal comes before any connection.
+#[tokio::test]
+async fn a_host_header_is_refused_on_every_sibling_surface() {
+    const TARGET: &str = "https://203.0.113.77/x";
+    let forged = || {
+        vec![
+            ("Accept".to_string(), "application/json".to_string()),
+            ("hOsT".to_string(), "other-tenant.example".to_string()),
+        ]
+    };
+
+    let mut ctx = ctx_with(CapabilityWorld::Http, vec!["*".to_string()]);
+    let mut req = gql(TARGET);
+    req.headers = Some(forged());
+    let out = <AegixContext as wit_graphql::Host>::execute(&mut ctx, req).await;
+    assert!(matches!(out, Err(wit_graphql::Error::Networkerror)));
+    assert_eq!(
+        latched_class(&ctx),
+        Some(reason_class::REQUEST_HEADER_REFUSED),
+        "graphql"
+    );
+    assert!(!crate::runtime::is_transient_error_text(&message_for(
+        &ctx,
+        GUEST_GQL_NETWORKERROR
+    )));
+
+    let mut ctx = ctx_with(CapabilityWorld::Http, vec!["*".to_string()]);
+    let mut req = hook(TARGET);
+    req.headers = forged();
+    let out = <AegixContext as wit_webhook::Host>::send(&mut ctx, req).await;
+    assert!(matches!(out, Err(wit_webhook::Error::Sendfailed)));
+    assert_eq!(
+        latched_class(&ctx),
+        Some(reason_class::REQUEST_HEADER_REFUSED),
+        "webhook"
+    );
+
+    let mut ctx = ctx_with(CapabilityWorld::Http, vec!["*".to_string()]);
+    let out =
+        <AegixContext as wit_http_stream::Host>::connect(&mut ctx, TARGET.to_string(), forged())
+            .await;
+    assert!(matches!(out, Err(wit_http_stream::Error::ForbiddenHost)));
+    assert_eq!(
+        latched_class(&ctx),
+        Some(reason_class::REQUEST_HEADER_REFUSED),
+        "http-stream"
+    );
+}
+
 /// Every class `host::webhook` can latch, transcribed from its call sites.
 /// A list, not a derivation: the point is to be told when the code and this
 /// list disagree, which a derivation could not do.
@@ -625,6 +682,7 @@ const WEBHOOK_LATCHED_CLASSES: &[&str] = &[
     reason_class::WRITE_CEILING,
     reason_class::URL_TOO_LONG,
     reason_class::REQUEST_HEADER_CAP,
+    reason_class::REQUEST_HEADER_REFUSED,
     reason_class::REQUEST_BODY_CAP,
     reason_class::URL_PARSE,
     reason_class::INSECURE_SCHEME,
@@ -723,6 +781,7 @@ pub(super) const STREAM_LATCHED_CLASSES: &[&str] = &[
     reason_class::TIER1_PUBLIC_IP_EGRESS,
     reason_class::PER_HOST_RATE_LIMIT,
     reason_class::REQUEST_HEADER_CAP,
+    reason_class::REQUEST_HEADER_REFUSED,
     reason_class::SECRET_LOOKUP,
     // Added 2026-09 with the connection-establishment move. These four are
     // the complete output of `classify_reqwest_send_error`, and they are

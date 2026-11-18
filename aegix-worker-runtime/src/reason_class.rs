@@ -293,6 +293,13 @@ pub const PER_HOST_RATE_LIMIT: &str = "per-host-rate-limit";
 /// two have opposite remediations (shrink your request vs. the upstream is
 /// misbehaving) and opposite directions of travel.
 pub const REQUEST_HEADER_CAP: &str = "request-header-cap";
+/// The OUTBOUND request named a header a module may not set: `Host`, or one
+/// of the fields that belong to the connection
+/// (`host::request_headers::REFUSED_REQUEST_HEADERS`).
+///
+/// Named apart from [`REQUEST_HEADER_CAP`]: that one is fixed by sending
+/// fewer headers, this one by not sending that header at all.
+pub const REQUEST_HEADER_REFUSED: &str = "request-header-refused";
 /// The OUTBOUND body exceeded `MAX_OUTBOUND_HTTP_BODY_BYTES`.
 ///
 /// Also the class for `wit_graphql`'s 1 MB query cap: a GraphQL query IS the
@@ -351,6 +358,7 @@ pub const HTTP_POLICY_CLASSES: &[&str] = &[
     EXECUTION_RATE_LIMIT,
     PER_HOST_RATE_LIMIT,
     REQUEST_HEADER_CAP,
+    REQUEST_HEADER_REFUSED,
     REQUEST_BODY_CAP,
     GRAPHQL_INTROSPECTION,
     SSE_STREAM_CAP,
@@ -634,6 +642,7 @@ pub const ALL: &[&str] = &[
     EXECUTION_RATE_LIMIT,
     PER_HOST_RATE_LIMIT,
     REQUEST_HEADER_CAP,
+    REQUEST_HEADER_REFUSED,
     REQUEST_BODY_CAP,
     GRAPHQL_INTROSPECTION,
     SSE_STREAM_CAP,
@@ -671,6 +680,7 @@ pub const NON_TRANSIENT: &[&str] = &[
     EXECUTION_RATE_LIMIT,
     PER_HOST_RATE_LIMIT,
     REQUEST_HEADER_CAP,
+    REQUEST_HEADER_REFUSED,
     REQUEST_BODY_CAP,
     GRAPHQL_INTROSPECTION,
     SSE_STREAM_CAP,
@@ -1034,6 +1044,7 @@ mod tests {
                 "execution-rate-limit",
                 "per-host-rate-limit",
                 "request-header-cap",
+                "request-header-refused",
                 "request-body-cap",
                 "graphql-introspection",
                 "sse-stream-cap",
@@ -1066,6 +1077,7 @@ mod tests {
                 "execution-rate-limit",
                 "per-host-rate-limit",
                 "request-header-cap",
+                "request-header-refused",
                 "request-body-cap",
                 "graphql-introspection",
                 "sse-stream-cap",
@@ -1267,7 +1279,7 @@ mod tests {
     /// which is the whole reason the pairing is safe to extend.
     #[test]
     fn every_http_policy_class_is_non_transient() {
-        assert_eq!(HTTP_POLICY_CLASSES.len(), 18);
+        assert_eq!(HTTP_POLICY_CLASSES.len(), 19);
         for t in HTTP_POLICY_CLASSES {
             assert!(ALL.contains(t), "{t:?} missing from ALL");
             assert!(

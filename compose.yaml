@@ -21,7 +21,7 @@
 services:
   demo:
     # allow-unpinned-image: this tree's own image at this tree's version; its digest exists only once the release is built, and compose.pinned.yaml carries it
-    image: ghcr.io/aegix-dev/aegix-runtime/demo:0.1.0
+    image: ghcr.io/aegix-dev/aegix-runtime/demo:0.1.1
     network_mode: none
     read_only: true
     tmpfs:

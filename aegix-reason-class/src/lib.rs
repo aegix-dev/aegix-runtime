@@ -97,6 +97,7 @@ pub const ALL: &[&str] = &[
     "execution-rate-limit",
     "per-host-rate-limit",
     "request-header-cap",
+    "request-header-refused",
     "request-body-cap",
     "graphql-introspection",
     "sse-stream-cap",
@@ -148,6 +149,12 @@ pub enum Family {
     /// The OUTBOUND request exceeded a size cap (body or headers). Also covers
     /// the GraphQL query-size cap, because a GraphQL query IS the request body.
     RequestCap,
+    /// The OUTBOUND request named a header a module may not set: `Host`, which
+    /// would choose another site than the URL that was admitted, or a field
+    /// that belongs to the connection (`Transfer-Encoding`, `Connection`, …).
+    /// Fixed in the MODULE's source, by not setting the header. Apart from
+    /// [`Family::RequestCap`], whose fix is to send less.
+    RequestHeader,
     /// The URL could not be used: unparseable, or longer than the byte cap.
     /// An AUTHORING error, not a policy denial — saying "a policy refused you"
     /// here sends the operator hunting a gate that never fired.
@@ -202,6 +209,7 @@ impl Family {
             Self::SecretLookup
                 | Self::ResponseCap
                 | Self::RequestCap
+                | Self::RequestHeader
                 | Self::InsecureScheme
                 | Self::CapabilityWorld
                 | Self::HostAllowlist
@@ -240,6 +248,7 @@ pub fn family(token: &str) -> Option<Family> {
         "secret-lookup" => Family::SecretLookup,
         "response-too-large" | "header-cap" => Family::ResponseCap,
         "request-header-cap" | "request-body-cap" => Family::RequestCap,
+        "request-header-refused" => Family::RequestHeader,
         "url-too-long" | "url-parse" => Family::MalformedUrl,
         "insecure-scheme" => Family::InsecureScheme,
         "capability-world" => Family::CapabilityWorld,
@@ -341,6 +350,7 @@ mod tests {
                 "execution-rate-limit",
                 "per-host-rate-limit",
                 "request-header-cap",
+                "request-header-refused",
                 "request-body-cap",
                 "graphql-introspection",
                 "sse-stream-cap",
@@ -349,7 +359,7 @@ mod tests {
                 "inference-ceiling-timeout",
             ]
         );
-        assert_eq!(ALL.len(), 34);
+        assert_eq!(ALL.len(), 35);
     }
 
     /// TOTALITY. A token in [`ALL`] with no family would be a token every

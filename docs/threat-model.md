@@ -54,6 +54,7 @@ compiled the module, and wasmtime.
 | read the value of a secret it is granted | it is given a handle. The host signs with the secret or places it in a request; the value does not enter the module. The one host function that returns a value needs a flag under the job's signature, and the reference controller never sets it | `aegix-worker-runtime/src/host/secrets.rs`, `get_secret`, and `expose_secret`; `aegix-reference-controller/src/dispatch.rs`, `prepare` |
 | have a secret sent somewhere of its choosing | a `vault://` reference is filled in only for a host the grant names, in a header or a JSON body, never in a URL and never in a message-bus header | `aegix-worker-runtime/src/host/vault.rs`, `secret_destination_refusal` |
 | call a host that is not on its list, or with a verb it was not given | `allowed_hosts` is exact hosts and `.suffix` entries; empty denies everything, and so does an empty `allowed_methods`. HTTPS only. The worker also takes `*` as every public host; the reference controller refuses to load a module granted it (see [The operator's side](#the-operators-side)) | `aegix-worker-runtime/src/host/egress_admission.rs`, `admit_parsed_url`; `aegix-workflow-job-protocol/src/lib.rs`, `method_permitted` |
+| name another site to the server than the one its URL was admitted for | a `Host` header, and the fields that belong to the connection (`Transfer-Encoding`, `Connection`, `Upgrade` and the rest), are refused on every request path before a secret is filled in or a connection is opened. The worker writes them from the URL | `aegix-worker-runtime/src/host/request_headers.rs`, `request_headers_refusal` |
 | reach a private address: loopback, the local network, a cloud metadata service | an address literal is refused at admission, and a name is checked when it is resolved for the connection, so a name that changes its answer is checked on the answer that is used. Redirects are not followed | `aegix-worker-runtime/src/host/egress.rs`, `denied_ip_literal`; `aegix-worker-runtime/src/ssrf_resolver.rs`, `resolved_addr_permitted`; `aegix-ssrf-classify/src/lib.rs`, `classify_private_ip` |
 | reach an outside model, as an actor held to local ones | provider hosts are refused whatever the grant says, provider keys are not resolved, and a local model server's cloud-served models are refused | `aegix-worker-runtime/src/host/egress.rs`, `egress_posture_deny_reason`; `aegix-worker-runtime/src/host/llm.rs`, `decide_llm_tier_access`, and `admit_local_model` |
 | write, as a read-only actor | the worker refuses the host call, and the controller refuses the write again when a worker signs one | `aegix-worker-runtime/src/context.rs`, `write_ceiling_refuses_detailed`; `aegix-rpc-gates/src/write_ceiling.rs`, `gate` |
@@ -68,8 +69,16 @@ compiled the module, and wasmtime.
   input, what it read from memory, and any secret granted for that host. A
   host that returns request headers in its response returns the secret to
   the module.
+* A header that a host on the list itself reads as a routing instruction
+  (`X-Forwarded-Host`, `X-Original-URL`) is sent as the module wrote it. What
+  such a host does with it is the host's.
 * The provider list has four hosts. A model behind any other host is stopped
   only by `allowed_hosts`.
+* `allowed_hosts` is read by the HTTP interfaces and not by the model ones.
+  A module in a world with `llm` or `embedding` sends its prompt to the
+  model server the worker is configured with, or to a provider the worker
+  holds a key for, with an empty list of hosts as with any other
+  ([limits.md](limits.md), "Model calls").
 * The worker's own write-ceiling check is off unless it is switched on
   ([What a deployment must set](#what-a-deployment-must-set)). The
   controller's is always on in the reference controller.
@@ -106,6 +115,11 @@ posture, shares one key among all workers and is weaker in every row
   they run, and report any output, any failure and any fuel figure it likes.
   The controller checks who signed a result. It cannot check that the module
   ran.
+* The log lines it publishes while a job runs are not signed, and the
+  controller records them before the lines of the signed result. It can
+  write lines into the log of any running job whose id it knows: its own,
+  and, with the broker login the workers share, any whose claim it saw
+  answered.
 * A job granted no secret is claimed by nobody, so while it runs any listed
   worker is served its actor's memory.
 * A gate's "yes" is remembered for two seconds
@@ -132,9 +146,16 @@ With the workers' broker login and no key.
 not a deployment.
 
 * **Nothing but a job's secrets is encrypted on the bus.** A job's input, its
-  module, its result and the answers to its data calls are signed and
-  readable. Every worker logs in as one user, so that user can take a share
-  of the jobs and read the answers sent to other workers.
+  module, its result and the answers to its data calls are readable. Every
+  worker logs in as one user, so that user can take a share of the jobs and
+  read the answers sent to other workers.
+* **An answer to a data call, and a log line, carry no signature.** The
+  table's last row is all that keeps a made-up answer out of a worker's
+  inbox: with the controller's login, or on a broker without those
+  permissions, a worker's module can be given any value as its actor's
+  memory. A log line is published on a subject the worker login may publish
+  to, and the controller keeps the first 200 it receives for a job
+  ([limits.md](limits.md), "The message bus").
 * **There is no TLS** in the demo's broker, and the reference controller
   has no setting for a CA. A worker has one (`NATS_CA_FILE`).
 * **Availability.** Signed messages are counted in records of fixed size

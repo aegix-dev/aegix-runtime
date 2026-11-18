@@ -773,19 +773,18 @@ impl wit_http::Host for AegixContext {
 
         // Build the async reqwest request
         let method = req.method;
-        // MCP-1105 (2026-05-16): cap header count BEFORE the body-size
-        // / per-header vault-resolve loop. Pre-fix loop at line ~1893
-        // called `resolve_vault_header` (DB call) per header with no
-        // bound — see the MAX_OUTBOUND_HEADERS doc-comment for the
-        // full attack surface.
-        if req.headers.len() > MAX_OUTBOUND_HEADERS {
+        // The module's headers, BEFORE the per-header vault-resolve loop:
+        // their count (MCP-1105, 2026-05-16: the loop made a secret lookup
+        // per header with no bound) and their names (2026-11-17: a `Host`
+        // header named another site than the URL that was admitted). One
+        // rule for every path, `request_headers_refusal`.
+        if let Some(refusal) = request_headers_refusal(&req.headers) {
             tracing::warn!(
                 module_id = ?self.module_id,
-                header_count = req.headers.len(),
-                limit = MAX_OUTBOUND_HEADERS,
-                "wit_http::fetch rejected: header count exceeds cap"
+                %refusal,
+                "wit_http::fetch rejected: request headers refused"
             );
-            return Err(deny_forbidden(self, reason_class::REQUEST_HEADER_CAP));
+            return Err(deny_forbidden(self, refusal.class()));
         }
         let headers = req.headers.clone();
         // MCP-1014 (2026-05-15): cap caller-supplied body size. Same
@@ -1554,16 +1553,15 @@ impl wit_http::Host for AegixContext {
             // 8. Resolve vault:// headers (async — see resolve_vault_header).
             //    Deny audits emit inside resolve_vault_header itself; this
             //    site only translates the Err to wit_http::Error.
-            // MCP-1105: per-entry header cap. See MAX_OUTBOUND_HEADERS
-            // doc-comment for the rationale.
-            if req.headers.len() > MAX_OUTBOUND_HEADERS {
+            // Per entry, the same rule as `fetch`: the header count
+            // (MCP-1105) and the names a module may not set.
+            if let Some(refusal) = request_headers_refusal(&req.headers) {
                 tracing::warn!(
                     module_id = ?self.module_id,
-                    header_count = req.headers.len(),
-                    limit = MAX_OUTBOUND_HEADERS,
-                    "wit_http::fetch_all entry rejected: header count exceeds cap"
+                    %refusal,
+                    "wit_http::fetch_all entry rejected: request headers refused"
                 );
-                validated.push(Err(deny_forbidden(self, reason_class::REQUEST_HEADER_CAP)));
+                validated.push(Err(deny_forbidden(self, refusal.class())));
                 continue;
             }
             let reqwest_method = to_reqwest_method(&req.method);

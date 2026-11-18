@@ -1,0 +1,115 @@
+# What every commit and every pull request is held to: the documents, the
+# lints, and every test that needs no service, on Linux x86_64 and on Linux
+# arm64.
+#
+# Both architectures, because they do not run the same code: on x86_64 the
+# worker's allocator turns memory protection keys on where the processor has
+# them, and on Linux a metrics registry carries the process collector. Until
+# this workflow existed (0.1.1) the tests had only ever been run on arm64, and
+# the first outside review found two that did not pass on x86_64.
+#
+# The demo is not run here. The release workflow runs it in full, from the
+# image, on each architecture, before anything is pushed; `make demo` runs it
+# from a checkout.
+#
+# A release is refused unless this workflow passed for the commit the tag
+# names (release.yml, the `check` job).
+#
+# The workflow holds no secret and may write nothing: a pull request from a
+# fork runs it as it is.
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+# A newer push to a pull request replaces the run of the older one. A run of
+# main is never cancelled: each commit there keeps its own verdict, which a
+# release reads.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A runner builds once and is thrown away: incremental state would only
+  # take disk, of which a runner has little.
+  CARGO_INCREMENTAL: 0
+  # For the same reason, no debug info. A failed assertion still names its
+  # file and line; only a backtrace loses them.
+  CARGO_PROFILE_DEV_DEBUG: none
+  RUST_BACKTRACE: 1
+
+jobs:
+  docs:
+    name: Documents and version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - run: make docs-check
+      - run: make release-check
+
+  lint:
+    name: rustfmt and clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml names the release and its components. An older
+      # rustup installs it when asked what is active; a newer one is told to.
+      - name: The toolchain this tree pins
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version --verbose
+      - run: make lint
+
+  test:
+    name: Tests on ${{ matrix.arch }}
+    strategy:
+      # One architecture failing says nothing about the other: let both end.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - name: The toolchain this tree pins
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version --verbose
+      # Which processor ran the tests: whether it has memory protection keys
+      # (`pku`) decides which allocator path the worker's tests take.
+      - name: The processor
+        run: |
+          uname -m
+          if grep -qw pku /proc/cpuinfo; then echo "memory protection keys: yes"; else echo "memory protection keys: no"; fi
+          df -h . | sed -n 2p
+      # Every test binary runs, whatever an earlier one did, so one run names
+      # every failure on this architecture.
+      - run: make test KEEP_GOING=1
+      - name: Disk left
+        if: always()
+        run: df -h . | sed -n 2p

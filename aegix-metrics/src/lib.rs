@@ -5230,6 +5230,54 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The two families of the MCP per-tool instrument.
+    const MCP_INSTRUMENT_FAMILIES: [&str; 2] = [
+        "aegix_mcp_tool_duration_seconds",
+        "aegix_mcp_tool_calls_total",
+    ];
+
+    /// What the MCP per-tool instrument costs one scrape, in bytes: the HELP
+    /// and TYPE lines of its two families and every sample line of theirs,
+    /// each with its newline.
+    ///
+    /// Only those lines are counted. A render also carries every other
+    /// family of the registry, and some of those change between two renders
+    /// of one process (on Linux, the process collector's), so a difference of
+    /// whole-render lengths measures them too.
+    fn mcp_instrument_bytes(render: &str) -> usize {
+        render
+            .lines()
+            .filter(|line| {
+                let named = line
+                    .strip_prefix("# HELP ")
+                    .or_else(|| line.strip_prefix("# TYPE "))
+                    .unwrap_or(line);
+                MCP_INSTRUMENT_FAMILIES
+                    .iter()
+                    .any(|family| named.starts_with(family))
+            })
+            .map(|line| line.len() + 1)
+            .sum()
+    }
+
+    /// The measure counts the instrument's lines and no other family's: a
+    /// value of another family that changes width between two renders moves
+    /// nothing. This is the Linux case, built by hand so it is held on every
+    /// platform.
+    #[test]
+    fn the_instrument_measure_ignores_every_other_family() {
+        let own = "# HELP aegix_mcp_tool_calls_total calls\n\
+                   # TYPE aegix_mcp_tool_calls_total counter\n\
+                   aegix_mcp_tool_calls_total{tool=\"whoami\"} 1\n\
+                   aegix_mcp_tool_duration_seconds_count{tool=\"whoami\"} 1\n";
+        let before = format!("process_cpu_seconds_total 9.99\n{own}process_open_fds 9\n");
+        let after = format!("process_cpu_seconds_total 10.01\n{own}process_open_fds 10\n");
+        assert_ne!(before.len(), after.len(), "the case must change width");
+        assert_eq!(mcp_instrument_bytes(&before), own.len());
+        assert_eq!(mcp_instrument_bytes(&after), own.len());
+        assert_eq!(mcp_instrument_bytes("process_open_fds 9\n"), 0);
+    }
+
     /// The premise of the "do NOT pre-seed the MCP instrument" decision,
     /// pinned so it cannot silently stop being true.
     ///
@@ -5249,6 +5297,14 @@ mod tests {
     /// for call volume and why the counter is seeded and the histogram is
     /// not), so the one-time preamble is 3459 bytes; the MARGINAL 1996 — the
     /// per-pair cost the histogram decision actually rests on — is unchanged.
+    ///
+    /// The cost is read from the instrument's OWN lines
+    /// ([`mcp_instrument_bytes`]), never from the length of a whole render.
+    /// Until 2026-11-17 it was the difference of two whole renders, and on
+    /// Linux the registry also carries the process collector, whose values
+    /// (CPU seconds, resident bytes) change width from one render to the
+    /// next: the test read 3460 for 3459 there. No gate of this repository
+    /// ran on Linux x86_64; an outside review of 0.1.0 found it.
     #[test]
     fn the_mcp_instrument_costs_the_lines_the_no_preseed_decision_assumes() {
         let m = AegixMetrics::new().expect("metrics");
@@ -5280,7 +5336,12 @@ mod tests {
         );
         assert_eq!(lines("aegix_mcp_tool_calls_total"), 1);
         // First pair also pays the two families' HELP/TYPE preamble once.
-        let first_pair_bytes = warm.len() - cold.len();
+        assert_eq!(
+            mcp_instrument_bytes(&cold),
+            0,
+            "the instrument must cost a scrape nothing before any call"
+        );
+        let first_pair_bytes = mcp_instrument_bytes(&warm);
         record_mcp_tool_call_on(
             &m,
             "whoami",
@@ -5288,7 +5349,7 @@ mod tests {
             Duration::from_millis(3),
         );
         let two = m.render_prometheus().expect("render");
-        let marginal_bytes = two.len() - warm.len();
+        let marginal_bytes = mcp_instrument_bytes(&two) - first_pair_bytes;
         assert_eq!(
             (first_pair_bytes, marginal_bytes),
             (3459, 1996),
@@ -5303,14 +5364,14 @@ mod tests {
     fn each_tool_outcome_pair_is_its_own_series() {
         let m = AegixMetrics::new().expect("metrics");
         record_mcp_tool_call_on(&m, "whoami", McpToolOutcome::Ok, Duration::from_millis(1));
-        let one = m.render_prometheus().expect("render").len();
+        let one = mcp_instrument_bytes(&m.render_prometheus().expect("render"));
         record_mcp_tool_call_on(
             &m,
             "whoami",
             McpToolOutcome::Refused,
             Duration::from_millis(1),
         );
-        let two = m.render_prometheus().expect("render").len();
+        let two = mcp_instrument_bytes(&m.render_prometheus().expect("render"));
         assert!(
             two > one,
             "a second outcome on the same tool must add series, not fold in"

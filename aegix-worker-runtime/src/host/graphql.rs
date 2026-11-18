@@ -945,18 +945,16 @@ impl AegixContext {
             );
             return Err(gql_deny(self, reason_class::URL_TOO_LONG));
         }
-        // MCP-1105: cap caller-supplied header count. See
-        // MAX_OUTBOUND_HEADERS doc-comment. graphql adds extra urgency
-        // because the retry loop below re-iterates headers on every
-        // attempt — 10k headers × `max_retries` vault lookups per call.
-        if headers.len() > MAX_OUTBOUND_HEADERS {
+        // The module's headers: their count (MCP-1105; the retry loop below
+        // walks them again on every attempt) and the names a module may not
+        // set. One rule, `request_headers_refusal`.
+        if let Some(refusal) = request_headers_refusal(&headers) {
             tracing::warn!(
                 module_id = ?self.module_id,
-                header_count = headers.len(),
-                limit = MAX_OUTBOUND_HEADERS,
-                "wit_graphql::execute rejected: header count exceeds cap"
+                %refusal,
+                "wit_graphql::execute rejected: request headers refused"
             );
-            return Err(gql_deny(self, reason_class::REQUEST_HEADER_CAP));
+            return Err(gql_deny(self, refusal.class()));
         }
         // MCP-584: clamp caller-supplied timeout in GraphQL exactly
         // as in http::fetch — `option<u32>` is unbounded otherwise.

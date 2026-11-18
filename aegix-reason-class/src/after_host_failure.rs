@@ -106,6 +106,7 @@ impl AfterHostFailure {
             Family::SecretLookup => Self::Credential,
             Family::ResponseCap
             | Family::RequestCap
+            | Family::RequestHeader
             | Family::InsecureScheme
             | Family::CapabilityWorld
             | Family::HostAllowlist

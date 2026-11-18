@@ -36,11 +36,28 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      actions: read   # the verdict of ci.yml for the tagged commit
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
           persist-credentials: false
       - run: make release-check TAG="$GITHUB_REF_NAME" REPOSITORY="$GITHUB_REPOSITORY"
+
+      # The images below are built from this commit and its tests are not run
+      # again here: a release is of a commit ci.yml passed, on both
+      # architectures. A tag pushed before that run has ended is refused; run
+      # this job again when it has.
+      - name: ci.yml passed for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --commit "$GITHUB_SHA" --status success --limit 1 \
+              --json databaseId --jq length)"
+          if [ "$passed" != "1" ]; then
+            echo "::error::ci.yml has no successful run for $GITHUB_SHA. Wait for it to pass, then run this job again."
+            exit 1
+          fi
 
   build:
     name: Images for ${{ matrix.arch }}

@@ -44,6 +44,7 @@ const HOST_FILES: &[(&str, &str)] = &[
     ("model", include_str!("model.rs")),
     ("object_storage", include_str!("object_storage.rs")),
     ("orchestration", include_str!("orchestration.rs")),
+    ("request_headers", include_str!("request_headers.rs")),
     ("secrets", include_str!("secrets.rs")),
     ("state", include_str!("state.rs")),
     ("vault", include_str!("vault.rs")),

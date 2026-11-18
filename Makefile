@@ -14,8 +14,8 @@ lint: ## rustfmt and clippy, warnings refused
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --locked -- -D warnings
 
-test: ## Every test that needs no service
-	cargo test --workspace --locked
+test: ## Every test that needs no service (KEEP_GOING=1 runs every test binary, whatever an earlier one did)
+	cargo test --workspace --locked $(if $(KEEP_GOING),--no-fail-fast)
 
 demo: ## A hostile module against the reference controller and an unmodified worker, in both postures (needs nats-server, cargo-component, the wasm32-wasip2 target, jq, python3, uuidgen)
 	@command -v nats-server >/dev/null 2>&1 || [ -n "$$AEGIX_DEMO_NATS_SERVER" ] \

@@ -120,6 +120,7 @@ mod messaging;
 mod model;
 mod object_storage;
 mod orchestration;
+mod request_headers;
 mod secrets;
 mod state;
 mod vault;
@@ -177,6 +178,7 @@ pub(crate) use messaging::*;
 pub(crate) use object_storage::*;
 #[allow(unused_imports)]
 pub(crate) use orchestration::*;
+pub(crate) use request_headers::request_headers_refusal;
 #[allow(unused_imports)]
 pub(crate) use secrets::*;
 #[allow(unused_imports)]

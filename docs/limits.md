@@ -41,6 +41,14 @@ hold a timed-out job open by publishing log lines. And a worker signed a
 failure for a job it could not verify, so a sender with no key could have a
 running job recorded as failed. Expect more to be found.
 
+The first outside review, of 0.1.0, found a third. A module's `Host` header
+was sent as the module wrote it, while its list of hosts and the destination
+of its secrets were decided on the URL. A module granted one name on a
+shared front end (a bucket of an object store, one customer of a CDN) could
+name another to the server, and a secret granted for the first went with
+the request. The header is refused now, with the fields that belong to the
+connection (`docs/threat-model.md`, section A).
+
 ## Defaults are for development
 
 A worker started without `RUST_ENV`, or with a development one, leaves
@@ -55,7 +63,25 @@ reference controller in this tree.
 ## The message bus
 
 * **Only a job's secrets are encrypted.** Inputs, modules, results and the
-  answers to data calls are signed and readable by anyone who can subscribe.
+  answers to data calls are readable by anyone who can subscribe.
+* **An answer to a data call is not signed.** A job, a result and a data
+  call are; the answer the controller sends back is not. A worker takes it
+  from its own inbox, and what keeps another party from answering first is
+  the broker's rule that the worker login may not publish there
+  (`deploy/nats/worker-permissions.conf`). With the controller's login, or
+  on a broker without that rule, a worker can be handed a made-up answer,
+  and its module reads it as its actor's memory. Until 0.1.1 this page said
+  the answers were signed.
+* **A log line is not signed.** A worker publishes the lines of a running
+  job on a subject named for the job, and the worker login may publish
+  there. The controller keeps the first 200 lines it receives, puts the
+  lines of the signed result after them, and drops what is past 200. It
+  cannot tell who sent a line. Whoever holds that login and learns a
+  running job's id can put lines into its record, and with 200 of them
+  leave none of the worker's own. The id is not a secret: with the one
+  login every worker shares here, it can be read from the answer to another
+  worker's claim. Read a job's log as what was said on the bus, not as what
+  the module did.
 * **Every worker logs in to the broker as one user** in the configuration
   this tree carries (`deploy/nats/nats-shared-worker.conf`), so that login
   can take a share of the jobs and read answers meant for another worker.
@@ -83,9 +109,10 @@ job: a data call must name a job the controller is running.
 
 ## What the controller takes on trust
 
-* **A worker's report.** The output, the status, the time taken, the fuel
-  spent and the log lines are what the worker said. The controller checks
-  who signed them.
+* **A worker's report.** The output, the status, the time taken and the
+  fuel spent are what the worker said. The controller checks who signed the
+  result that carries them. The log lines sent while the job ran are not
+  signed at all ([The message bus](#the-message-bus)).
 * **A job nobody claimed.** A job granted no secret is not claimed, so while
   it runs any listed worker is served its actor's memory. Under `fleet-key`
   any holder of the key is.
@@ -101,6 +128,23 @@ Not defended. The records that stop replays are of fixed size and refuse new
 messages when full; the controller runs at most 64 jobs at once and answers
 at most 64 claims at once; a subject can be flooded by anyone who can
 publish to it. These fail closed: work stops, data does not leave.
+
+## Model calls
+
+`allowed_hosts` governs a module's HTTP requests: `http`, `graphql`,
+`webhook`, `http-stream` and `wasi:http`. The model interfaces (`llm`,
+`llm-tools`, `llm-streaming`, `embedding`) do not read it. A module in a
+world that has them (`llm-node`, `secrets-node`, `database-node`,
+`agent-node`, `automation-node`) sends its prompt to the model server at
+`OLLAMA_URL`, or to a provider the worker holds a key for, whatever its
+list of hosts says. A module with an empty `allowed_hosts` is therefore not
+a module that sends nothing out. What decides is:
+
+* the world the module is linked with;
+* the actor's tier: an actor held to local models is refused the providers;
+* whether the worker has a key. The reference controller hands a job none,
+  and a worker takes one from its own environment only in the development
+  profile, or in the transitional one under a named waiver.
 
 ## What the worker can hold
 

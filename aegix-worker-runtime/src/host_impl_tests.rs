@@ -596,6 +596,76 @@ async fn a_real_response_is_captured_and_the_request_is_not() {
     .is_none());
 }
 
+/// The server a module's request reaches is told the URL's host, and a
+/// request that names another is never sent (2026-11-17).
+///
+/// `allowed_hosts` and a `vault://` secret's destination are decided on the
+/// URL. Until this date a module's `Host` header was copied onto the request,
+/// so the server that answered was told a name nothing had admitted. The
+/// loopback server accepts ONE connection: were the forged request sent, it
+/// would be the one captured, and the honest request after it would fail.
+#[tokio::test]
+async fn the_server_is_told_the_urls_host_and_a_forged_one_is_never_sent() {
+    let (port, server) = spawn_loopback_capture_server().await;
+    let ctx = || {
+        AegixContext::new(
+            CapabilityWorld::Http,
+            vec!["localhost".to_string()],
+            vec!["GET".to_string()],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::default(),
+            None,
+        )
+        .unwrap()
+        .with_dev_egress(DevEgressOptIns::LOOPBACK)
+    };
+    let request = |headers: Vec<(String, String)>| wit_http::Request {
+        method: wit_http::Method::Get,
+        url: format!("http://localhost:{port}/v1/items"),
+        headers,
+        body: vec![],
+        timeout_ms: None,
+    };
+
+    let mut forging = ctx();
+    let refused = wit_http::Host::fetch(
+        &mut forging,
+        request(vec![(
+            "Host".to_string(),
+            "other-tenant.example".to_string(),
+        )]),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(wit_http::Error::Forbiddenhost)),
+        "a module's Host header is refused: {refused:?}"
+    );
+
+    let mut honest = ctx();
+    let resp = wit_http::Host::fetch(&mut honest, request(vec![]))
+        .await
+        .expect("the one connection the server accepts is the honest request's");
+    assert_eq!(resp.status, 200);
+
+    let sent = server.await.expect("server task").to_ascii_lowercase();
+    let host_lines: Vec<&str> = sent
+        .lines()
+        .filter(|line| line.starts_with("host:"))
+        .collect();
+    assert_eq!(
+        host_lines,
+        [format!("host: localhost:{port}").as_str()],
+        "the server is told the URL's host, once: {sent}"
+    );
+    assert!(!sent.contains("other-tenant.example"), "{sent}");
+}
+
 /// Regression for the `fetch_with_bearer` double-"Bearer" 401 bug.
 ///
 /// `SecretProvider::into_auth_header(slot, "Authorization")` ALREADY

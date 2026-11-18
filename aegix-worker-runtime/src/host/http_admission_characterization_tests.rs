@@ -428,6 +428,34 @@ async fn cancelled_refusal() {
     assert_eq!(got.calls, 0);
 }
 
+/// A module's `Host` header is refused on both paths, before a connection is
+/// opened, and recorded under its own class (2026-11-17).
+#[tokio::test]
+async fn host_header_refusal() {
+    let mut r = get(&at_ip("/x"));
+    r.headers = vec![
+        ("Accept".to_string(), "application/json".to_string()),
+        ("Host".to_string(), "other-tenant.example".to_string()),
+    ];
+    both(
+        Ctx::new(),
+        r,
+        Seen {
+            outcome: s(&["Forbiddenhost"]),
+            class: Some("request-header-refused"),
+            diag: vec![],
+            calls: 1,
+        },
+        Seen {
+            outcome: s(&["Forbiddenhost"]),
+            class: Some("request-header-refused"),
+            diag: vec![],
+            calls: 0,
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn header_cap_refusal() {
     let mut r = get(&at_ip("/x"));

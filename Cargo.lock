@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-audit-event"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-config",
  "chrono",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-auth-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -57,18 +57,18 @@ dependencies = [
 
 [[package]]
 name = "aegix-build-info"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "aegix-capability-world"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegix-compilation"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-capability-world",
  "aegix-config",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-auth-types",
  "tracing",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-dlp-provider"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-config",
  "regex",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-e2e-probe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-rpc-protocol",
  "aegix-workflow-job-protocol",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-engine-events"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-graphql",
  "serde",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-envelope-seal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-metrics",
  "aegix-workflow-job-protocol",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-http-body"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-idempotency"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-redis",
  "anyhow",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-local-inference"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-config",
  "aegix-dlp-provider",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-metrics"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-workflow-liveness",
  "anyhow",
@@ -214,14 +214,14 @@ dependencies = [
 
 [[package]]
 name = "aegix-module-source"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "aegix-nats-tls"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-nats",
  "futures",
@@ -231,18 +231,18 @@ dependencies = [
 
 [[package]]
 name = "aegix-random"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rand 0.10.3",
 ]
 
 [[package]]
 name = "aegix-reason-class"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "aegix-redis"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "redis",
  "tokio",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-reference-controller"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-auth-types",
  "aegix-capability-world",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-replay-guard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-config",
  "aegix-redis",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-rpc-gates"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-capability-world",
  "aegix-config",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-rpc-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-config",
  "aegix-random",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-secrets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-random",
  "aegix-workflow-job-protocol",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-shutdown"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tokio",
  "tokio-util",
@@ -374,25 +374,25 @@ dependencies = [
 
 [[package]]
 name = "aegix-sigstore-policy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "aegix-sql-classify"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sqlparser",
 ]
 
 [[package]]
 name = "aegix-ssrf-classify"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "aegix-task-supervision"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prometheus",
  "tokio",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-text-util"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "serde_json",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-trace"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-dlp-provider",
  "opentelemetry",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-trace-nats"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-nats",
  "opentelemetry",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-wit-inspector"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-capability-world",
  "proptest",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "aegix-worker-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-audit-event",
  "aegix-auth-types",
@@ -551,11 +551,11 @@ dependencies = [
 
 [[package]]
 name = "aegix-workflow-liveness"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "aegix-zones"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "jiff",
@@ -6164,7 +6164,7 @@ dependencies = [
 
 [[package]]
 name = "worker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegix-auth-types",
  "aegix-build-info",

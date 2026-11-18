@@ -485,22 +485,17 @@ impl wit_http_stream::Host for AegixContext {
             ));
         }
 
-        // MCP-1105: cap caller-supplied header count. See
-        // MAX_OUTBOUND_HEADERS doc-comment. SSE streams are long-lived
-        // (kept open for the full execution timeout) so even one
-        // bloated connection ties up host memory + the vault-resolve
-        // cost compounds across reconnects.
-        if headers.len() > MAX_OUTBOUND_HEADERS {
+        // The module's headers: their count (MCP-1105; a stream is held
+        // open for the whole execution and the secret lookups compound
+        // across reconnects) and the names a module may not set. One rule,
+        // `request_headers_refusal`.
+        if let Some(refusal) = request_headers_refusal(&headers) {
             tracing::warn!(
                 module_id = ?self.module_id,
-                header_count = headers.len(),
-                limit = MAX_OUTBOUND_HEADERS,
-                "wit_http_stream::connect rejected: header count exceeds cap"
+                %refusal,
+                "wit_http_stream::connect rejected: request headers refused"
             );
-            return Err(stream_deny_forbidden(
-                self,
-                reason_class::REQUEST_HEADER_CAP,
-            ));
+            return Err(stream_deny_forbidden(self, refusal.class()));
         }
         // Resolve vault:// headers.
         let resolved_headers: Vec<(String, String)> = {

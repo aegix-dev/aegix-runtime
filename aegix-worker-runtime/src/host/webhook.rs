@@ -86,18 +86,16 @@ impl wit_webhook::Host for AegixContext {
             );
             return Err(webhook_deny(self, reason_class::URL_TOO_LONG));
         }
-        // MCP-1105: cap caller-supplied header count. See
-        // MAX_OUTBOUND_HEADERS doc-comment for the per-vault-resolve
-        // amplification rationale; wit_webhook::send's retry budget
-        // (1 + max_retries) further compounds it.
-        if req.headers.len() > MAX_OUTBOUND_HEADERS {
+        // The module's headers: their count (MCP-1105; the retry budget,
+        // 1 + max_retries, compounds the per-header secret lookup) and the
+        // names a module may not set. One rule, `request_headers_refusal`.
+        if let Some(refusal) = request_headers_refusal(&req.headers) {
             tracing::warn!(
                 module_id = ?self.module_id,
-                header_count = req.headers.len(),
-                limit = MAX_OUTBOUND_HEADERS,
-                "wit_webhook::send rejected: header count exceeds cap"
+                %refusal,
+                "wit_webhook::send rejected: request headers refused"
             );
-            return Err(webhook_deny(self, reason_class::REQUEST_HEADER_CAP));
+            return Err(webhook_deny(self, refusal.class()));
         }
         let headers = req.headers.clone();
         // MCP-1014 (2026-05-15): cap caller-supplied webhook body. Pre-fix
