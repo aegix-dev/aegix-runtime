@@ -33,6 +33,9 @@ impl CompilationService {
         source_code: &str,
     ) -> Result<Vec<CompilationError>> {
         self.ensure_enabled()?;
+        if let Some(message) = crate::source_too_large(source_code) {
+            return Ok(vec![crate::refusal_error(message)]);
+        }
         // Run static lints first (instant, no compilation needed)
         let mut lint_warnings = lint_source_code(source_code);
 
