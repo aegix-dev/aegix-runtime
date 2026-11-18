@@ -43,6 +43,12 @@ Answers the first outside review of 0.1.0.
   under the tests beside it, and they failed whenever the tests of that
   crate shared a process, as `cargo test` runs them. The first run of
   `ci.yml` found it, on both architectures.
+- **Fixed: a test of `aegix-secrets` read its log lines from a subscriber of
+  its own thread.** `tracing` decides once per process whether a log
+  statement has a listener, and asks the thread that reached it first; when
+  that was another test's thread, the line was never captured. It failed the
+  second CI run on amd64. The test now reads from one subscriber the test
+  binary installs once.
 - **Documents corrected.** `docs/limits.md` and `docs/threat-model.md` said
   the answers to a worker's data calls were signed. They are not: what keeps
   a made-up answer out of a worker's inbox is the broker's permissions. The

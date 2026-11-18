@@ -117,6 +117,8 @@ mod job_span_redaction_tests {
             let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("test"));
             let subscriber = tracing_subscriber::Registry::default().with(layer);
 
+            // thread-subscriber: the span and the events this reads are made
+            // in this closure, on this thread, and nowhere else in the binary.
             tracing::subscriber::with_default(subscriber, || {
                 let span = tracing::info_span!("wasm-job");
                 let _entered = span.enter();
@@ -199,6 +201,8 @@ mod job_span_redaction_tests {
                 .build();
             let raw = tracing_opentelemetry::layer().with_tracer(provider.tracer("control"));
             let subscriber = tracing_subscriber::Registry::default().with(raw);
+            // thread-subscriber: the span and the events this reads are made
+            // in this closure, on this thread, and nowhere else in the binary.
             tracing::subscriber::with_default(subscriber, || {
                 let span = tracing::info_span!("wasm-job");
                 let _entered = span.enter();
@@ -226,6 +230,8 @@ mod job_span_redaction_tests {
             .build();
         let layer = aegix_trace::otel_bridge_layer_with_tracer(provider.tracer("shared"));
         let subscriber = tracing_subscriber::Registry::default().with(layer);
+        // thread-subscriber: the span and the events this reads are made
+        // in this closure, on this thread, and nowhere else in the binary.
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!("wasm-job");
             let _entered = span.enter();

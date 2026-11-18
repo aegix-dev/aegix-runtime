@@ -71,40 +71,92 @@ mod tests {
         assert_eq!(handle.0, 1);
     }
 
+    /// What this test binary has logged, for the tests that read their own
+    /// lines.
+    ///
+    /// One capturing subscriber serves the whole binary, installed on first
+    /// use as the process's default. A subscriber a test sets for its own
+    /// thread (`tracing::subscriber::set_default`) loses lines: `tracing`
+    /// decides once, for the process, whether a log statement has any
+    /// listener, and while one subscriber is registered it asks the thread
+    /// that reached the statement first. From a neighbour's thread, which has
+    /// none, the answer is "never", and the capturing test then sees nothing
+    /// from that statement. Under `cargo test` every test here shares one
+    /// process, and that lost the `secret.resolve` line in 153 runs of 400 at
+    /// four threads (2026-11-18,
+    /// `docs/engineering-log/packages/2026-11-18-public-ci-second-run.md`).
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> LogCapture {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        /// The lines logged so far that contain `marker`: something only the
+        /// calling test wrote, so a neighbour's lines are not read as its own.
+        fn lines_naming(&self, marker: &str) -> Vec<String> {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|line| line.contains(marker))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    fn log_capture() -> &'static LogCapture {
+        static CAPTURE: std::sync::OnceLock<LogCapture> = std::sync::OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            let capture = LogCapture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("this binary's tests install one subscriber, and it is this one");
+            // A statement another thread reached while the subscriber was
+            // being installed was told nothing listens. Ask again, now that
+            // one does.
+            tracing::callsite::rebuild_interest_cache();
+            capture
+        })
+    }
+
     /// The decorator's `secret.resolve` / `secret.resolve.failed` lines fire on
     /// every secret a module resolves, and an OAuth path carries the account's
     /// provider key — for gmail, the user's email — in its fourth segment.
-    /// Drive the REAL decorator under a capturing subscriber and read the
-    /// bytes it wrote: the message and the correlation token must be there,
-    /// the address must not. (Check 91 is the textual gate; this is the half
-    /// that proves the rendered field, not the named function.)
+    /// Drive the REAL decorator under the binary's capturing subscriber and
+    /// read the lines it wrote: the message and the correlation token must be
+    /// there, the address must not. (Check 91 is the textual gate; this is
+    /// the half that proves the rendered field, not the named function.)
     #[tokio::test]
     async fn resolve_log_lines_carry_the_hashed_provider_key_not_the_email() {
-        use std::sync::{Arc, Mutex};
-        #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Capture;
-            fn make_writer(&'a self) -> Capture {
-                self.clone()
-            }
-        }
-        let buf = Capture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let log = log_capture();
+        // Both calls carry this id, and nothing else in the binary does: it
+        // is how this test finds its own lines among its neighbours'.
+        let execution_id = uuid::Uuid::new_v4();
 
         let uid = "11111111-2222-3333-4444-555555555555";
         let ok_path = format!("oauth/gmail/{uid}/alice@example.com/access_token");
@@ -112,17 +164,17 @@ mod tests {
         map.insert(ok_path.clone(), "secret".to_string());
         let provider = AuditingProvider::new(MockProvider { resolved: map });
 
-        provider
-            .resolve(&ok_path, uuid::Uuid::new_v4())
-            .await
-            .unwrap();
+        provider.resolve(&ok_path, execution_id).await.unwrap();
         let missing = format!("oauth/gmail/{uid}/bob@example.com/refresh_token");
-        assert!(provider
-            .resolve(&missing, uuid::Uuid::new_v4())
-            .await
-            .is_err());
+        assert!(provider.resolve(&missing, execution_id).await.is_err());
 
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines = log.lines_naming(&execution_id.to_string());
+        assert_eq!(
+            lines.len(),
+            3,
+            "a line for each resolve and one for the failure: {lines:#?}"
+        );
+        let out = lines.join("\n");
         assert!(out.contains("secret.resolve"), "{out}");
         assert!(out.contains("secret.resolve.failed"), "{out}");
         assert!(out.contains("key_path="), "field is `key_path`: {out}");

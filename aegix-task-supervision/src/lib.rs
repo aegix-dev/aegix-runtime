@@ -863,6 +863,10 @@ mod hook_tests {
             // Best-effort: if a sibling already installed one we still
             // assert on the counter below.
             let _ = tracing::subscriber::set_global_default(sub);
+            // A statement another thread reached while the subscriber was
+            // being installed was told nothing listens. Ask again, now that
+            // one does.
+            tracing::callsite::rebuild_interest_cache();
             cap
         })
         .clone()
