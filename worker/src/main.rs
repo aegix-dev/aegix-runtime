@@ -601,16 +601,34 @@ async fn publish_result_with_retry(
 /// decryption, module acquisition, hash checks): `status: Failed`,
 /// `output_payload: {"error": msg}`, elapsed time from `start`, and
 /// empty logs/signature/nonce/worker-id (the publish path signs it).
+/// Why a job's capability-world hint is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorldHintRefusal {
+    /// The hint names no world this worker knows.
+    Unrecognised,
+    /// There is no hint, and the security profile enforces.
+    Missing,
+}
+
 /// The world a job's signed `capability_world` hint names: `Ok(None)` for no
 /// hint, `Ok(Some(world))` for a world this worker knows, `Err` for a hint it
 /// does not (the parser maps any unknown string to `Unknown`, which the
 /// runtime would read as "no hint" — E2-3).
-fn job_world_hint(raw: Option<&str>) -> Result<Option<worker::wit_inspector::CapabilityWorld>, ()> {
+///
+/// With no hint the runtime links the module at the world its own binary
+/// claims, which a module's author chooses. Where the security profile
+/// enforces (`enforcing`), a dispatched job must therefore carry the world
+/// its controller checked, and one without is refused (2026-11-18).
+fn job_world_hint(
+    raw: Option<&str>,
+    enforcing: bool,
+) -> Result<Option<worker::wit_inspector::CapabilityWorld>, WorldHintRefusal> {
     use worker::wit_inspector::CapabilityWorld;
     match raw {
+        None if enforcing => Err(WorldHintRefusal::Missing),
         None => Ok(None),
         Some(s) => match s.parse::<CapabilityWorld>() {
-            Ok(CapabilityWorld::Unknown) | Err(_) => Err(()),
+            Ok(CapabilityWorld::Unknown) | Err(_) => Err(WorldHintRefusal::Unrecognised),
             Ok(world) => Ok(Some(world)),
         },
     }
@@ -2110,10 +2128,27 @@ async fn run_verified_job(
     // which also documents the attestation model. On failure the
     // FetchError message is byte-for-byte the string the inline code
     // previously placed in the failed result and the span status.
+    //
+    // Bounded by the job's own clock: its execution timeout (the same
+    // fallback the execution below uses when the request names none) and its
+    // deadline. The job holds a concurrency permit throughout, so a registry
+    // that stalls must not be able to hold it for good.
+    let fetch_budget = module_fetcher::fetch_budget(
+        req.timeout_ms,
+        req.deadline_unix_secs,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        std::time::Duration::from_secs(worker::runtime::nonzero_env_or_default(
+            "WASM_EXECUTION_TIMEOUT_SECS",
+            120,
+        )),
+    );
     let FetchedModule {
         bytes: wasm_bytes,
         attested_in_this_run: bytes_attested_in_this_run,
-    } = match module_fetcher::fetch(&req, &runtime, &mut _span).await {
+    } = match module_fetcher::fetch_within(&req, &runtime, &mut _span, fetch_budget).await {
         Ok(fetched) => fetched,
         Err(e) => {
             _span.end_error(&e.message);
@@ -2254,9 +2289,12 @@ async fn run_verified_job(
     // hint" (security review 2026-10-15, E2-3): until then it fell back to
     // the binary's inspected world — the pre-G-1 behaviour, wider than the
     // world the controller checked whenever the inspection is wider.
-    let capability_world_hint = match job_world_hint(req.capability_world.as_deref()) {
+    let capability_world_hint = match job_world_hint(
+        req.capability_world.as_deref(),
+        aegix_config::security_profile::profile().enforces(),
+    ) {
         Ok(hint) => hint,
-        Err(()) => {
+        Err(WorldHintRefusal::Unrecognised) => {
             ::tracing::warn!(
                 target: "talos_security",
                 job_id = %req.job_id,
@@ -2268,6 +2306,22 @@ async fn run_verified_job(
                 &start,
                 "capability-world-unrecognised: the job names a capability world this worker \
                  does not know",
+            );
+        }
+        // No hint under an enforcing profile: the module would be linked at
+        // the world its own binary claims.
+        Err(WorldHintRefusal::Missing) => {
+            ::tracing::warn!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                "capability-world-missing: the job carries no signed world hint and the \
+                 security profile enforces; refused before instantiation"
+            );
+            return failed_result(
+                req.job_id,
+                &start,
+                "capability-world-missing: the job names no capability world, and this \
+                 worker's security profile requires one",
             );
         }
     };
@@ -3433,6 +3487,20 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // The same gate for the CORE-instance pool: a component holds several
+    // core instances (up to MAX_CORE_INSTANCES_PER_COMPONENT), and that pool
+    // can run out while component slots are still free.
+    let worst_case_core_instances = (max_concurrent_jobs as u64)
+        .saturating_mul(u64::from(worker::runtime::MAX_CORE_INSTANCES_PER_COMPONENT));
+    if worst_case_core_instances > u64::from(worker::runtime::TOTAL_CORE_INSTANCES) {
+        ::tracing::warn!(
+            max_concurrent_jobs,
+            max_core_instances_per_component = worker::runtime::MAX_CORE_INSTANCES_PER_COMPONENT,
+            total_core_instances = worker::runtime::TOTAL_CORE_INSTANCES,
+            "AEGIX_MAX_CONCURRENT_JOBS can exceed the pooling allocator's total_core_instances when components are at their core-instance limit — jobs may fail to instantiate under saturation"
+        );
+    }
+
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_jobs));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -3894,19 +3962,38 @@ mod result_publish_tests {
     /// read as "no hint"; a known one in either spelling is that world.
     #[test]
     fn an_unrecognised_world_hint_is_refused_not_dropped() {
+        use super::WorldHintRefusal;
         use worker::wit_inspector::CapabilityWorld;
-        assert_eq!(super::job_world_hint(None), Ok(None));
-        assert_eq!(
-            super::job_world_hint(Some("http-node")),
-            Ok(Some(CapabilityWorld::Http))
-        );
-        assert_eq!(
-            super::job_world_hint(Some("automation-node")),
-            Ok(Some(CapabilityWorld::Trusted))
-        );
-        for unknown in ["automation-node-v2", "", "llm-node", "unknown"] {
-            assert_eq!(super::job_world_hint(Some(unknown)), Err(()), "{unknown:?}");
+        assert_eq!(super::job_world_hint(None, false), Ok(None));
+        for enforcing in [false, true] {
+            assert_eq!(
+                super::job_world_hint(Some("http-node"), enforcing),
+                Ok(Some(CapabilityWorld::Http))
+            );
+            assert_eq!(
+                super::job_world_hint(Some("automation-node"), enforcing),
+                Ok(Some(CapabilityWorld::Trusted))
+            );
+            for unknown in ["automation-node-v2", "", "llm-node", "unknown"] {
+                assert_eq!(
+                    super::job_world_hint(Some(unknown), enforcing),
+                    Err(WorldHintRefusal::Unrecognised),
+                    "{unknown:?}"
+                );
+            }
         }
+    }
+
+    /// With no hint the module is linked at the world its own binary claims;
+    /// where the profile enforces, such a job is refused instead.
+    #[test]
+    fn a_job_without_a_world_hint_is_refused_where_the_profile_enforces() {
+        use super::WorldHintRefusal;
+        assert_eq!(super::job_world_hint(None, false), Ok(None));
+        assert_eq!(
+            super::job_world_hint(None, true),
+            Err(WorldHintRefusal::Missing)
+        );
     }
 
     use super::*;

@@ -20,10 +20,11 @@ pub struct FetchedModule {
     pub bytes: Vec<u8>,
     /// Whether the bytes were cryptographically attested during THIS
     /// worker run: inline `wasm_bytes` from the JobRequest (HMAC over
-    /// the job covers sha256(bytes)), a fresh OCI pull that completed
-    /// Sigstore + layer-digest checks, or a Redis OCI-cache hit that
-    /// re-verified against the manifest digest. When `false`
-    /// (`redis:wasm:` direct fetch, filesystem load), the controller's
+    /// the job covers sha256(bytes)), or an OCI pull or digest-keyed cache
+    /// hit whose layer digest matched AND whose manifest was Sigstore-
+    /// verified in this run or is pinned by digest in the signed module URI
+    /// ([`oci_pull_is_attested`]). When `false` (`redis:wasm:` direct fetch,
+    /// filesystem load, an unverified tag-only OCI pull), the controller's
     /// `expected_wasm_hash` is the only integrity anchor — the caller's
     /// hash-check block MUST refuse to execute without one.
     pub attested_in_this_run: bool,
@@ -79,6 +80,213 @@ fn max_oci_layer_bytes() -> u64 {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_MAX_OCI_LAYER_BYTES)
+}
+
+/// Most bytes of a manifest body the worker reads. The distribution spec has
+/// registries cap a manifest at 4 MiB; a Wasm artifact's is a few hundred
+/// bytes. Fixed, not configurable: the manifest is read before the signature
+/// is checked, so this is what an unverified registry can make the worker hold.
+#[cfg(feature = "oci")]
+const MAX_OCI_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Most bytes read of a registry's token response.
+#[cfg(feature = "oci")]
+const MAX_OCI_TOKEN_BODY_BYTES: u64 = 64 * 1024;
+
+/// Most bytes read of a non-2xx registry response. Read for the operator's
+/// log only: the body never reaches the job's result.
+#[cfg(feature = "oci")]
+const MAX_OCI_ERROR_BODY_BYTES: u64 = 8 * 1024;
+
+/// Most redirects one registry request follows (a blob GET is commonly
+/// redirected once, to the registry's storage host).
+#[cfg(feature = "oci")]
+const MAX_OCI_REDIRECTS: usize = 5;
+
+/// How long a connection to a registry may take to establish
+/// (`WORKER_OCI_CONNECT_TIMEOUT_SECS`, default 10 s). Until 2026-11-18 the
+/// registry client had no timeout of any kind.
+#[cfg(feature = "oci")]
+fn oci_connect_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(aegix_config::positive_env_or_default::<u64>(
+        "WORKER_OCI_CONNECT_TIMEOUT_SECS",
+        10,
+    ))
+}
+
+/// How long a registry may go without sending a byte before the request is
+/// abandoned (`WORKER_OCI_READ_TIMEOUT_SECS`, default 30 s). An idle bound,
+/// not a total one: the total is the job's own budget ([`fetch_within`]).
+#[cfg(feature = "oci")]
+fn oci_read_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(aegix_config::positive_env_or_default::<u64>(
+        "WORKER_OCI_READ_TIMEOUT_SECS",
+        30,
+    ))
+}
+
+/// The variable naming the registries `OCI_REGISTRY_USERNAME` /
+/// `OCI_REGISTRY_PASSWORD` belong to: a comma-separated list of registry
+/// hosts as a module URI spells them (`ghcr.io`, `registry.internal:5000`; an
+/// entry without a port matches that host on any port). The pair is presented
+/// to those registries only — to the pull and to `cosign verify` alike — and
+/// every other registry is reached anonymously. Unset, the pair goes to
+/// whichever registry a module URI names, as it did before 2026-11-18, except
+/// under an enforcing security profile, where it is then withheld from all of
+/// them ([`registry_credential_decision`]).
+pub const OCI_REGISTRY_CREDENTIAL_HOSTS_ENV: &str = "OCI_REGISTRY_CREDENTIAL_HOSTS";
+
+/// Whether the registry credential pair is presented to one registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialDecision {
+    /// The operator named this registry: present the pair.
+    Send,
+    /// No list is set and the profile does not enforce: present the pair, as
+    /// before the list existed.
+    SendUnscoped,
+    /// A list is set and this registry is not on it: anonymous.
+    WithheldNotListed,
+    /// No list is set under an enforcing profile: anonymous.
+    WithheldNoList,
+}
+
+impl CredentialDecision {
+    #[must_use]
+    pub fn sends(self) -> bool {
+        matches!(self, Self::Send | Self::SendUnscoped)
+    }
+}
+
+/// Parse [`OCI_REGISTRY_CREDENTIAL_HOSTS_ENV`]: `None` when unset or holding
+/// no entry (an empty value is unset, the same filter the pair itself gets).
+#[must_use]
+pub fn parse_credential_hosts(raw: Option<&str>) -> Option<Vec<String>> {
+    let hosts: Vec<String> = raw?
+        .split(',')
+        .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    (!hosts.is_empty()).then_some(hosts)
+}
+
+/// The host of a `host[:port]` registry name, lowercased, without the port
+/// (an IPv6 literal keeps its brackets).
+fn registry_host_without_port(registry: &str) -> String {
+    let registry = registry.trim().trim_end_matches('.').to_ascii_lowercase();
+    match registry.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && (!host.contains(':') || host.ends_with(']')) =>
+        {
+            host.to_string()
+        }
+        _ => registry,
+    }
+}
+
+/// The credential rule, pure. A registry is on the list when an entry equals
+/// its `host:port` spelling or its host alone. Before the list existed the
+/// pair went to whichever host a module URI named, so a URI naming someone
+/// else's registry was handed the worker's private-registry login.
+#[must_use]
+pub fn registry_credential_decision(
+    profile: aegix_config::security_profile::SecurityProfile,
+    listed: Option<&[String]>,
+    registry: &str,
+) -> CredentialDecision {
+    let Some(listed) = listed else {
+        return if profile.enforces() {
+            CredentialDecision::WithheldNoList
+        } else {
+            CredentialDecision::SendUnscoped
+        };
+    };
+    let full = registry.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host = registry_host_without_port(registry);
+    if listed.iter().any(|entry| *entry == full || *entry == host) {
+        CredentialDecision::Send
+    } else {
+        CredentialDecision::WithheldNotListed
+    }
+}
+
+/// [`registry_credential_decision`] over the process environment, for one
+/// registry name. A withheld pair is logged once per process, not per pull.
+fn registry_credentials_for(registry: &str) -> Option<(String, String)> {
+    // An empty half is unset: `OCI_REGISTRY_USERNAME=""` from a chart
+    // placeholder must not become `Authorization: Basic Og==`.
+    let user = std::env::var("OCI_REGISTRY_USERNAME")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let password = std::env::var("OCI_REGISTRY_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let listed = parse_credential_hosts(
+        std::env::var(OCI_REGISTRY_CREDENTIAL_HOSTS_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let decision = registry_credential_decision(
+        aegix_config::security_profile::profile(),
+        listed.as_deref(),
+        registry,
+    );
+    static WITHHELD_LOGGED: std::sync::Once = std::sync::Once::new();
+    match decision {
+        CredentialDecision::Send | CredentialDecision::SendUnscoped => Some((user, password)),
+        CredentialDecision::WithheldNotListed => {
+            WITHHELD_LOGGED.call_once(|| {
+                ::tracing::warn!(
+                    registry = %registry,
+                    "registry credentials are set but this registry is not named in \
+                     OCI_REGISTRY_CREDENTIAL_HOSTS: reaching it anonymously (logged once)"
+                );
+            });
+            None
+        }
+        CredentialDecision::WithheldNoList => {
+            WITHHELD_LOGGED.call_once(|| {
+                ::tracing::error!(
+                    registry = %registry,
+                    "registry credentials are set but OCI_REGISTRY_CREDENTIAL_HOSTS is not, \
+                     under an enforcing security profile: the credentials are withheld from \
+                     every registry until the variable names the ones they belong to \
+                     (logged once)"
+                );
+            });
+            None
+        }
+    }
+}
+
+/// The line printed at boot when a registry credential is set and no
+/// registry is named for it. Pure. `None` when there is nothing to say.
+#[must_use]
+pub fn registry_credential_boot_notice(
+    profile: aegix_config::security_profile::SecurityProfile,
+    credentials_set: bool,
+    hosts_named: bool,
+) -> Option<String> {
+    if !credentials_set || hosts_named {
+        return None;
+    }
+    Some(if profile.enforces() {
+        format!(
+            "[MODULES] ✗ OCI_REGISTRY_USERNAME / OCI_REGISTRY_PASSWORD are set but \
+             {OCI_REGISTRY_CREDENTIAL_HOSTS_ENV} is not: under AEGIX_SECURITY_PROFILE={} the \
+             credentials are withheld from every registry. Set \
+             {OCI_REGISTRY_CREDENTIAL_HOSTS_ENV} to the registry hosts they belong to",
+            profile.name()
+        )
+    } else {
+        format!(
+            "[MODULES] ! OCI_REGISTRY_USERNAME / OCI_REGISTRY_PASSWORD are set but \
+             {OCI_REGISTRY_CREDENTIAL_HOSTS_ENV} is not: the credentials are presented to \
+             whichever registry a module URI names. Set {OCI_REGISTRY_CREDENTIAL_HOSTS_ENV} \
+             to the registry hosts they belong to"
+        )
+    })
 }
 
 /// Whether this build carries the OCI registry client (`oci-client`, `oci-spec`
@@ -231,6 +439,18 @@ pub fn enforce_production_sigstore_policy_explicit() -> anyhow::Result<SigstoreP
     // operator configured one (2026-11-02): the policy stands, and every
     // `oci://` dispatch is refused before it would be consulted.
     if let Some(line) = registry_client_boot_notice(policy, registry_credentials_are_set()) {
+        eprintln!("{line}");
+    }
+    if let Some(line) = registry_credential_boot_notice(
+        aegix_config::security_profile::profile(),
+        registry_credentials_are_set(),
+        parse_credential_hosts(
+            std::env::var(OCI_REGISTRY_CREDENTIAL_HOSTS_ENV)
+                .ok()
+                .as_deref(),
+        )
+        .is_some(),
+    ) {
         eprintln!("{line}");
     }
     Ok(policy)
@@ -415,7 +635,9 @@ pub fn cosign_verify_argv(
 ///
 /// The store is the worker process's own (`TUF_ROOT` under its `/tmp`), so a
 /// gate in the process is the whole of it. The wait is on the job's own
-/// clock. The gate is released when the call returns or is dropped.
+/// clock: the worker acquires a module through [`fetch_within`], which drops
+/// the whole acquisition — this wait included — when the job's budget is
+/// spent. The gate is released when the call returns or is dropped.
 static COSIGN_VERIFY_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How long one `cosign verify` may run before it is killed and the job
@@ -470,10 +692,15 @@ pub async fn verify_oci_signature(
     };
     // A private registry: cosign reads its login from COSIGN_REGISTRY_*,
     // derived from the OCI_REGISTRY_* pair the pull itself uses (the one
-    // mapping, `aegix_sigstore_policy::cosign_registry_credentials_env`).
+    // mapping, `aegix_sigstore_policy::cosign_registry_credentials_env`) —
+    // and only for a registry the pull itself would present the pair to.
+    let registry = reference.split('/').next().unwrap_or_default();
+    let (user, password) = registry_credentials_for(registry).unzip();
     command
         .args(&argv)
-        .envs(aegix_sigstore_policy::cosign_registry_credentials_env_from_process());
+        .envs(aegix_sigstore_policy::cosign_registry_credentials_env(
+            user, password,
+        ));
     run_cosign_one_at_a_time(command, reference, COSIGN_VERIFY_LIMIT).await
 }
 
@@ -831,23 +1058,24 @@ enum BlobFetchError {
     Transport(String),
 }
 
-/// Stream a layer blob by digest, refusing once it exceeds `cap` (so a
-/// registry cannot grow host memory past the cap before any check runs).
+/// Read a response body, refusing once it exceeds `cap` (so a registry cannot
+/// grow host memory past the cap before any check runs). A declared
+/// `Content-Length` over the cap is refused before a byte is read.
 #[cfg(feature = "oci")]
-async fn fetch_capped_blob(
-    client: &oci_client::Client,
-    image: &oci_client::Reference,
-    layer: &oci_client::manifest::OciDescriptor,
+async fn read_body_capped(
+    response: reqwest::Response,
     cap: u64,
 ) -> Result<Vec<u8>, BlobFetchError> {
     use futures_util::StreamExt as _;
-    let mut stream = client
-        .pull_blob_stream(image, layer)
-        .await
-        .map_err(|e| BlobFetchError::Transport(e.to_string()))?;
+    if let Some(declared) = response.content_length() {
+        if declared > cap {
+            return Err(BlobFetchError::TooLarge(declared));
+        }
+    }
+    let mut stream = response.bytes_stream();
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| BlobFetchError::Transport(e.to_string()))?;
+        let chunk = chunk.map_err(|e| BlobFetchError::Transport(transport_reason(&e)))?;
         let next = out.len() as u64 + chunk.len() as u64;
         if next > cap {
             return Err(BlobFetchError::TooLarge(next));
@@ -855,6 +1083,91 @@ async fn fetch_capped_blob(
         out.extend_from_slice(&chunk);
     }
     Ok(out)
+}
+
+/// What a failed registry request is called in a job's result: the class of
+/// failure only. The error itself (which names URLs) goes to the log.
+#[cfg(feature = "oci")]
+fn transport_reason(e: &reqwest::Error) -> String {
+    ::tracing::warn!(error = %e, "registry request failed");
+    if e.is_timeout() {
+        "registry request timed out"
+    } else if e.is_redirect() {
+        "registry redirect refused"
+    } else if e.is_connect() {
+        "could not connect to the registry"
+    } else {
+        "registry request failed"
+    }
+    .to_string()
+}
+
+/// Log the start of a non-2xx registry response, for the operator. The body
+/// is read under [`MAX_OCI_ERROR_BODY_BYTES`] and never returned: until
+/// 2026-11-18 it was read whole and placed in the job's result, which let a
+/// registry both exhaust memory and hand a caller the body of whatever URL it
+/// redirected the worker to.
+#[cfg(feature = "oci")]
+async fn log_registry_refusal(what: &str, response: reqwest::Response) {
+    let status = response.status().as_u16();
+    let body = read_body_capped(response, MAX_OCI_ERROR_BODY_BYTES)
+        .await
+        .unwrap_or_default();
+    ::tracing::warn!(
+        what,
+        status,
+        body = ?String::from_utf8_lossy(&body),
+        "registry refused the request"
+    );
+}
+
+/// A digest as it may appear in a registry URL path: `algorithm:encoded`,
+/// from the characters the image spec allows. The layer digest comes from a
+/// manifest the registry wrote, and goes into the blob URL.
+#[cfg(feature = "oci")]
+fn digest_is_well_formed(digest: &str) -> bool {
+    let Some((algorithm, encoded)) = digest.split_once(':') else {
+        return false;
+    };
+    !algorithm.is_empty()
+        && !encoded.is_empty()
+        && digest.len() <= 256
+        && algorithm
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"+._-".contains(&b))
+        && encoded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"=_-".contains(&b))
+}
+
+/// Stream a layer blob by digest, refusing once it exceeds `cap` (so a
+/// registry cannot grow host memory past the cap before any check runs).
+#[cfg(feature = "oci")]
+async fn fetch_capped_blob(
+    client: &RegistryClient<'_>,
+    image: &oci_client::Reference,
+    layer: &oci_client::manifest::OciDescriptor,
+    cap: u64,
+) -> Result<Vec<u8>, BlobFetchError> {
+    if !digest_is_well_formed(&layer.digest) {
+        return Err(BlobFetchError::Transport(
+            "manifest names a malformed layer digest".to_string(),
+        ));
+    }
+    let url = client.net.url(image, "blobs", &layer.digest);
+    let response = client
+        .get(image, &url, None)
+        .await
+        .map_err(BlobFetchError::Transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        log_registry_refusal("blob", response).await;
+        return Err(BlobFetchError::Transport(format!(
+            "registry returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    read_body_capped(response, cap).await
 }
 
 /// Read a filesystem module: regular files only (not a device, FIFO or
@@ -936,41 +1249,504 @@ pub fn verify_oci_layer<'a>(
     }
 }
 
-// MCP-913 (2026-05-14): bare OnceLock<Client>, no outer Mutex.
-// `oci_client::Client::pull` takes `&self` (verified against
-// the 0.11 source — internal `auth_store: Arc<RwLock<HashMap<...>>>`
-// handles the token cache concurrency). Pre-fix `OnceLock<Mutex<Client>>`
-// + `client_mutex.lock().await` SERIALIZED every concurrent OCI pull
-// through one lock. The critical section held across:
-//   - sigstore `cosign verify` subprocess (network + fork, ~1-3s)
-//   - OCI registry pull (network + blob transfer, ~1-10s)
-//   - layer digest verify (fast)
-//   - Redis cache SET (network, fast)
-// So under worker concurrency, a second module pull waited for the
-// first to FULLY complete the chain. With 5–15s per pull, this
-// capped worker module-load throughput at one-at-a-time per scheme
-// (HTTPS / HTTP separately). The two schemes don't share locks but
-// neither do they handle hostname-level isolation.
+/// The HTTP client every registry request goes through, and the scheme it
+/// speaks. The worker's own, not `oci-client`'s: that client's is private, and
+/// had no timeout, followed any ten redirects, decoded gzip / brotli / deflate
+/// bodies transparently and read manifest, token and error bodies whole — so
+/// a registry a module URI named could hold a job forever or expand a few
+/// megabytes into gigabytes of worker memory, before any signature was
+/// checked (2026-11-18). `oci-client` still parses references and manifests.
 #[cfg(feature = "oci")]
-static OCI_CLIENT_HTTPS: OnceLock<oci_client::Client> = OnceLock::new();
-#[cfg(feature = "oci")]
-static OCI_CLIENT_HTTP: OnceLock<oci_client::Client> = OnceLock::new();
+struct RegistryHttp {
+    http: reqwest::Client,
+    scheme: &'static str,
+}
 
 #[cfg(feature = "oci")]
-fn get_oci_client(is_http: bool) -> &'static oci_client::Client {
-    if is_http {
-        OCI_CLIENT_HTTP.get_or_init(|| {
-            let client_config = oci_client::client::ClientConfig {
-                protocol: oci_client::client::ClientProtocol::Http,
-                ..Default::default()
-            };
-            oci_client::Client::new(client_config)
-        })
+static OCI_CLIENT_HTTPS: OnceLock<RegistryHttp> = OnceLock::new();
+#[cfg(feature = "oci")]
+static OCI_CLIENT_HTTP: OnceLock<RegistryHttp> = OnceLock::new();
+
+/// One client per scheme for the process. Shared without a lock, so
+/// concurrent pulls do not queue behind one another.
+#[cfg(feature = "oci")]
+fn get_oci_client(is_http: bool) -> &'static RegistryHttp {
+    let cell = if is_http {
+        &OCI_CLIENT_HTTP
     } else {
-        OCI_CLIENT_HTTPS.get_or_init(|| {
-            let client_config = oci_client::client::ClientConfig::default();
-            oci_client::Client::new(client_config)
+        &OCI_CLIENT_HTTPS
+    };
+    cell.get_or_init(|| RegistryHttp::new(is_http, oci_connect_timeout(), oci_read_timeout()))
+}
+
+#[cfg(feature = "oci")]
+impl RegistryHttp {
+    fn new(
+        is_http: bool,
+        connect_timeout: std::time::Duration,
+        read_timeout: std::time::Duration,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .user_agent("Aegix-Worker/1.0")
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
+            // A body is read as sent, so a cap on bytes read is a cap on
+            // bytes held. A registry that compresses anyway fails its digest.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .redirect(reqwest::redirect::Policy::custom(
+                move |attempt| match redirect_refusal(
+                    attempt.previous().len(),
+                    attempt.url(),
+                    is_http,
+                ) {
+                    Some(reason) => attempt.error(reason),
+                    None => attempt.follow(),
+                },
+            ))
+            .dns_resolver(std::sync::Arc::new(MetadataFilteringResolver))
+            .build()
+            .expect("worker: failed to build the registry HTTP client");
+        Self {
+            http,
+            scheme: if is_http { "http" } else { "https" },
+        }
+    }
+
+    /// `{scheme}://{registry}/v2/{repository}/{kind}/{id}` — the distribution
+    /// API's manifest and blob addresses.
+    fn url(&self, reference: &oci_client::Reference, kind: &str, id: &str) -> String {
+        format!(
+            "{}://{}/v2/{}/{kind}/{id}{}",
+            self.scheme,
+            reference.resolve_registry(),
+            reference.repository(),
+            reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
+        )
+    }
+}
+
+/// Why a redirect is not followed, or `None` to follow it. Pure. A registry
+/// redirects a blob to its storage host, which is followed (reqwest drops the
+/// `Authorization` header when the host changes); what is refused is a chain
+/// longer than [`MAX_OCI_REDIRECTS`], a step down from https, and a cloud
+/// metadata address.
+#[cfg(feature = "oci")]
+fn redirect_refusal(hops_so_far: usize, next: &url::Url, allow_http: bool) -> Option<&'static str> {
+    if hops_so_far >= MAX_OCI_REDIRECTS {
+        return Some("too many redirects");
+    }
+    match next.scheme() {
+        "https" => {}
+        "http" if allow_http => {}
+        _ => return Some("redirect leaves https"),
+    }
+    match next.host_str() {
+        Some(host) if !is_metadata_service_host(host) => None,
+        _ => Some("redirect to a cloud metadata host"),
+    }
+}
+
+/// Resolves a registry's name and drops any cloud metadata address from the
+/// answer, so a DNS name that points at one is refused at connect — the name
+/// check in [`is_metadata_service_host`] sees only the spelling. Private
+/// addresses are kept: an in-cluster registry is a legitimate one.
+#[cfg(feature = "oci")]
+struct MetadataFilteringResolver;
+
+#[cfg(feature = "oci")]
+impl reqwest::dns::Resolve for MetadataFilteringResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // The port is a placeholder `lookup_host` needs; zeroed below so
+            // the connector supplies the real one.
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(format!("{host}:80"))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .filter(|addr| !is_metadata_ip(addr.ip()))
+                .map(|mut addr| {
+                    addr.set_port(0);
+                    addr
+                })
+                .collect();
+            if addrs.is_empty() {
+                ::tracing::error!(
+                    host = %host,
+                    "registry host resolves to no address but a cloud metadata one — refusing"
+                );
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "registry host resolves to a cloud metadata address",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
+    }
+}
+
+/// What a registry's `WWW-Authenticate` header asks for.
+#[cfg(feature = "oci")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthChallenge {
+    /// The token flow: ask `realm` for a pull token.
+    Bearer {
+        realm: String,
+        service: Option<String>,
+    },
+    Basic,
+    /// No header, or a scheme the worker does not speak.
+    Unknown,
+}
+
+/// Parse one `WWW-Authenticate` value. Pure. Parameters are `key="value"` or
+/// `key=value`, comma-separated; a quoted value may hold commas.
+#[cfg(feature = "oci")]
+fn parse_auth_challenge(header: &str) -> AuthChallenge {
+    let header = header.trim();
+    let (scheme, rest) = header
+        .split_once(char::is_whitespace)
+        .unwrap_or((header, ""));
+    if scheme.eq_ignore_ascii_case("basic") {
+        return AuthChallenge::Basic;
+    }
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return AuthChallenge::Unknown;
+    }
+    let (mut realm, mut service) = (None, None);
+    let mut rest = rest.trim_start();
+    while !rest.is_empty() {
+        let Some((key, after)) = rest.split_once('=') else {
+            break;
+        };
+        let (value, remainder) = match after.strip_prefix('"') {
+            Some(quoted) => match quoted.split_once('"') {
+                Some((value, remainder)) => (value, remainder),
+                None => (quoted, ""),
+            },
+            None => after.split_once(',').unwrap_or((after, "")),
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "realm" => realm = Some(value.trim().to_string()),
+            "service" => service = Some(value.trim().to_string()),
+            _ => {}
+        }
+        rest = remainder.trim_start_matches([',', ' ', '\t']);
+    }
+    match realm {
+        Some(realm) if !realm.is_empty() => AuthChallenge::Bearer { realm, service },
+        _ => AuthChallenge::Unknown,
+    }
+}
+
+/// The challenge a 401 carries: the token flow if any header offers it.
+#[cfg(feature = "oci")]
+fn challenge_of(headers: &reqwest::header::HeaderMap) -> AuthChallenge {
+    let mut found = AuthChallenge::Unknown;
+    for value in headers.get_all(reqwest::header::WWW_AUTHENTICATE) {
+        match value.to_str().map(parse_auth_challenge) {
+            Ok(bearer @ AuthChallenge::Bearer { .. }) => return bearer,
+            Ok(AuthChallenge::Basic) => found = AuthChallenge::Basic,
+            _ => {}
+        }
+    }
+    found
+}
+
+/// A registry's token response: the token under either name registries use,
+/// and how long it lasts (the token spec's default is 60 s).
+#[cfg(feature = "oci")]
+#[derive(serde::Deserialize)]
+struct TokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+/// Pull tokens by registry, repository and login, kept for at most five
+/// minutes and never past their own expiry, so a registry reference — whose
+/// manifest is fetched on every dispatch — does not ask for a token each time.
+#[cfg(feature = "oci")]
+static REGISTRY_TOKENS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (String, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "oci")]
+const REGISTRY_TOKEN_CACHE_ENTRIES: usize = 256;
+
+#[cfg(feature = "oci")]
+fn cached_registry_token(key: &str) -> Option<String> {
+    let mut guard = REGISTRY_TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    let tokens = guard.get_or_insert_with(Default::default);
+    match tokens.get(key) {
+        Some((token, expires)) if *expires > std::time::Instant::now() => Some(token.clone()),
+        Some(_) => {
+            tokens.remove(key);
+            None
+        }
+        None => None,
+    }
+}
+
+#[cfg(feature = "oci")]
+fn forget_registry_token(key: &str) {
+    let mut guard = REGISTRY_TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tokens) = guard.as_mut() {
+        tokens.remove(key);
+    }
+}
+
+#[cfg(feature = "oci")]
+fn remember_registry_token(key: String, token: String, expires_in_secs: u64) {
+    // Ten seconds short of expiry, so a token is not used as it lapses.
+    let keep = expires_in_secs.min(300).saturating_sub(10);
+    if keep == 0 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut guard = REGISTRY_TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    let tokens = guard.get_or_insert_with(Default::default);
+    if tokens.len() >= REGISTRY_TOKEN_CACHE_ENTRIES {
+        tokens.retain(|_, (_, expires)| *expires > now);
+        if tokens.len() >= REGISTRY_TOKEN_CACHE_ENTRIES {
+            tokens.clear();
+        }
+    }
+    tokens.insert(key, (token, now + std::time::Duration::from_secs(keep)));
+}
+
+/// One pull's view of a registry: the shared HTTP client and the login this
+/// registry is given, if any ([`registry_credentials_for`]).
+#[cfg(feature = "oci")]
+struct RegistryClient<'a> {
+    net: &'a RegistryHttp,
+    credentials: Option<(String, String)>,
+}
+
+#[cfg(feature = "oci")]
+enum RequestAuth<'a> {
+    None,
+    Bearer(&'a str),
+    Basic(&'a (String, String)),
+}
+
+#[cfg(feature = "oci")]
+impl RegistryClient<'_> {
+    fn token_key(&self, reference: &oci_client::Reference) -> String {
+        format!(
+            "{}://{}/{}|{}",
+            self.net.scheme,
+            reference.resolve_registry(),
+            reference.repository(),
+            self.credentials
+                .as_ref()
+                .map(|(user, _)| user.as_str())
+                .unwrap_or_default()
+        )
+    }
+
+    async fn send(
+        &self,
+        url: &str,
+        accept: Option<&str>,
+        auth: RequestAuth<'_>,
+    ) -> Result<reqwest::Response, String> {
+        let mut request = self.net.http.get(url);
+        if let Some(accept) = accept {
+            request = request.header(reqwest::header::ACCEPT, accept);
+        }
+        request = match auth {
+            RequestAuth::None => request,
+            RequestAuth::Bearer(token) => request.bearer_auth(token),
+            RequestAuth::Basic((user, password)) => request.basic_auth(user, Some(password)),
+        };
+        request.send().await.map_err(|e| transport_reason(&e))
+    }
+
+    /// GET a registry URL, answering one authentication challenge: a request
+    /// goes out with the cached token or none, and a 401 is answered once, by
+    /// the token flow or by the registry's own login, as its header asks.
+    async fn get(
+        &self,
+        reference: &oci_client::Reference,
+        url: &str,
+        accept: Option<&str>,
+    ) -> Result<reqwest::Response, String> {
+        let key = self.token_key(reference);
+        let cached = cached_registry_token(&key);
+        let first = self
+            .send(
+                url,
+                accept,
+                cached
+                    .as_deref()
+                    .map_or(RequestAuth::None, RequestAuth::Bearer),
+            )
+            .await?;
+        if first.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(first);
+        }
+        let challenge = challenge_of(first.headers());
+        drop(first);
+        if cached.is_some() {
+            forget_registry_token(&key);
+        }
+        match challenge {
+            AuthChallenge::Bearer { realm, service } => {
+                let (token, expires_in) = self
+                    .pull_token(reference, &realm, service.as_deref())
+                    .await?;
+                let response = self.send(url, accept, RequestAuth::Bearer(&token)).await?;
+                remember_registry_token(key, token, expires_in);
+                Ok(response)
+            }
+            AuthChallenge::Basic => match &self.credentials {
+                Some(login) => self.send(url, accept, RequestAuth::Basic(login)).await,
+                None => Err("registry returned HTTP 401 (it asks for a login)".to_string()),
+            },
+            AuthChallenge::Unknown => Err("registry returned HTTP 401".to_string()),
+        }
+    }
+
+    /// Ask the registry's token service for a pull token for this repository.
+    /// The service is wherever the registry's challenge says; it is held to
+    /// the registry's own scheme and is never a cloud metadata host. The
+    /// login, when this registry is given one, is presented to it — that is
+    /// the token flow, and the operator named the registry.
+    async fn pull_token(
+        &self,
+        reference: &oci_client::Reference,
+        realm: &str,
+        service: Option<&str>,
+    ) -> Result<(String, u64), String> {
+        let mut url =
+            url::Url::parse(realm).map_err(|_| "registry names an unusable token service")?;
+        let host_ok = url
+            .host_str()
+            .is_some_and(|host| !is_metadata_service_host(host));
+        if !host_ok || !(url.scheme() == "https" || url.scheme() == self.net.scheme) {
+            ::tracing::error!(realm = %realm, "registry token service refused");
+            return Err("registry names a token service the worker will not call".to_string());
+        }
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(service) = service {
+                query.append_pair("service", service);
+            }
+            query.append_pair(
+                "scope",
+                &format!("repository:{}:pull", reference.repository()),
+            );
+        }
+        let auth = self
+            .credentials
+            .as_ref()
+            .map_or(RequestAuth::None, RequestAuth::Basic);
+        let response = self.send(url.as_str(), None, auth).await?;
+        let status = response.status();
+        if !status.is_success() {
+            log_registry_refusal("token", response).await;
+            return Err(format!(
+                "registry token service returned HTTP {}",
+                status.as_u16()
+            ));
+        }
+        let body = match read_body_capped(response, MAX_OCI_TOKEN_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(BlobFetchError::TooLarge(_)) => {
+                return Err("registry token response is too large".to_string())
+            }
+            Err(BlobFetchError::Transport(reason)) => return Err(reason),
+        };
+        let parsed: TokenResponse = serde_json::from_slice(&body)
+            .map_err(|_| "registry token response is unparseable".to_string())?;
+        let token = parsed
+            .token
+            .or(parsed.access_token)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| "registry token response carries no token".to_string())?;
+        Ok((token, parsed.expires_in.unwrap_or(60)))
+    }
+
+    /// Fetch a manifest's bytes under [`MAX_OCI_MANIFEST_BYTES`], with the
+    /// registry's `Docker-Content-Digest` header when it sent one. The digest
+    /// that binds the pull is computed from these bytes by
+    /// [`pin_oci_manifest`]; the header is only compared with it.
+    async fn fetch_manifest(
+        &self,
+        reference: &oci_client::Reference,
+    ) -> Result<(Vec<u8>, Option<String>), String> {
+        let id = reference
+            .digest()
+            .or(reference.tag())
+            .unwrap_or("latest")
+            .to_string();
+        let url = self.net.url(reference, "manifests", &id);
+        let accept = OCI_IMAGE_MANIFEST_MEDIA_TYPES.join(", ");
+        let response = self.get(reference, &url, Some(&accept)).await?;
+        let status = response.status();
+        if !status.is_success() {
+            log_registry_refusal("manifest", response).await;
+            return Err(format!("registry returned HTTP {}", status.as_u16()));
+        }
+        let header_digest = response
+            .headers()
+            .get("docker-content-digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        match read_body_capped(response, MAX_OCI_MANIFEST_BYTES).await {
+            Ok(body) => Ok((body, header_digest)),
+            Err(BlobFetchError::TooLarge(seen)) => Err(format!(
+                "manifest is at least {seen} bytes, cap is {MAX_OCI_MANIFEST_BYTES}"
+            )),
+            Err(BlobFetchError::Transport(reason)) => Err(reason),
+        }
+    }
+}
+
+/// Whether `ip` is a cloud metadata service address, in any spelling an IPv6
+/// address can give an IPv4 one (mapped, compatible, NAT64, 6to4).
+fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        // 169.254.169.254 — AWS/Azure/GCP/Oracle/DO IMDS;
+        // 100.100.100.200 — Alibaba Cloud.
+        std::net::IpAddr::V4(v4) => {
+            matches!(v4.octets(), [169, 254, 169, 254] | [100, 100, 100, 200])
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // fd00:ec2::254 — AWS IMDSv2 over IPv6.
+            if s == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254] {
+                return true;
+            }
+            let v4 = |hi: u16, lo: u16| {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    (hi >> 8) as u8,
+                    hi as u8,
+                    (lo >> 8) as u8,
+                    lo as u8,
+                ))
+            };
+            // IPv4-mapped and IPv4-compatible (`::ffff:a.b.c.d`, `::a.b.c.d`)
+            // and NAT64 (`64:ff9b::/96`) carry the address in the last two
+            // segments; 6to4 (`2002::/16`) in the second and third.
+            let in_low_bits = (s[..5] == [0; 5] && (s[5] == 0xffff || s[5] == 0))
+                || s[..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
+            let embedded = if in_low_bits {
+                Some(v4(s[6], s[7]))
+            } else if s[0] == 0x2002 {
+                Some(v4(s[1], s[2]))
+            } else {
+                None
+            };
+            embedded.is_some_and(is_metadata_ip)
+        }
     }
 }
 
@@ -996,12 +1772,17 @@ fn get_oci_client(is_http: bool) -> &'static oci_client::Client {
 /// * Oracle Cloud: `169.254.169.254` (same)
 /// * Alibaba Cloud: `100.100.100.200`
 ///
-/// Comparison is case-insensitive for DNS names; IP literals are
-/// compared by parsing both sides as `IpAddr` so spelling tricks
-/// (`169.254.169.0254`, `0xa9.0xfe.0xa9.0xfe`, `2852039166`) don't
-/// bypass — `Ipv4Addr::from_str` accepts only canonical dotted-quad
-/// form, but a future hostile encoding could be added here as the
-/// threat landscape evolves.
+/// Comparison is case-insensitive for DNS names. An IP literal is read the
+/// way the HTTP client will read it — as a URL host — before it is compared:
+/// a URL parser takes `0xa9.0xfe.0xa9.0xfe`, `2852039166`, `0251.0376.0251.0376`
+/// and `169.254.43518` for 169.254.169.254, while `IpAddr::from_str` rejects
+/// all four, so a gate that only parsed the canonical dotted quad passed them
+/// to a client that then connected to the metadata service (until 2026-11-18
+/// this comment claimed the opposite). An IPv6 spelling of an IPv4 metadata
+/// address is refused as that address ([`is_metadata_ip`]).
+///
+/// A DNS name that RESOLVES to a metadata address is not this function's to
+/// see; the registry client's resolver drops such an answer at connect.
 pub fn is_metadata_service_host(host: &str) -> bool {
     // Strip port. The OCI registry component is one of:
     //   1. `host` — bare DNS / IPv4
@@ -1020,7 +1801,7 @@ pub fn is_metadata_service_host(host: &str) -> bool {
         // `[v6addr]` or `[v6addr]:port` — strip brackets, drop suffix.
         match end.split_once(']') {
             Some((v6, _after_bracket)) => v6,
-            None => host, // malformed — let `parse::<IpAddr>` fail below
+            None => host, // malformed — no parse below accepts it
         }
     } else if let Some((before, after)) = host.rsplit_once(':') {
         // `host:port`. The port suffix must be ASCII digits; otherwise
@@ -1034,45 +1815,34 @@ pub fn is_metadata_service_host(host: &str) -> bool {
     } else {
         host
     };
+    // A fully-qualified spelling names the same host.
+    let host_no_port = host_no_port.trim_end_matches('.');
 
-    // DNS-name matches (case-insensitive).
-    let dns_matches = [
-        "metadata.google.internal",
-        "metadata",
-        "metadata.aws.amazon.com",
-    ];
-    for name in dns_matches {
-        if host_no_port.eq_ignore_ascii_case(name) {
-            return true;
-        }
+    let is_metadata_name = |name: &str| {
+        [
+            "metadata.google.internal",
+            "metadata",
+            "metadata.aws.amazon.com",
+        ]
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+    };
+    if is_metadata_name(host_no_port) {
+        return true;
     }
-
-    // IP-literal matches.
     if let Ok(ip) = host_no_port.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                // 169.254.169.254 — AWS/Azure/GCP/Oracle/DO IMDS.
-                if v4.octets() == [169, 254, 169, 254] {
-                    return true;
-                }
-                // 100.100.100.200 — Alibaba Cloud metadata.
-                if v4.octets() == [100, 100, 100, 200] {
-                    return true;
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                // fd00:ec2::254 — AWS IMDSv2 IPv6.
-                // Decompresses to `fd00:0ec2:0:0:0:0:0:0254`, so the
-                // segment layout is `[0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]`.
-                let segs = v6.segments();
-                if segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254] {
-                    return true;
-                }
-            }
-        }
+        return is_metadata_ip(ip);
     }
-
-    false
+    // Not a canonical literal: ask the URL parser what host this is.
+    match url::Url::parse(&format!("http://{host_no_port}/")) {
+        Ok(parsed) => match parsed.host() {
+            Some(url::Host::Ipv4(v4)) => is_metadata_ip(std::net::IpAddr::V4(v4)),
+            Some(url::Host::Ipv6(v6)) => is_metadata_ip(std::net::IpAddr::V6(v6)),
+            Some(url::Host::Domain(name)) => is_metadata_name(name.trim_end_matches('.')),
+            None => false,
+        },
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -1123,6 +1893,59 @@ mod is_metadata_service_host_tests {
         assert!(!is_metadata_service_host("us-docker.pkg.dev"));
     }
 
+    /// The spellings a URL parser reads as 169.254.169.254 and `IpAddr`
+    /// does not: each reached the metadata service through the old gate.
+    #[test]
+    fn non_canonical_ipv4_spellings_are_blocked() {
+        for spelling in [
+            "0xa9.0xfe.0xa9.0xfe",
+            "0xA9FEA9FE",
+            "2852039166",
+            "0251.0376.0251.0376",
+            "169.254.43518",
+            "169.16689662",
+            "169.254.169.254.",
+            "2852039166:443",
+            "0xa9.0xfe.0xa9.0xfe:5000",
+        ] {
+            assert!(is_metadata_service_host(spelling), "{spelling} passed");
+        }
+        // Alibaba's, the same way.
+        assert!(is_metadata_service_host("0x64.0x64.0x64.0xc8"));
+        assert!(is_metadata_service_host("1684301000"));
+    }
+
+    #[test]
+    fn ipv6_spellings_of_the_ipv4_address_are_blocked() {
+        for spelling in [
+            "::ffff:169.254.169.254",
+            "[::ffff:169.254.169.254]:443",
+            "[::ffff:a9fe:a9fe]",
+            "::169.254.169.254",
+            "64:ff9b::169.254.169.254",
+            "2002:a9fe:a9fe::1",
+            "[0:0:0:0:0:ffff:6464:64c8]:80",
+        ] {
+            assert!(is_metadata_service_host(spelling), "{spelling} passed");
+        }
+        assert!(!is_metadata_service_host("::ffff:10.0.0.5"));
+        assert!(!is_metadata_service_host("[::1]:5000"));
+    }
+
+    #[test]
+    fn a_fully_qualified_metadata_name_is_blocked() {
+        assert!(is_metadata_service_host("metadata.google.internal."));
+        assert!(is_metadata_service_host("metadata.google.internal.:80"));
+    }
+
+    #[test]
+    fn non_canonical_spellings_of_other_hosts_are_allowed() {
+        // 127.0.0.1 and 10.0.0.5, spelt the same odd ways: a local registry.
+        assert!(!is_metadata_service_host("0x7f.0.0.1:5000"));
+        assert!(!is_metadata_service_host("2130706433"));
+        assert!(!is_metadata_service_host("167772165"));
+    }
+
     #[test]
     fn near_misses_allowed() {
         // Unicode lookalikes — host_no_port comparison is byte-exact for IPs.
@@ -1133,6 +1956,125 @@ mod is_metadata_service_host_tests {
         assert!(!is_metadata_service_host("169.254.0.1"));
         // Not a registry name pattern.
         assert!(!is_metadata_service_host("registry-metadata.example.com"));
+    }
+}
+
+/// What a size-checked Redis read found.
+enum CappedRedisValue {
+    /// No such key, or Redis could not be asked.
+    Missing,
+    /// The value is this many bytes, over the cap; it was not read.
+    TooLarge(u64),
+    Found(Vec<u8>),
+}
+
+/// Whether a Redis value of `len` bytes is read under `cap`. Pure. `STRLEN`
+/// answers 0 for a key that does not exist.
+fn redis_value_admitted(len: u64, cap: u64) -> Result<bool, u64> {
+    match len {
+        0 => Ok(false),
+        len if len > cap => Err(len),
+        _ => Ok(true),
+    }
+}
+
+/// `GET` a module from Redis only after `STRLEN` says it fits. A bare `GET`
+/// materialises the whole value before any check can run, so a planted
+/// 512 MiB value cost that much memory per job that touched the key.
+async fn redis_get_capped<C>(conn: &mut C, key: &str, cap: u64) -> CappedRedisValue
+where
+    C: redis::aio::ConnectionLike + Send,
+{
+    let len = match redis::cmd("STRLEN").arg(key).query_async::<u64>(conn).await {
+        Ok(len) => len,
+        Err(_) => return CappedRedisValue::Missing,
+    };
+    match redis_value_admitted(len, cap) {
+        Ok(false) => return CappedRedisValue::Missing,
+        Err(len) => return CappedRedisValue::TooLarge(len),
+        Ok(true) => {}
+    }
+    match redis::cmd("GET")
+        .arg(key)
+        .query_async::<Option<Vec<u8>>>(conn)
+        .await
+    {
+        // The value can be replaced between the two commands.
+        Ok(Some(b)) if (b.len() as u64) > cap => CappedRedisValue::TooLarge(b.len() as u64),
+        Ok(Some(b)) => CappedRedisValue::Found(b),
+        _ => CappedRedisValue::Missing,
+    }
+}
+
+/// Whether an OCI pull's bytes are attested in this run, pure: the Sigstore
+/// signature was VERIFIED, or the reference in the signed job pins the
+/// manifest by digest (the dispatch signature then covers the manifest, and
+/// the manifest names the layer digest the bytes were checked against). A
+/// tag reference that was not verified — the `disabled` policy, or `audit`
+/// with no identity or a failed check — is digest-checked only against what
+/// the registry itself said, and is not attested.
+#[must_use]
+pub fn oci_pull_is_attested(check: &SigstoreCheck, reference_pins_digest: bool) -> bool {
+    reference_pins_digest || *check == SigstoreCheck::Verified
+}
+
+/// The first token of the [`FetchError::message`] of an acquisition that ran
+/// out of its budget.
+pub const MODULE_FETCH_TIMED_OUT_REASON: &str = "module_fetch_timed_out";
+
+/// How long one job may spend acquiring its module: its own execution
+/// timeout (`fallback` when the request names none), and never past its
+/// deadline. Pure.
+#[must_use]
+pub fn fetch_budget(
+    timeout_ms: u64,
+    deadline_unix_secs: u64,
+    now_unix_secs: u64,
+    fallback: std::time::Duration,
+) -> std::time::Duration {
+    let own = if timeout_ms > 0 {
+        std::time::Duration::from_millis(timeout_ms)
+    } else {
+        fallback
+    };
+    if deadline_unix_secs == 0 {
+        return own;
+    }
+    own.min(std::time::Duration::from_secs(
+        deadline_unix_secs.saturating_sub(now_unix_secs),
+    ))
+}
+
+/// [`fetch`], abandoned when `budget` is spent. What the worker calls: a job
+/// holds a concurrency permit while its module is acquired, and until
+/// 2026-11-18 nothing bounded that — a registry that accepted the connection
+/// and then stalled, or a queue behind the cosign gate, held the permit for
+/// good. Dropping the acquisition drops its requests and kills a running
+/// `cosign verify`.
+pub async fn fetch_within(
+    req: &JobRequest,
+    runtime: &AegixRuntime,
+    span: &mut JobSpan,
+    budget: std::time::Duration,
+) -> Result<FetchedModule, FetchError> {
+    match tokio::time::timeout(budget, fetch(req, runtime, span)).await {
+        Ok(fetched) => fetched,
+        Err(_) => {
+            ::tracing::warn!(
+                job_id = %req.job_id,
+                module_uri = %req.module_uri,
+                budget_ms = budget.as_millis() as u64,
+                "module acquisition did not finish within the job's budget"
+            );
+            span.set_attribute("error", MODULE_FETCH_TIMED_OUT_REASON);
+            Err(FetchError {
+                message: format!(
+                    "{MODULE_FETCH_TIMED_OUT_REASON}: the module was not acquired within \
+                     the job's time budget ({} ms)",
+                    budget.as_millis()
+                ),
+            })
+        }
     }
 }
 
@@ -1197,36 +2139,30 @@ pub async fn fetch(
                     .module_uri
                     .strip_prefix("redis:")
                     .unwrap_or(&req.module_uri);
-                if let Ok(Some(b)) = redis::cmd("GET")
-                    .arg(key)
-                    .query_async::<Option<Vec<u8>>>(&mut conn)
-                    .await
-                {
-                    found_bytes = Some(b);
+                // The cap applies to this path too — a Redis writer could
+                // plant an oversized value here — and it is asked of Redis
+                // BEFORE the value is read, so a refused value is never held.
+                let layer_cap = max_oci_layer_bytes();
+                match redis_get_capped(&mut conn, key, layer_cap).await {
+                    CappedRedisValue::Found(b) => found_bytes = Some(b),
+                    CappedRedisValue::Missing => {}
+                    CappedRedisValue::TooLarge(size) => {
+                        let err = format!(
+                            "wasm_module_too_large: redis:wasm: blob is {size} bytes, cap is {layer_cap}"
+                        );
+                        ::tracing::error!(
+                            module_uri = %req.module_uri,
+                            blob_size = size,
+                            cap_bytes = layer_cap,
+                            "redis:wasm: blob exceeds cap — refusing to execute"
+                        );
+                        return Err(FetchError { message: err });
+                    }
                 }
             }
         }
 
         if let Some(b) = found_bytes {
-            // H-3: cap also applies to the direct `redis:wasm:` path —
-            // an attacker with Redis write access could plant an
-            // oversized WASM blob here too. Reject before the bytes
-            // reach wasmtime so the OOM defense applies uniformly
-            // across all load sources.
-            let layer_cap = max_oci_layer_bytes();
-            if (b.len() as u64) > layer_cap {
-                let err = format!(
-                    "wasm_module_too_large: redis:wasm: blob is {} bytes, cap is {layer_cap}",
-                    b.len()
-                );
-                ::tracing::error!(
-                    module_uri = %req.module_uri,
-                    blob_size = b.len(),
-                    cap_bytes = layer_cap,
-                    "redis:wasm: blob exceeds cap — refusing to execute"
-                );
-                return Err(FetchError { message: err });
-            }
             span.set_attribute_int("module_size_bytes", b.len() as i64);
             span.set_attribute("module_source", "redis");
             b
@@ -1330,7 +2266,6 @@ async fn fetch_from_registry(
     // eliminates the cache-poisoning window.
     let mut found_bytes: Option<Vec<u8>> = None;
 
-    use oci_client::secrets::RegistryAuth;
     use oci_client::Reference;
 
     if let Ok(reference) = image_ref.parse::<Reference>() {
@@ -1387,35 +2322,14 @@ async fn fetch_from_registry(
             false
         };
 
-        // MCP-913: direct &Client — see OCI_CLIENT_HTTPS/HTTP comment for
-        // why the prior `client_mutex.lock().await` was a concurrency
-        // bottleneck. `Client::pull` is `&self` and thread-safe.
-        let client = get_oci_client(is_http);
-
-        // In a production enterprise setting, these would be loaded from HashiCorp Vault or mounted Secrets.
-        // MCP-762 (2026-05-13): match the sibling helper
-        // `aegix-registry::sync::registry_auth_from_env` (sync.rs:547)
-        // by filtering empty strings before constructing
-        // RegistryAuth::Basic. Pre-fix, `OCI_REGISTRY_USERNAME=""`
-        // (helm placeholder pattern) yielded `Ok("")` from
-        // std::env::var, took the `if let (Ok, Ok)` branch, and
-        // produced `RegistryAuth::Basic("", "")` — sent as
-        // `Authorization: Basic Og==` (base64 of `:`). The registry
-        // rejects with 401 instead of falling back to the
-        // documented anonymous-for-public-artifacts path. Same
-        // empty-env-var class as MCP-590/591/653/710/752/753; the
-        // controller-side `registry_auth_from_env` had the right
-        // shape but the worker-side resolver was the drift.
-        let user_opt = std::env::var("OCI_REGISTRY_USERNAME")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let pass_opt = std::env::var("OCI_REGISTRY_PASSWORD")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let auth = match (user_opt, pass_opt) {
-            (Some(user), Some(password)) => RegistryAuth::Basic(user, password),
-            _ => RegistryAuth::Anonymous,
+        // The registry's login, when the operator named this registry for
+        // it ([`registry_credentials_for`]); anonymous otherwise, which is
+        // also the documented path for a public artifact.
+        let registry_client = RegistryClient {
+            net: get_oci_client(is_http),
+            credentials: registry_credentials_for(reference.registry()),
         };
+        let client = &registry_client;
 
         let layer_cap = max_oci_layer_bytes();
 
@@ -1429,19 +2343,18 @@ async fn fetch_from_registry(
         // `Docker-Content-Digest` header is not trusted), cosign verifies
         // `repo@<that digest>`, and the layer blob is fetched by digest
         // from that same manifest.
-        let (manifest_body, header_digest) = match client
-            .pull_manifest_raw(&reference, &auth, OCI_IMAGE_MANIFEST_MEDIA_TYPES)
-            .await
-        {
+        let (manifest_body, header_digest) = match client.fetch_manifest(&reference).await {
             Ok(v) => v,
-            Err(e) => {
+            Err(reason) => {
                 ::tracing::warn!(
                     module_uri = %req.module_uri,
-                    error = %e,
+                    reason = %reason,
                     "Failed to fetch OCI manifest"
                 );
                 return Err(FetchError {
-                    message: sanitize_error_message(&format!("oci_manifest_fetch_failed: {e}")),
+                    message: sanitize_error_message(&format!(
+                        "oci_manifest_fetch_failed: {reason}"
+                    )),
                 });
             }
         };
@@ -1456,7 +2369,7 @@ async fn fetch_from_registry(
                 return Err(FetchError { message });
             }
         };
-        if header_digest != pinned.manifest_digest {
+        if let Some(header_digest) = header_digest.filter(|d| *d != pinned.manifest_digest) {
             ::tracing::warn!(
                 module_uri = %req.module_uri,
                 header_digest = %header_digest,
@@ -1555,74 +2468,79 @@ async fn fetch_from_registry(
             }
         };
 
+        // Whether these bytes count as attested in this run
+        // ([`oci_pull_is_attested`]): the signature was verified, or the
+        // signed module URI itself pins the manifest digest. Until
+        // 2026-11-18 every digest-checked pull was marked attested, so under
+        // `disabled`, or `audit` with a failed verification, a tag-only
+        // reference with no expected hash ran whatever the registry served
+        // and the worker's unattested-bytes gate never saw it.
+        let attested = oci_pull_is_attested(&sigstore_check, reference.digest().is_some());
+
         // H1: digest-keyed cache lookup, keyed on the layer digest named
         // by the manifest whose OWN digest we computed and (per policy)
         // signature-verified above.
         //
         // Cache hit re-verifies the cached bytes against the
         // expected digest before serving (defense in depth against
-        // a Redis-write attacker). The cache is ONLY written below
-        // after both sigstore + digest checks pass in this run, so
-        // a hit implies prior attestation; we mark
-        // `bytes_attested_in_this_run` accordingly so the
-        // downstream `expected_wasm_hash` fallback doesn't kick in
-        // and re-fail for cached-but-no-hash-provided jobs.
+        // a Redis-write attacker). A hit is attested exactly when a
+        // fresh pull would be (`attested` above): the Sigstore step
+        // has already run for this dispatch, and the layer digest
+        // comes from the manifest it covered.
         let redis_key = Some(format!("oci_cache:{}", pinned.layer.digest));
         if let (Some(digest), Some(key)) = (Some(&pinned.layer.digest), &redis_key) {
             if let Some(redis_client) = runtime.redis_client() {
                 if let Ok(mut conn) = aegix_redis::multiplexed(&redis_client).await {
-                    if let Ok(Some(b)) = redis::cmd("GET")
-                        .arg(key)
-                        .query_async::<Option<Vec<u8>>>(&mut conn)
-                        .await
-                    {
-                        if (b.len() as u64) > layer_cap {
-                            ::tracing::error!(
-                                module_uri = %req.module_uri,
-                                cached_size = b.len(),
-                                cap_bytes = layer_cap,
-                                "Redis OCI cache hit exceeds layer cap — discarding cache entry, will refetch from registry"
-                            );
-                            let _: Result<(), _> = redis::cmd("DEL")
-                                .arg(key)
-                                .query_async::<()>(&mut conn)
-                                .await;
-                        } else {
-                            // Re-verify cached bytes against the
-                            // declared digest. A Redis-write
-                            // attacker who replaced the value but
-                            // not the key would fail here.
-                            match verify_oci_layer(&b, Some(digest.as_str())) {
-                                LayerVerdict::Verified { .. } => {
-                                    span.add_event("oci_cache_hit");
-                                    span.set_attribute("module_source", "redis_oci_cache");
-                                    *attested_in_this_run = true;
-                                    found_bytes = Some(b);
-                                }
-                                LayerVerdict::DigestMismatch { expected, computed } => {
-                                    ::tracing::error!(
-                                        module_uri = %req.module_uri,
-                                        expected = %expected,
-                                        computed = %computed,
-                                        "Redis OCI cache hit failed digest re-verification — evicting and refetching"
-                                    );
-                                    let _: Result<(), _> = redis::cmd("DEL")
-                                        .arg(key)
-                                        .query_async::<()>(&mut conn)
-                                        .await;
-                                }
-                                LayerVerdict::AcceptedUnverified => {
-                                    // Unreachable: we passed
-                                    // Some(digest) above so the
-                                    // None arm doesn't fire. Belt-
-                                    // and-braces: evict to force a
-                                    // fresh pull rather than serving
-                                    // unverified bytes.
-                                    let _: Result<(), _> = redis::cmd("DEL")
-                                        .arg(key)
-                                        .query_async::<()>(&mut conn)
-                                        .await;
-                                }
+                    // Sized before it is read: an over-cap entry is
+                    // discarded without ever being loaded.
+                    let cached = redis_get_capped(&mut conn, key, layer_cap).await;
+                    if let CappedRedisValue::TooLarge(cached_size) = cached {
+                        ::tracing::error!(
+                            module_uri = %req.module_uri,
+                            cached_size,
+                            cap_bytes = layer_cap,
+                            "Redis OCI cache hit exceeds layer cap — discarding cache entry, will refetch from registry"
+                        );
+                        let _: Result<(), _> = redis::cmd("DEL")
+                            .arg(key)
+                            .query_async::<()>(&mut conn)
+                            .await;
+                    }
+                    if let CappedRedisValue::Found(b) = cached {
+                        // Re-verify cached bytes against the
+                        // declared digest. A Redis-write
+                        // attacker who replaced the value but
+                        // not the key would fail here.
+                        match verify_oci_layer(&b, Some(digest.as_str())) {
+                            LayerVerdict::Verified { .. } => {
+                                span.add_event("oci_cache_hit");
+                                span.set_attribute("module_source", "redis_oci_cache");
+                                *attested_in_this_run = attested;
+                                found_bytes = Some(b);
+                            }
+                            LayerVerdict::DigestMismatch { expected, computed } => {
+                                ::tracing::error!(
+                                    module_uri = %req.module_uri,
+                                    expected = %expected,
+                                    computed = %computed,
+                                    "Redis OCI cache hit failed digest re-verification — evicting and refetching"
+                                );
+                                let _: Result<(), _> = redis::cmd("DEL")
+                                    .arg(key)
+                                    .query_async::<()>(&mut conn)
+                                    .await;
+                            }
+                            LayerVerdict::AcceptedUnverified => {
+                                // Unreachable: we passed
+                                // Some(digest) above so the
+                                // None arm doesn't fire. Belt-
+                                // and-braces: evict to force a
+                                // fresh pull rather than serving
+                                // unverified bytes.
+                                let _: Result<(), _> = redis::cmd("DEL")
+                                    .arg(key)
+                                    .query_async::<()>(&mut conn)
+                                    .await;
                             }
                         }
                     }
@@ -1692,7 +2610,7 @@ async fn fetch_from_registry(
                                  re-verify against the registry"
                             );
                         }
-                        *attested_in_this_run = true;
+                        *attested_in_this_run = attested;
                         found_bytes = Some(data);
                     }
                     LayerVerdict::DigestMismatch { expected, computed } => {
@@ -2681,5 +3599,661 @@ mod registry_client_build_tests {
         };
         assert_eq!(err.message, NoRegistryClientInThisBuild.to_string());
         assert!(err.message.starts_with(NO_REGISTRY_CLIENT_REASON));
+    }
+}
+
+/// Who is given the registry login, how a Redis module is sized before it is
+/// read, what counts as attested, and how long an acquisition may take
+/// (2026-11-18). Pure: no registry, no Redis.
+#[cfg(test)]
+mod acquisition_bounds_tests {
+    use super::*;
+    use aegix_config::security_profile::SecurityProfile;
+    use std::time::Duration;
+
+    fn hosts(raw: &str) -> Option<Vec<String>> {
+        parse_credential_hosts(Some(raw))
+    }
+
+    #[test]
+    fn the_login_goes_only_to_a_named_registry() {
+        let listed = hosts("GHCR.io, registry.internal:5000 ,");
+        for profile in [
+            SecurityProfile::Hardened,
+            SecurityProfile::Transitional,
+            SecurityProfile::Development,
+        ] {
+            let decide =
+                |registry| registry_credential_decision(profile, listed.as_deref(), registry);
+            assert_eq!(decide("ghcr.io"), CredentialDecision::Send);
+            // An entry without a port names the host on any port.
+            assert_eq!(decide("ghcr.io:443"), CredentialDecision::Send);
+            assert_eq!(decide("registry.internal:5000"), CredentialDecision::Send);
+            // An entry with a port names that port only.
+            assert_eq!(
+                decide("registry.internal:6000"),
+                CredentialDecision::WithheldNotListed
+            );
+            for other in [
+                "attacker.example",
+                "ghcr.io.attacker.example",
+                "xghcr.io",
+                "",
+            ] {
+                assert_eq!(
+                    decide(other),
+                    CredentialDecision::WithheldNotListed,
+                    "{other}"
+                );
+                assert!(!decide(other).sends());
+            }
+        }
+    }
+
+    #[test]
+    fn with_no_list_the_login_is_withheld_only_where_the_profile_enforces() {
+        for (profile, expected) in [
+            (
+                SecurityProfile::Hardened,
+                CredentialDecision::WithheldNoList,
+            ),
+            (
+                SecurityProfile::Transitional,
+                CredentialDecision::WithheldNoList,
+            ),
+            (
+                SecurityProfile::Development,
+                CredentialDecision::SendUnscoped,
+            ),
+        ] {
+            assert_eq!(
+                registry_credential_decision(profile, None, "ghcr.io"),
+                expected
+            );
+        }
+        // Unset, empty and separators-only are all "no list".
+        assert_eq!(parse_credential_hosts(None), None);
+        assert_eq!(hosts(""), None);
+        assert_eq!(hosts(" , ,"), None);
+    }
+
+    #[test]
+    fn the_boot_notice_speaks_only_for_a_login_with_no_registry_named() {
+        for profile in [SecurityProfile::Hardened, SecurityProfile::Development] {
+            assert_eq!(registry_credential_boot_notice(profile, false, false), None);
+            assert_eq!(registry_credential_boot_notice(profile, true, true), None);
+            let line = registry_credential_boot_notice(profile, true, false).unwrap();
+            assert!(line.contains(OCI_REGISTRY_CREDENTIAL_HOSTS_ENV));
+            assert_eq!(line.contains("withheld"), profile.enforces());
+        }
+    }
+
+    #[test]
+    fn a_redis_value_is_sized_before_it_is_read() {
+        assert_eq!(redis_value_admitted(0, 10), Ok(false));
+        assert_eq!(redis_value_admitted(10, 10), Ok(true));
+        assert_eq!(redis_value_admitted(11, 10), Err(11));
+        assert_eq!(redis_value_admitted(512 << 20, 32 << 20), Err(512 << 20));
+    }
+
+    /// TEXTUAL pin: no module is read from Redis by a bare `GET`; the one
+    /// `GET` is the helper's, after its `STRLEN`.
+    #[test]
+    fn every_redis_module_read_goes_through_the_sized_helper() {
+        let src = include_str!("module_fetcher.rs");
+        let body = &src[src.find("async fn redis_get_capped").unwrap()
+            ..src.find("#[cfg(test)]\nmod oci_layer_tests").unwrap()];
+        assert_eq!(body.matches(r#"redis::cmd("GET")"#).count(), 1);
+        assert!(
+            body.find(r#"redis::cmd("STRLEN")"#).unwrap()
+                < body.find(r#"redis::cmd("GET")"#).unwrap()
+        );
+        assert_eq!(
+            body.matches("redis_get_capped(&mut conn, key, layer_cap)")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_pull_is_attested_by_a_verified_signature_or_a_pinned_digest_only() {
+        let unverified = [
+            SigstoreCheck::NotRequested,
+            SigstoreCheck::NoIdentity,
+            SigstoreCheck::Failed("signature_verification_failed".into()),
+        ];
+        for check in &unverified {
+            // A tag the registry may repoint, and nothing checked the signer.
+            assert!(!oci_pull_is_attested(check, false), "{check:?}");
+            // The signed job names the manifest digest: pinned as before.
+            assert!(oci_pull_is_attested(check, true), "{check:?}");
+        }
+        assert!(oci_pull_is_attested(&SigstoreCheck::Verified, false));
+        assert!(oci_pull_is_attested(&SigstoreCheck::Verified, true));
+    }
+
+    /// TEXTUAL pin: the registry arm never marks bytes attested on its own.
+    #[test]
+    fn the_registry_arm_sets_the_flag_from_the_one_rule() {
+        let src = include_str!("module_fetcher.rs");
+        let body = &src[src.find("async fn fetch_from_registry(").unwrap()
+            ..src
+                .find("#[cfg(not(feature = \"oci\"))]\nasync fn fetch_from_registry(")
+                .unwrap()];
+        assert_eq!(body.matches("*attested_in_this_run = attested;").count(), 2);
+        assert!(!body.contains("*attested_in_this_run = true"));
+        assert!(body.contains(
+            "let attested = oci_pull_is_attested(&sigstore_check, reference.digest().is_some());"
+        ));
+    }
+
+    #[test]
+    fn the_fetch_budget_is_the_jobs_timeout_and_never_past_its_deadline() {
+        let fallback = Duration::from_secs(120);
+        assert_eq!(
+            fetch_budget(5_000, 0, 1_000, fallback),
+            Duration::from_secs(5)
+        );
+        assert_eq!(fetch_budget(0, 0, 1_000, fallback), fallback);
+        // A deadline nearer than the timeout wins; a farther one does not.
+        assert_eq!(
+            fetch_budget(60_000, 1_010, 1_000, fallback),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            fetch_budget(5_000, 2_000, 1_000, fallback),
+            Duration::from_secs(5)
+        );
+        // A deadline already passed leaves nothing.
+        assert_eq!(fetch_budget(5_000, 900, 1_000, fallback), Duration::ZERO);
+    }
+}
+
+/// The worker's registry client against a registry that misbehaves
+/// (2026-11-18): each test runs a one-connection-at-a-time HTTP server on
+/// loopback that answers as the test says.
+#[cfg(all(test, feature = "oci"))]
+mod registry_client_tests {
+    use super::*;
+    use oci_client::Reference;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// What the server does with one request, given its head.
+    enum Reply {
+        Bytes(Vec<u8>),
+        /// Accept the request and never answer.
+        Stall,
+    }
+
+    fn response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Reply {
+        let mut out = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            out.push_str(&format!("{name}: {value}\r\n"));
+        }
+        out.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        let mut out = out.into_bytes();
+        out.extend_from_slice(body);
+        Reply::Bytes(out)
+    }
+
+    /// Start the server; returns its port and the request heads it saw.
+    async fn registry(
+        answer: impl Fn(&str, u16) -> Reply + Send + Sync + 'static,
+    ) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let (answer, recorded) = (answer.clone(), recorded.clone());
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    recorded.lock().unwrap().push(head.clone());
+                    match answer(&head, port) {
+                        Reply::Bytes(bytes) => {
+                            let _ = socket.write_all(&bytes).await;
+                            let _ = socket.shutdown().await;
+                        }
+                        Reply::Stall => tokio::time::sleep(Duration::from_secs(600)).await,
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    fn net() -> RegistryHttp {
+        RegistryHttp::new(true, Duration::from_secs(5), Duration::from_secs(5))
+    }
+
+    fn reference(port: u16) -> Reference {
+        format!("127.0.0.1:{port}/acme/echo:1").parse().unwrap()
+    }
+
+    fn anonymous(net: &RegistryHttp) -> RegistryClient<'_> {
+        RegistryClient {
+            net,
+            credentials: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manifest_is_fetched_from_the_distribution_address() {
+        let (port, seen) = registry(|_, _| {
+            response(
+                "200 OK",
+                &[("Docker-Content-Digest", "sha256:abc")],
+                b"{\"manifest\":true}",
+            )
+        })
+        .await;
+        let net = net();
+        let (body, header_digest) = anonymous(&net)
+            .fetch_manifest(&reference(port))
+            .await
+            .unwrap();
+        assert_eq!(body, b"{\"manifest\":true}");
+        assert_eq!(header_digest.as_deref(), Some("sha256:abc"));
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].starts_with("GET /v2/acme/echo/manifests/1 HTTP/1.1"));
+        let head = seen[0].to_ascii_lowercase();
+        assert!(head.contains("application/vnd.oci.image.manifest.v1+json"));
+        // No login, and no offer to take a compressed body.
+        assert!(!head.contains("authorization:"));
+        assert!(!head.contains("accept-encoding:"));
+    }
+
+    #[tokio::test]
+    async fn a_manifest_over_the_cap_is_refused_by_its_declared_length() {
+        // The head alone: a declared length over the cap is refused before a
+        // byte of body is read.
+        let (port, _) = registry(|_, _| {
+            Reply::Bytes(
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4294967296\r\n\r\n"
+                    .to_vec(),
+            )
+        })
+        .await;
+        let net = net();
+        let err = anonymous(&net)
+            .fetch_manifest(&reference(port))
+            .await
+            .unwrap_err();
+        assert!(err.contains("cap is"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_manifest_over_the_cap_is_refused_while_it_streams() {
+        // No declared length: the body is refused as it passes the cap.
+        let (port, _) = registry(|_, _| {
+            let mut out = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+            out.resize(out.len() + MAX_OCI_MANIFEST_BYTES as usize + 4096, b'x');
+            Reply::Bytes(out)
+        })
+        .await;
+        let net = net();
+        let err = anonymous(&net)
+            .fetch_manifest(&reference(port))
+            .await
+            .unwrap_err();
+        assert!(err.contains("cap is"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_compressed_body_is_not_inflated() {
+        // A registry that compresses unasked: the bytes are taken as sent
+        // (and then fail the digest), never expanded past the cap.
+        let sent = [0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef];
+        let (port, _) =
+            registry(move |_, _| response("200 OK", &[("Content-Encoding", "gzip")], &sent)).await;
+        let net = net();
+        let (body, _) = anonymous(&net)
+            .fetch_manifest(&reference(port))
+            .await
+            .unwrap();
+        assert_eq!(body, sent);
+    }
+
+    #[tokio::test]
+    async fn a_refusals_body_is_not_returned() {
+        let (port, _) =
+            registry(|_, _| response("500 Internal Server Error", &[], b"internal-only-detail"))
+                .await;
+        let net = net();
+        let client = anonymous(&net);
+        let err = client.fetch_manifest(&reference(port)).await.unwrap_err();
+        assert_eq!(err, "registry returned HTTP 500");
+        let layer = oci_client::manifest::OciDescriptor {
+            digest: format!("sha256:{}", "a".repeat(64)),
+            ..Default::default()
+        };
+        match fetch_capped_blob(&client, &reference(port), &layer, 1 << 20).await {
+            Err(BlobFetchError::Transport(reason)) => {
+                assert_eq!(reason, "registry returned HTTP 500")
+            }
+            other => panic!("expected a transport refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_stalls_is_abandoned() {
+        let (port, _) = registry(|_, _| Reply::Stall).await;
+        let net = RegistryHttp::new(true, Duration::from_secs(5), Duration::from_millis(300));
+        let began = std::time::Instant::now();
+        let err = anonymous(&net)
+            .fetch_manifest(&reference(port))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "registry request timed out");
+        assert!(began.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_blob_is_capped_and_its_digest_must_be_well_formed() {
+        let (port, seen) = registry(|_, _| response("200 OK", &[], &[7u8; 2048])).await;
+        let net = net();
+        let client = anonymous(&net);
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let layer = oci_client::manifest::OciDescriptor {
+            digest: digest.clone(),
+            ..Default::default()
+        };
+        let blob = fetch_capped_blob(&client, &reference(port), &layer, 4096)
+            .await
+            .unwrap();
+        assert_eq!(blob.len(), 2048);
+        assert!(seen.lock().unwrap()[0]
+            .starts_with(&format!("GET /v2/acme/echo/blobs/{digest} HTTP/1.1")));
+        assert!(matches!(
+            fetch_capped_blob(&client, &reference(port), &layer, 1024).await,
+            Err(BlobFetchError::TooLarge(2048))
+        ));
+        // A digest that would walk the URL elsewhere never becomes a request.
+        let before = seen.lock().unwrap().len();
+        for malformed in [
+            "sha256:../../../../v2/other/blobs/x",
+            "sha256:abc?ns=x",
+            "sha256",
+            ":abc",
+            "sha256:",
+            "SHA256:abc",
+        ] {
+            let layer = oci_client::manifest::OciDescriptor {
+                digest: malformed.to_string(),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    fetch_capped_blob(&client, &reference(port), &layer, 4096).await,
+                    Err(BlobFetchError::Transport(_))
+                ),
+                "{malformed}"
+            );
+        }
+        assert_eq!(seen.lock().unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn the_token_flow_is_answered_once_and_the_login_goes_to_the_token_service() {
+        let (port, seen) = registry(|head, port| {
+            if head.starts_with("GET /token?") {
+                response("200 OK", &[], br#"{"token":"pull-token","expires_in":300}"#)
+            } else if head.to_ascii_lowercase().contains("authorization: bearer pull-token") {
+                response("200 OK", &[], b"{}")
+            } else {
+                response(
+                    "401 Unauthorized",
+                    &[(
+                        "WWW-Authenticate",
+                        &format!(
+                            r#"Bearer realm="http://127.0.0.1:{port}/token",service="reg.test",scope="repository:acme/echo:pull,push""#
+                        ),
+                    )],
+                    b"",
+                )
+            }
+        })
+        .await;
+        let net = net();
+        let client = RegistryClient {
+            net: &net,
+            credentials: Some(("robot".to_string(), "s3cret".to_string())),
+        };
+        client.fetch_manifest(&reference(port)).await.unwrap();
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 3);
+            // The unauthenticated try carries no login.
+            assert!(!seen[0].to_ascii_lowercase().contains("authorization:"));
+            assert!(seen[1].starts_with(
+                "GET /token?service=reg.test&scope=repository%3Aacme%2Fecho%3Apull HTTP/1.1"
+            ));
+            // base64("robot:s3cret")
+            assert!(seen[1].contains("Basic cm9ib3Q6czNjcmV0"));
+            assert!(!seen[2].contains("cm9ib3Q6czNjcmV0"));
+        }
+        // The token is kept: the next fetch is one request.
+        client.fetch_manifest(&reference(port)).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_token_service_on_a_metadata_host_is_never_called() {
+        let (port, seen) = registry(|_, _| {
+            response(
+                "401 Unauthorized",
+                &[(
+                    "WWW-Authenticate",
+                    r#"Bearer realm="http://169.254.169.254/latest/meta-data/",service="x""#,
+                )],
+                b"",
+            )
+        })
+        .await;
+        let net = net();
+        let client = RegistryClient {
+            net: &net,
+            credentials: Some(("robot".to_string(), "s3cret".to_string())),
+        };
+        let err = client.fetch_manifest(&reference(port)).await.unwrap_err();
+        assert!(err.contains("token service"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_basic_challenge_is_answered_only_with_a_login() {
+        let (port, seen) = registry(|head, _| {
+            if head.contains("Basic cm9ib3Q6czNjcmV0") {
+                response("200 OK", &[], b"{}")
+            } else {
+                response(
+                    "401 Unauthorized",
+                    &[("WWW-Authenticate", r#"Basic realm="registry""#)],
+                    b"",
+                )
+            }
+        })
+        .await;
+        let net = net();
+        let err = anonymous(&net)
+            .fetch_manifest(&reference(port))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("registry returned HTTP 401"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let with_login = RegistryClient {
+            net: &net,
+            credentials: Some(("robot".to_string(), "s3cret".to_string())),
+        };
+        with_login.fetch_manifest(&reference(port)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_metadata_host_is_refused() {
+        let (port, seen) = registry(|_, _| {
+            response(
+                "307 Temporary Redirect",
+                &[("Location", "http://169.254.169.254/latest/meta-data/")],
+                b"",
+            )
+        })
+        .await;
+        let net = net();
+        let err = anonymous(&net)
+            .fetch_manifest(&reference(port))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "registry redirect refused");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn redirects_are_followed_within_limits_only() {
+        let to = |s: &str| url::Url::parse(s).unwrap();
+        // A blob redirected to the registry's storage host.
+        assert_eq!(
+            redirect_refusal(0, &to("https://blobs.example/x"), false),
+            None
+        );
+        assert_eq!(
+            redirect_refusal(MAX_OCI_REDIRECTS, &to("https://blobs.example/x"), false),
+            Some("too many redirects")
+        );
+        // https never steps down; a local http registry may stay on http.
+        assert_eq!(
+            redirect_refusal(0, &to("http://blobs.example/x"), false),
+            Some("redirect leaves https")
+        );
+        assert_eq!(
+            redirect_refusal(0, &to("http://registry:5000/x"), true),
+            None
+        );
+        assert_eq!(
+            redirect_refusal(0, &to("file:///etc/passwd"), true),
+            Some("redirect leaves https")
+        );
+        for metadata in [
+            "https://169.254.169.254/latest",
+            "https://2852039166/latest",
+            "https://[::ffff:169.254.169.254]/latest",
+            "https://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            assert_eq!(
+                redirect_refusal(0, &to(metadata), true),
+                Some("redirect to a cloud metadata host"),
+                "{metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_addresses_are_recognised_in_every_family() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        for metadata in [
+            "169.254.169.254",
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "2002:6464:64c8::",
+        ] {
+            assert!(is_metadata_ip(ip(metadata)), "{metadata}");
+        }
+        for other in [
+            "169.254.169.253",
+            "10.0.0.1",
+            "127.0.0.1",
+            "::1",
+            "2001:db8::1",
+        ] {
+            assert!(!is_metadata_ip(ip(other)), "{other}");
+        }
+    }
+
+    #[test]
+    fn challenges_are_parsed() {
+        assert_eq!(
+            parse_auth_challenge(
+                r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:a/b:pull,push""#
+            ),
+            AuthChallenge::Bearer {
+                realm: "https://ghcr.io/token".to_string(),
+                service: Some("ghcr.io".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_auth_challenge("bearer service=reg, realm=https://auth.example/t"),
+            AuthChallenge::Bearer {
+                realm: "https://auth.example/t".to_string(),
+                service: Some("reg".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_auth_challenge(r#"Basic realm="x""#),
+            AuthChallenge::Basic
+        );
+        assert_eq!(parse_auth_challenge("BASIC"), AuthChallenge::Basic);
+        for unusable in [
+            "",
+            "Negotiate",
+            "Bearer",
+            r#"Bearer service="x""#,
+            r#"Bearer realm="""#,
+        ] {
+            assert_eq!(
+                parse_auth_challenge(unusable),
+                AuthChallenge::Unknown,
+                "{unusable}"
+            );
+        }
+    }
+
+    /// Through `fetch_within` itself: a registry that accepts the request and
+    /// never answers costs the job its budget, not the worker its permit.
+    #[tokio::test]
+    async fn an_acquisition_that_outlives_the_jobs_budget_is_abandoned() {
+        let (port, _) = registry(|_, _| Reply::Stall).await;
+        let req: JobRequest = serde_json::from_value(serde_json::json!({
+            "job_id": uuid::Uuid::new_v4(),
+            "workflow_execution_id": uuid::Uuid::new_v4(),
+            "module_uri": format!("oci://127.0.0.1:{port}/acme/echo:1"),
+            "input_payload": {},
+            "timeout_ms": 1000,
+            "allowed_hosts": [],
+            "signature": [],
+            "job_nonce": "n",
+            "wasm_bytes": null,
+        }))
+        .expect("a minimal JobRequest deserialises");
+        let runtime = AegixRuntime::new().expect("runtime");
+        let mut span = JobSpan::current_with_parent(&opentelemetry::Context::new());
+        let began = std::time::Instant::now();
+        let Err(err) = fetch_within(&req, &runtime, &mut span, Duration::from_millis(300)).await
+        else {
+            panic!("a stalled registry cannot produce a module");
+        };
+        assert!(
+            err.message.starts_with(MODULE_FETCH_TIMED_OUT_REASON),
+            "{}",
+            err.message
+        );
+        assert!(began.elapsed() < Duration::from_secs(10));
+        // Nothing of the registry's address or the URL in the job's result.
+        assert!(!err.message.contains("127.0.0.1"));
     }
 }
