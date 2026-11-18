@@ -88,13 +88,11 @@ bytes.workspace = true
 [dev-dependencies]
 # Integration tests (tests/) compile guest fixtures and poke the runtime
 # directly; the runtime itself comes through aegix-worker-runtime.
-# wasmtime's defaults without `cache` (see the root manifest), plus
-# memory-protection-keys.
+# The feature set aegix-worker-runtime builds with, plus `wat` for fixtures.
 wasmtime = { workspace = true, features = [
-  "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat", "profiling",
-  "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump",
-  "debug-builtins", "runtime", "component-model", "component-model-async", "threads",
-  "stack-switching", "std", "debug", "compile-time-builtins", "wit-parser", "memory-protection-keys",
+  "anyhow", "async", "backtrace", "parallel-compilation", "cranelift", "pooling-allocator",
+  "demangle", "addr2line", "runtime", "component-model", "component-model-async", "std",
+  "call-hook", "wat",
 ] }
 wat.workspace = true  # Convert WAT text to a minimal component for AOT tests
 wit-component.workspace = true

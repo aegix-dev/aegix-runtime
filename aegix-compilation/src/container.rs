@@ -19,7 +19,7 @@
 //! - `AEGIX_BUILDER_MEMORY` — Memory limit. Default: `2g`.
 //! - `AEGIX_BUILDER_CPUS` — CPU limit. Default: `2`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
@@ -620,6 +620,22 @@ pub fn build_command(
     Ok(cmd)
 }
 
+/// Where a container build sees the workspace ([`build_command`] mounts it
+/// there and makes it the working directory).
+pub(crate) const CONTAINER_WORKSPACE: &str = "/build";
+
+/// The `--manifest-path` for a cargo command built by [`build_command`]: the
+/// workspace's `Cargo.toml` as THAT command will see it. A container command
+/// runs with the workspace mounted at [`CONTAINER_WORKSPACE`], where the host
+/// path does not exist; a host command runs against the host path.
+pub(crate) fn manifest_path_for(cmd: &SandboxCommand, workspace: &Path) -> PathBuf {
+    if cmd.container_name().is_some() {
+        Path::new(CONTAINER_WORKSPACE).join("Cargo.toml")
+    } else {
+        workspace.join("Cargo.toml")
+    }
+}
+
 /// Build a [`SandboxCommand`] for running `cargo audit` inside the container.
 ///
 /// Identical security flags as [`build_command`] including `--network=none`.
@@ -926,6 +942,21 @@ pub(crate) fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A container build runs with the workspace mounted at `/build`; the
+    /// host path it was created at does not exist there, so cargo would
+    /// refuse the manifest before compiling anything.
+    #[test]
+    fn the_manifest_path_is_the_one_the_command_will_see() {
+        let ws = Path::new("/var/lib/aegix/compile/job-1");
+        let in_container = SandboxCommand::container_run("podman");
+        assert_eq!(
+            manifest_path_for(&in_container, ws),
+            PathBuf::from("/build/Cargo.toml")
+        );
+        let on_host = host_command("cargo");
+        assert_eq!(manifest_path_for(&on_host, ws), ws.join("Cargo.toml"));
+    }
 
     #[test]
     fn container_disabled_returns_plain_cargo() {

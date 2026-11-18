@@ -719,7 +719,7 @@ pub(crate) const LLM_PROVIDER_LABELS: [&str; 4] = ["anthropic", "openai", "gemin
 /// compile time. `AegixRuntime::select_tier` returns one of these beside the
 /// cache it picks, so the `tier` label on `wasm.instance_cache.evictions` can
 /// never carry a runtime string (package DR, 2026-09-22).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InstanceCacheTier {
     Minimal,
     /// Http and Network share one linker and one cache (see `select_tier`).

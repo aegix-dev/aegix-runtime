@@ -488,7 +488,7 @@ type IoFuture = Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>;
 /// proxy, no redirects, 5 s connect timeout) instead of upstream's raw
 /// `TcpStream::connect` on a name it resolves itself.
 pub(crate) struct HardenedWasiHttpHooks {
-    client: reqwest::Client,
+    client: crate::context::EgressClient,
     /// Every destination ([`destination_key`]) the gate admitted in this
     /// execution. Bounded by the per-execution call budget, which is charged
     /// before a destination is added.
@@ -496,7 +496,7 @@ pub(crate) struct HardenedWasiHttpHooks {
 }
 
 impl HardenedWasiHttpHooks {
-    pub(crate) fn new(client: reqwest::Client) -> Self {
+    pub(crate) fn new(client: crate::context::EgressClient) -> Self {
         Self {
             client,
             admitted: std::sync::Arc::default(),
@@ -555,7 +555,8 @@ impl WasiHttpHooks for HardenedWasiHttpHooks {
                 );
                 return Err(wasmtime_wasi_http::Error::HttpRequestDenied);
             }
-            let response = send_via_hardened_client(client, request, options).await?;
+            let response =
+                send_via_hardened_client(client.client().clone(), request, options).await?;
             // reqwest drives its own connection, so there is no separate I/O
             // task for the caller to await.
             Ok((response, Box::new(std::future::ready(Ok(()))) as IoFuture))

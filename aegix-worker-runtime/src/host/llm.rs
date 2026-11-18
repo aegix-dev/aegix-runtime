@@ -848,7 +848,7 @@ impl AegixContext {
         let client = if is_local {
             local_llm_http_client().clone()
         } else {
-            self.http_client.clone()
+            self.http_client.client().clone()
         };
         // MCP-1213 (2026-05-18): one timeout for the FULL exchange
         // (send + body read), not just `.send()`. Pre-fix the outer

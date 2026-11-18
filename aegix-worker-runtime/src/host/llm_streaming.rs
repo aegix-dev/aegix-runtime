@@ -73,7 +73,7 @@ impl AegixContext {
         let spawn_http_client = if adapter.is_local() {
             local_llm_http_client().clone()
         } else {
-            self.http_client.clone()
+            self.http_client.client().clone()
         };
 
         // R2 token ledger: usage events arrive inside the spawned reader

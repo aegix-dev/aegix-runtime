@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub mod advisory_db;
 mod analyze;
+mod artifact_read;
 pub mod catalog;
 pub mod container;
 pub mod dependency_allowlist;
@@ -19,6 +20,7 @@ pub mod sandbox_run;
 pub mod scaffold;
 pub mod source_entities;
 mod target_cache;
+mod template_guard;
 
 // Re-export the allowlist gate at the crate root so callers (and the
 // `mcp::utils` re-export shim in controller) can keep importing
@@ -43,6 +45,41 @@ use uuid::Uuid;
 /// hostile submission from holding a compilation slot for the full
 /// 60-second cargo timeout. Override with `WASM_MAX_SOURCE_BYTES`.
 pub(crate) const DEFAULT_MAX_SOURCE_BYTES: usize = 1_048_576;
+
+/// The source-size refusal, or `None` when `source` is within the cap
+/// (`WASM_MAX_SOURCE_BYTES`, default [`DEFAULT_MAX_SOURCE_BYTES`]).
+///
+/// One check for every entry point that takes caller-supplied source — the
+/// Rust, JavaScript and Python compiles, the lint and the analysis — so none
+/// of them writes an arbitrarily large string to disk and hands it to a
+/// toolchain while holding a compile slot.
+pub(crate) fn source_too_large(source: &str) -> Option<String> {
+    let max = nonzero_env_or_default("WASM_MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES);
+    (source.len() > max).then(|| {
+        format!(
+            "source-too-large: source code is {} bytes but the cap is {} bytes \
+             (set WASM_MAX_SOURCE_BYTES to raise it). Reduce the module size or \
+             split into multiple smaller modules.",
+            source.len(),
+            max
+        )
+    })
+}
+
+/// How long a compile waits for a slot before reporting the queue full.
+const COMPILE_SLOT_WAIT: Duration = Duration::from_secs(120);
+
+/// The error entry for a refusal that names no source position.
+fn refusal_error(message: String) -> CompilationError {
+    CompilationError {
+        line: None,
+        column: None,
+        end_line: None,
+        end_column: None,
+        message,
+        severity: "error".to_string(),
+    }
+}
 
 /// wasm-security-review (2026-05-22): parse an env var as a positive
 /// integer, falling back to `default` on missing / unparseable / zero
@@ -660,6 +697,21 @@ impl CompilationService {
     /// with compilation off cannot run a toolchain over module source by
     /// any path — including one added later that forgets
     /// [`Self::ensure_enabled`].
+    /// [`Self::acquire_slot`], giving up after `wait`: a caller queued behind
+    /// a full set of slots gets an answer instead of waiting without bound.
+    async fn acquire_slot_within(&self, wait: Duration) -> Result<CompileSlot> {
+        tokio::time::timeout(wait, self.acquire_slot())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Compilation queue full (max {} concurrent). All slots busy for more than {} \
+                     seconds. Try again shortly.",
+                    max_concurrent_compilations(),
+                    wait.as_secs()
+                )
+            })?
+    }
+
     async fn acquire_slot(&self) -> Result<CompileSlot> {
         self.ensure_enabled()?;
         CompileSlot::acquire(Arc::clone(compilation_semaphore()))
@@ -737,15 +789,22 @@ impl CompilationService {
         // apply to the raw user-supplied values, not the post-render output.
         self.validate_config_values(config)?;
 
-        // Register template
-        handlebars
-            .register_template_string("node_template", &template)
-            .context("Failed to parse Handlebars template")?;
+        // Parse under the structural bounds (nesting, no partials, bounded
+        // `each` work) — the template is the submitted source, so its shape
+        // is as untrusted as the config. See `template_guard`.
+        let compiled = template_guard::compile_bounded(template, config)?;
+        handlebars.register_template("node_template", compiled);
 
-        // Render with config
-        let rendered = handlebars
-            .render("node_template", config)
+        // Render with config, into a writer that stops at a multiple of the
+        // source cap rather than growing with whatever the template expands to.
+        let max_rendered =
+            nonzero_env_or_default("WASM_MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES)
+                .saturating_mul(template_guard::RENDERED_OUTPUT_FACTOR);
+        let mut out = template_guard::CappedWriter::new(max_rendered);
+        handlebars
+            .render_to_write("node_template", config, &mut out)
             .context("Failed to render template")?;
+        let rendered = out.into_string()?;
 
         Ok(rendered)
     }
@@ -977,26 +1036,11 @@ impl CompilationService {
         // nothing useful — and `cargo component build` would likely OOM
         // before producing an error. WASM_MAX_SOURCE_BYTES overrides the
         // default cap.
-        let max_source_bytes =
-            nonzero_env_or_default("WASM_MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES);
-        if source_code.len() > max_source_bytes {
+        if let Some(message) = source_too_large(source_code) {
             return Ok(CompilationResult {
                 success: false,
                 wasm_bytes: None,
-                errors: vec![CompilationError {
-                    line: None,
-                    column: None,
-                    end_line: None,
-                    end_column: None,
-                    message: format!(
-                        "source-too-large: source code is {} bytes but the cap is {} bytes \
-                         (set WASM_MAX_SOURCE_BYTES to raise it). Reduce the module size or \
-                         split into multiple smaller modules.",
-                        source_code.len(),
-                        max_source_bytes
-                    ),
-                    severity: "error".to_string(),
-                }],
+                errors: vec![refusal_error(message)],
                 size_bytes: 0,
                 content_hash: String::new(),
                 capability_world: CapabilityWorld::Unknown,
@@ -1512,6 +1556,16 @@ impl CompilationService {
             wit_dir,
             user_target_cache.as_deref(),
         );
+        // Whatever this build leaves in the per-user cache under its own
+        // job-unique package name is removed when this function returns.
+        let _job_outputs = target_cache::JobOutputs::new(user_target_cache.clone(), package_name);
+        // A container build has an empty environment and writes to the
+        // workspace's own `target` unless the cache is mounted; only a host
+        // build sees the controller's `CARGO_TARGET_DIR`.
+        let built_in_container = build_cmd
+            .as_ref()
+            .map(|cmd| cmd.container_name().is_some())
+            .unwrap_or(false);
         let output = match build_cmd {
             Ok(mut cmd) => {
                 cmd.args([
@@ -1521,11 +1575,9 @@ impl CompilationService {
                     "--target",
                     "wasm32-wasip2",
                     "--manifest-path",
-                    workspace
-                        .join("Cargo.toml")
-                        .to_str()
-                        .unwrap_or("Cargo.toml"),
                 ]);
+                let manifest = container::manifest_path_for(&cmd, workspace);
+                cmd.arg(manifest);
                 // 60s for large worlds like automation-node
                 cmd.run(Duration::from_secs(60), slot)
                     .await
@@ -1621,9 +1673,16 @@ impl CompilationService {
         // CARGO_TARGET_DIR env / throwaway workspace target.
         let target_base = user_target_cache.clone().unwrap_or_else(|| {
             std::env::var("CARGO_TARGET_DIR")
+                .ok()
+                .filter(|_| !built_in_container)
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| workspace.join("target"))
+                .unwrap_or_else(|| workspace.join("target"))
         });
+        // The only directories this build could write its artifact into. The
+        // artifact is read from under one of them or not at all — including
+        // when its path came from the build's own stdout.
+        let artifact_roots: Vec<PathBuf> = vec![target_base.clone(), workspace.to_path_buf()];
+        let artifact_root_refs: Vec<&Path> = artifact_roots.iter().map(PathBuf::as_path).collect();
 
         // Parse "Creating component /path/to/name.wasm" from cargo stdout.
         // The path may be absolute or relative to the compilation workspace.
@@ -1648,24 +1707,15 @@ impl CompilationService {
             }
         });
 
-        // Helper: true if the file has the WASM component model magic (0x0d at byte 4).
-        // Core WASM has 0x01 at byte 4; component model binaries have 0x0d.
-        // Reads only the first 8 bytes so this is O(1) regardless of file size.
-        fn is_component_magic(p: &PathBuf) -> bool {
-            use std::io::Read;
-            let Ok(mut f) = std::fs::File::open(p) else {
-                return false;
-            };
-            let mut buf = [0u8; 8];
-            matches!(
-                f.read(&mut buf),
-                Ok(n) if n >= 8 && &buf[0..4] == b"\0asm" && buf[4] == 0x0d
-            )
-        }
+        // True if the file has the WASM component model magic (0x0d at byte
+        // 4; core WASM has 0x01). Reads eight bytes of a regular file under
+        // the build's directories — never through a symlink.
+        let is_component_magic =
+            |p: &PathBuf| artifact_read::has_component_magic(p, &artifact_root_refs);
 
         // Return the modification time of a file, or None if unavailable.
         fn mtime(p: &PathBuf) -> Option<std::time::SystemTime> {
-            std::fs::metadata(p).and_then(|m| m.modified()).ok()
+            std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok()
         }
 
         let candidate_wasip1 = target_base
@@ -1675,7 +1725,11 @@ impl CompilationService {
             .join("wasm32-wasip2/release")
             .join(&wasm_filename);
 
-        let final_wasm_path: PathBuf = if let Some(p) = component_path_from_stdout {
+        // The reported path is the build's own output: taken only when it is a
+        // component under the build's directories, else the probe below decides.
+        let final_wasm_path: PathBuf = if let Some(p) =
+            component_path_from_stdout.filter(|p| is_component_magic(p))
+        {
             // cargo-component told us exactly where the component landed.
             tracing::info!(path = %p.display(), "cargo-component reported component path via stdout");
             p
@@ -1736,12 +1790,16 @@ impl CompilationService {
             }
         };
 
-        let wasm_bytes = tokio::fs::read(&final_wasm_path).await.with_context(|| {
-            format!(
-                "Failed to read compiled WASM from {}",
-                final_wasm_path.display()
-            )
-        })?;
+        // Size-checked on the opened file before a byte is read: a module
+        // with a few hundred MB of static data is refused here, not after it
+        // is in the controller's memory.
+        let wasm_bytes = artifact_read::read_artifact(
+            final_wasm_path.clone(),
+            artifact_roots.clone(),
+            max_component_bytes(ModuleLanguage::Rust),
+        )
+        .await
+        .context("Failed to read compiled WASM")?;
         tracing::info!(
             elapsed_ms = compile_start.elapsed().as_millis() as u64,
             name,
@@ -2734,6 +2792,9 @@ impl CompilationService {
         job_id: &str,
     ) -> Result<Vec<u8>> {
         self.ensure_enabled()?;
+        if let Some(message) = source_too_large(js_source) {
+            bail!(message);
+        }
         refuse_former_interface_names(js_source)?;
         // M-13: the compile runs SANDBOXED (container::tool_command — same
         // --network=none/read-only/non-root envelope as the Rust path)
@@ -2744,7 +2805,7 @@ impl CompilationService {
             require_host_lang_toolchain_allowed("javascript")?;
         }
 
-        let slot = self.acquire_slot().await?;
+        let slot = self.acquire_slot_within(COMPILE_SLOT_WAIT).await?;
 
         let workspace = self.workspace_root.join(format!("js-{}", job_id));
         tokio::fs::create_dir_all(&workspace).await?;
@@ -2832,7 +2893,12 @@ impl CompilationService {
             bail!("JS compilation failed:\n{}", sanitized);
         }
 
-        let wasm_bytes = tokio::fs::read(workspace.join("module.wasm")).await?;
+        let wasm_bytes = artifact_read::read_artifact(
+            workspace.join("module.wasm"),
+            vec![workspace.to_path_buf()],
+            max_component_bytes(ModuleLanguage::JavaScript),
+        )
+        .await?;
 
         // Validate the output is a valid WASM component
         if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
@@ -2853,6 +2919,9 @@ impl CompilationService {
         job_id: &str,
     ) -> Result<Vec<u8>> {
         self.ensure_enabled()?;
+        if let Some(message) = source_too_large(python_source) {
+            bail!(message);
+        }
         refuse_former_interface_names(python_source)?;
         // M-13: the compile runs SANDBOXED (container::tool_command — same
         // --network=none/read-only/non-root envelope as the Rust path)
@@ -2864,7 +2933,7 @@ impl CompilationService {
             require_host_lang_toolchain_allowed("python")?;
         }
 
-        let slot = self.acquire_slot().await?;
+        let slot = self.acquire_slot_within(COMPILE_SLOT_WAIT).await?;
 
         let workspace = self.workspace_root.join(format!("py-{}", job_id));
         tokio::fs::create_dir_all(&workspace).await?;
@@ -2937,7 +3006,12 @@ impl CompilationService {
             bail!("Python compilation failed:\n{}", sanitized);
         }
 
-        let wasm_bytes = tokio::fs::read(workspace.join("module.wasm")).await?;
+        let wasm_bytes = artifact_read::read_artifact(
+            workspace.join("module.wasm"),
+            vec![workspace.to_path_buf()],
+            max_component_bytes(ModuleLanguage::Python),
+        )
+        .await?;
         if wasm_bytes.len() < 8 || &wasm_bytes[..4] != b"\0asm" {
             bail!("Python compilation produced invalid WASM binary");
         }
@@ -3192,6 +3266,9 @@ impl CompilationService {
         dependencies: Option<&serde_json::Value>,
     ) -> Result<Vec<CompilationError>> {
         self.ensure_enabled()?;
+        if let Some(message) = source_too_large(source_code) {
+            return Ok(vec![refusal_error(message)]);
+        }
         // Static-lint pre-pass first — instant, no compile semaphore needed.
         // Mirrors compile_to_wasm_with_config so domain-specific hints
         // (e.g. `secrets::get` → `secrets::get_secret`) surface from BOTH
@@ -3251,7 +3328,7 @@ impl CompilationService {
         };
 
         let job_id = Uuid::new_v4();
-        let (workspace, _package_name) = self
+        let (workspace, package_name) = self
             .create_workspace(job_id, name, &full_source, dependencies)
             .await?;
 
@@ -3281,6 +3358,9 @@ impl CompilationService {
             // check` builds the dependency graph's rmeta, which dominates the
             // 30 s lint budget when cold. Anonymous callers lint uncached.
             let lint_target_cache = user_id.and_then(target_cache::resolve_for);
+            // The check's job-named outputs leave the per-user cache with it.
+            let _job_outputs =
+                target_cache::JobOutputs::new(lint_target_cache.clone(), &package_name);
             let lint_cmd = container::build_command(
                 &workspace,
                 &cargo_registry_cache,
@@ -3295,11 +3375,9 @@ impl CompilationService {
                         "--target",
                         "wasm32-wasip2",
                         "--manifest-path",
-                        workspace
-                            .join("Cargo.toml")
-                            .to_str()
-                            .unwrap_or("Cargo.toml"),
                     ]);
+                    let manifest = container::manifest_path_for(&cmd, &workspace);
+                    cmd.arg(manifest);
                     cmd.run(Duration::from_secs(30), &slot).await.map_err(|e| {
                         e.with_timeout_context("Lint check timed out after 30 seconds")
                     })?
@@ -3553,6 +3631,9 @@ impl CompilationService {
         // both entrypoints means there's no surface that can reach
         // `componentize-py` UNSANDBOXED on the host without the explicit
         // operator opt-in.
+        if let Some(message) = source_too_large(source_code) {
+            bail!(message);
+        }
         if !container::will_sandbox() {
             require_host_lang_toolchain_allowed("python")?;
         }
@@ -4230,6 +4311,196 @@ pub fn run() {}
 pub fn run() {}
 "#;
         assert_eq!(template_substitutes_world(template), None);
+    }
+}
+
+#[cfg(test)]
+mod render_template_bound_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn service() -> (tempfile::TempDir, CompilationService) {
+        let root = tempfile::tempdir().expect("workspace root");
+        let (event_tx, _events) = tokio::sync::broadcast::channel(8);
+        let service = CompilationService::new(root.path().to_path_buf(), event_tx);
+        (root, service)
+    }
+
+    fn refusal(template: &str, config: &serde_json::Value) -> String {
+        let (_root, service) = service();
+        format!(
+            "{:#}",
+            service
+                .render_template(template, config)
+                .expect_err("template must be refused")
+        )
+    }
+
+    /// The submitted source IS the template. This one recursed until the
+    /// stack overflowed and took the whole process with it.
+    #[test]
+    fn a_self_including_inline_partial_is_an_error_not_a_crash() {
+        let msg = refusal(
+            "// handlebars: true\n{{#*inline \"a\"}}x{{> a}}{{/inline}}{{> a}}",
+            &json!({}),
+        );
+        assert!(msg.contains("template-partial"), "got: {msg}");
+    }
+
+    /// Thirty levels, each including the one below twice: 2^30 copies from a
+    /// template of about a kilobyte.
+    #[test]
+    fn a_doubling_partial_chain_is_refused() {
+        let mut template = String::from("// handlebars: true\n{{#*inline \"p0\"}}x{{/inline}}");
+        for i in 1..=30 {
+            template.push_str(&format!(
+                "{{{{#*inline \"p{i}\"}}}}{{{{> p{prev}}}}}{{{{> p{prev}}}}}{{{{/inline}}}}",
+                prev = i - 1
+            ));
+        }
+        template.push_str("{{> p30}}");
+        assert!(refusal(&template, &json!({})).contains("template-partial"));
+    }
+
+    #[test]
+    fn a_plain_partial_is_refused() {
+        let msg = refusal(
+            "// handlebars: true\n{{> header}}\npub fn run() {}",
+            &json!({}),
+        );
+        assert!(msg.contains("template-partial"), "got: {msg}");
+    }
+
+    #[test]
+    fn nesting_deep_enough_to_overflow_the_parser_is_refused() {
+        let template = format!(
+            "// handlebars: true\n{}x{}",
+            "{{#if a}}".repeat(50_000),
+            "{{/if}}".repeat(50_000)
+        );
+        assert!(refusal(&template, &json!({"a": true})).contains("template-too-deep"));
+    }
+
+    /// An `each` whose expansion fits the work bound is still stopped by the
+    /// output cap: 100 000 rows of a ~100-byte line is past four times the
+    /// 1 MiB source cap.
+    #[test]
+    fn an_each_expansion_past_the_output_cap_is_refused() {
+        let items: Vec<u32> = (0..100_000).collect();
+        let template = format!(
+            "// handlebars: true\n{{{{#each items}}}}// {}\n{{{{/each}}}}",
+            "x".repeat(100)
+        );
+        let msg = refusal(&template, &json!({ "items": items }));
+        assert!(msg.contains("output cap"), "got: {msg}");
+    }
+
+    #[test]
+    fn nested_each_over_a_large_collection_is_refused_before_rendering() {
+        let items: Vec<u32> = (0..2000).collect();
+        let template = "// handlebars: true\n\
+            {{#each items}}{{#each @root.items}}{{#each @root.items}}{{/each}}{{/each}}{{/each}}";
+        let msg = refusal(template, &json!({ "items": items }));
+        assert!(msg.contains("template-too-expensive"), "got: {msg}");
+    }
+
+    #[test]
+    fn ordinary_module_templates_still_render() {
+        let (_root, service) = service();
+        let template = r#"// handlebars: true
+const BASE_URL: &str = "{{base_url}}";
+const RETRIES: u32 = {{retries}};
+{{#if verbose}}const VERBOSE: bool = true;{{else}}const VERBOSE: bool = false;{{/if}}
+const HOSTS: &[&str] = &[{{#each hosts}}"{{this}}", {{/each}}];
+#[aegix_node(world = "http-node")]
+pub fn run(input: String) -> Result<String, String> { Ok(input) }
+"#;
+        let rendered = service
+            .render_template(
+                template,
+                &json!({
+                    "base_url": "https://api.example.com",
+                    "retries": 3,
+                    "verbose": false,
+                    "hosts": ["a.example.com", "b.example.com"],
+                }),
+            )
+            .expect("an ordinary template renders");
+        assert!(rendered.contains(r#"const BASE_URL: &str = "https://api.example.com";"#));
+        assert!(rendered.contains("const RETRIES: u32 = 3;"));
+        assert!(rendered.contains("const VERBOSE: bool = false;"));
+        assert!(rendered.contains(r#"&["a.example.com", "b.example.com", ];"#));
+    }
+
+    /// Without the opt-in line the source is not a template at all: braces
+    /// that would be a partial are returned untouched.
+    #[test]
+    fn source_that_does_not_opt_in_is_returned_verbatim() {
+        let (_root, service) = service();
+        let source = "pub fn run() { let s = \"{{> not_a_partial}}\"; }";
+        assert_eq!(service.render_template(source, &json!({})).unwrap(), source);
+    }
+}
+
+#[cfg(test)]
+mod source_size_cap_tests {
+    use super::*;
+
+    fn service() -> (tempfile::TempDir, CompilationService) {
+        let root = tempfile::tempdir().expect("workspace root");
+        let (event_tx, _events) = tokio::sync::broadcast::channel(8);
+        let service = CompilationService::new(root.path().to_path_buf(), event_tx)
+            .with_compilation_enabled(true);
+        (root, service)
+    }
+
+    fn oversized() -> String {
+        "x".repeat(DEFAULT_MAX_SOURCE_BYTES + 1)
+    }
+
+    #[test]
+    fn the_cap_is_inclusive() {
+        assert!(source_too_large(&"x".repeat(DEFAULT_MAX_SOURCE_BYTES)).is_none());
+        let msg = source_too_large(&oversized()).expect("one byte over");
+        assert!(msg.starts_with("source-too-large"), "got: {msg}");
+    }
+
+    /// Every entry point that takes source refuses an oversized one before it
+    /// takes a slot, creates a workspace or runs a toolchain — so these
+    /// return at once on a machine with no toolchain at all.
+    #[tokio::test]
+    async fn every_source_entry_point_refuses_an_oversized_source() {
+        let _g = container::TEST_ENV_LOCK.lock().await;
+        let (root, service) = service();
+        let big = oversized();
+
+        let js = service
+            .compile_js_to_wasm(&big, "minimal-node", "job")
+            .await;
+        assert!(format!("{:#}", js.unwrap_err()).contains("source-too-large"));
+
+        let py = service
+            .compile_python_to_wasm(&big, "minimal-node", "job")
+            .await;
+        assert!(format!("{:#}", py.unwrap_err()).contains("source-too-large"));
+
+        let lint = service
+            .lint_code(None, "m", &big, "minimal-node", None)
+            .await
+            .expect("a refusal is a reported error, not a failure");
+        assert!(lint[0].message.starts_with("source-too-large"));
+
+        let analysis = service
+            .analyze_code("m", &big)
+            .await
+            .expect("a refusal is a reported error, not a failure");
+        assert!(analysis[0].message.starts_with("source-too-large"));
+
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "no workspace was created for a refused source"
+        );
     }
 }
 

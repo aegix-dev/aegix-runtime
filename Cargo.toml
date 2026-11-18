@@ -136,8 +136,12 @@ uuid = { version = "1.20", features = ["v4", "serde"] }
 # AOT cache), and it was the only path to zstd (RUSTSEC-2026-0391, -0395..0406,
 # -0410). A crate lists every other default itself.
 wasmtime = { version = "49.0.5", default-features = false }
-wasmtime-wasi = "49.0.5"
-wasmtime-wasi-http = "49.0.5"
+# WASI defaults off as well: the runtime links WASIp2 only. The defaults add
+# WASIp1 (wiggle) and WASIp3, which no linker here registers, and
+# wasmtime-wasi-http's `default-send-request` (upstream's unfiltered send
+# path, replaced by `host::wasi_http`). A crate names what it uses.
+wasmtime-wasi = { version = "49.0.5", default-features = false }
+wasmtime-wasi-http = { version = "49.0.5", default-features = false }
 zeroize = "1.8"
 
 # Workspace-level clippy policy.
