@@ -8,6 +8,7 @@ publish.workspace = true
 description = "RFC 0010 P3 (D3b) controller-side per-execution secret-envelope sealing: in-flight seal-context store, claim handler and claim responder."
 
 [dependencies]
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
 aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
 dashmap.workspace = true
 uuid = { workspace = true, features = ["v4"] }
@@ -17,17 +18,11 @@ async-nats.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 tracing.workspace = true
-# The responder counts the claims it drops (B2-3) on the platform's metrics
-# registry, when the build has one (feature `metrics`).
-aegix-metrics = { path = "../aegix-metrics", optional = true }
-
-[features]
-default = []
-# Count dropped claims on `aegix_envelope_claims_dropped_total`. The platform
-# controller turns this on (through `aegix-engine`, which runs the responder).
-# Off, the crate links no metrics registry, so a controller held by structural
-# check 109 can run the same responder; a drop is still logged.
-metrics = ["dep:aegix-metrics"]
+# No metrics registry: the responder counts the claims it drops (B2-3) through
+# the `ClaimDropCounter` its caller hands it, so a controller held by
+# structural check 109 runs the same responder as the platform's, and this
+# crate stays below the platform's metric registry (2026-11-18,
+# docs/engineering-log/packages/2026-11-18-metrics-registry-above-the-runtime.md).
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

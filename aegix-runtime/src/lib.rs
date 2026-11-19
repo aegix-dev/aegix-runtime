@@ -37,23 +37,31 @@ pub const WIT: &str = include_str!("../../wit/aegix.wit");
 /// behind every `aegix:core/*` interface, the module fetcher, the SQL
 /// validator and the result cache. The whole crate, for an embedder that
 /// needs a module the short paths below do not name.
-pub use aegix_worker_runtime as worker_runtime;
+pub use aegix_wasm_host as wasm_host;
+
+/// The former name of [`wasm_host`], from when the host crate was
+/// `aegix-worker-runtime`. The same items; kept so an embedder's paths go on
+/// compiling, with a warning that names the new one.
+#[deprecated(note = "renamed: use `aegix_runtime::wasm_host`")]
+pub mod worker_runtime {
+    pub use aegix_wasm_host::*;
+}
 
 /// The runtime proper: construction, the execute entry points, the security
 /// and retry policies and health.
 pub mod runtime {
-    pub use aegix_worker_runtime::runtime::*;
+    pub use aegix_wasm_host::runtime::*;
 }
 
 /// Per-execution context: the capability ceilings, egress scope, secret slots
 /// and the development opt-ins a test states on the context, never in the
 /// environment.
 pub mod context {
-    pub use aegix_worker_runtime::context::*;
+    pub use aegix_wasm_host::context::*;
 }
 
-pub use aegix_worker_runtime::context::{AegixContext, DevEgressOptIns};
-pub use aegix_worker_runtime::runtime::{
+pub use aegix_wasm_host::context::{AegixContext, DevEgressOptIns};
+pub use aegix_wasm_host::runtime::{
     AegixRuntime, RetryPolicy, RuntimeHealthStatus, SecurityPolicy,
 };
 

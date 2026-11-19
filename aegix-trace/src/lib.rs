@@ -418,7 +418,7 @@ pub fn export_to_otel(metadata: &tracing::Metadata<'_>) -> bool {
 ///
 /// In this workspace that stream carries untrusted text. The loudest source is
 /// guest WASM log lines — `tracing::{warn,error}!("[WASM] {msg}")` in
-/// `aegix_worker_runtime::host::logging`, deliberately un-redacted on the
+/// `aegix_wasm_host::host::logging`, deliberately un-redacted on the
 /// stated grounds that stdout is an operator surface — but it is one of roughly
 /// 418 event callsites in that crate alone, many of which interpolate upstream
 /// error text (`error = %e`) that has historically echoed a rejected `Bearer`
@@ -495,7 +495,7 @@ pub fn shutdown_tracing() {
 /// Upper bound, in Unicode scalar values, on any caller-supplied string this
 /// crate writes to a span or to the process's stdout/stderr.
 ///
-/// Matches `aegix_worker_runtime::error_sanitize::sanitize_error_message`'s
+/// Matches `aegix_wasm_host::error_sanitize::sanitize_error_message`'s
 /// bound so the two agree. Before this existed, `end_error` had **no** bound at
 /// all and its one guest-text caller passes a WASM-authored string of arbitrary
 /// length.
@@ -511,7 +511,7 @@ pub const MAX_SPAN_TEXT_CHARS: usize = 2000;
 /// WASM guest code. A module that echoes an upstream `401` routinely carries an
 /// `sk-*` / `ghp_*` / `Bearer …` value inside that text. Before this function
 /// existed, whether the secret was scrubbed depended on which caller you were:
-/// `aegix-worker-runtime`'s `runtime.rs` wrapped its argument in
+/// `aegix-wasm-host`'s `runtime.rs` wrapped its argument in
 /// `aegix_dlp_provider::redact_str` (PR #433) while `worker/src/main.rs` passed
 /// the output of `sanitize_error_message`, which strips paths, line numbers and
 /// internal IPs and does **no** secret redaction at all. Two sinks, the same
@@ -1569,7 +1569,7 @@ mod span_sink_redaction_tests {
 
     #[test]
     fn redaction_is_idempotent() {
-        // `aegix-worker-runtime`'s `runtime.rs` redacts before calling the
+        // `aegix-wasm-host`'s `runtime.rs` redacts before calling the
         // sink. Double redaction must be a no-op, or that caller would corrupt
         // its own message.
         for (name, fixture) in FIXTURES {

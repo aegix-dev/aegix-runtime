@@ -37,7 +37,7 @@ opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "testing"] }
 # gRPC stack (structural check 109 refuses those crates in the runtime's
 # closure; docs/engineering-log/packages/2026-11-01-otlp-below-the-runtime-boundary.md).
 # The two binaries that export traces — the controller directly, the worker
-# through `aegix-worker-runtime/otlp` — turn it on. Without it, every other
+# through `aegix-wasm-host/otlp` — turn it on. Without it, every other
 # item of this crate is unchanged (`ExecutionSpan`, the bridge layer, the
 # redaction sink, the endpoint and sampler readers), and `init_tracing` with a
 # configured endpoint REFUSES it with a log line naming this feature

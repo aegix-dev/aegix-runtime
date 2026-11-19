@@ -1,0 +1,21 @@
+[package]
+name = "aegix-deploy-posture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "What kind of deployment a process is in and how its settings are read: production or not, the security profile and its boot gates, the fleet-key and dispatch-binding requirements, the refusal of settings under a former name, and the one vocabulary for a boolean or a number read from the environment."
+repository = "https://github.com/aegix-dev/aegix-runtime"
+homepage = "https://github.com/aegix-dev/aegix-runtime"
+
+# A leaf below the runtime boundary (2026-11-18,
+# docs/engineering-log/packages/2026-11-18-deploy-posture-below-the-settings.md):
+# cut out of aegix-config, which re-exports every item at its old path. A
+# setting only the platform reads does not go here.
+[dependencies]
+aegix-auth-types = { path = "../aegix-auth-types" }
+tracing.workspace = true
+
+[lints]
+workspace = true

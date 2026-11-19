@@ -50,10 +50,10 @@ const LAST_USED_MARKER: &str = ".last_used";
 const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// On unless explicitly off, through the shared vocabulary
-/// (`aegix_config::bool_env`; an unrecognised value WARNs and keeps the
+/// (`aegix_deploy_posture::bool_env`; an unrecognised value WARNs and keeps the
 /// default). Package CB: this was a private off-list.
 fn cache_enabled() -> bool {
-    aegix_config::bool_env_or_default("AEGIX_COMPILE_TARGET_CACHE", true)
+    aegix_deploy_posture::bool_env_or_default("AEGIX_COMPILE_TARGET_CACHE", true)
 }
 
 fn cache_root() -> PathBuf {

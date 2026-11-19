@@ -492,11 +492,12 @@ async fn handle_connection(
             // depth, not a live misreport: it makes the display agree with the
             // gate's OWN semantics rather than depending on a guard in another
             // function to stay correct.
-            let auth_status = if aegix_config::env_var_is_set_nonempty("METRICS_AUTH_TOKENS") {
-                "ENABLED (secure)"
-            } else {
-                "DISABLED (insecure - set METRICS_AUTH_TOKENS)"
-            };
+            let auth_status =
+                if aegix_deploy_posture::env_var_is_set_nonempty("METRICS_AUTH_TOKENS") {
+                    "ENABLED (secure)"
+                } else {
+                    "DISABLED (insecure - set METRICS_AUTH_TOKENS)"
+                };
 
             let help = format!(
                 r#"<!DOCTYPE html>

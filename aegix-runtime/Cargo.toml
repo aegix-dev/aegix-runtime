@@ -16,7 +16,7 @@ readme = "README.md"
 # platform crate anywhere in this crate's normal-dependency closure, so a new
 # dependency of any crate listed here is a boundary change.
 [dependencies]
-aegix-worker-runtime = { path = "../aegix-worker-runtime" }
+aegix-wasm-host = { path = "../aegix-wasm-host" }
 aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
 aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
 aegix-capability-world = { path = "../aegix-capability-world" }
@@ -28,18 +28,18 @@ default = []
 # An embedder that exports traces over OTLP/gRPC turns this on; off, the
 # closure holds no `opentelemetry-otlp`, `tonic` or `prost` (check 109 refuses
 # them), and `init_tracing` refuses a configured endpoint with a log line.
-otlp = ["aegix-worker-runtime/otlp"]
+otlp = ["aegix-wasm-host/otlp"]
 # An embedder that runs modules pulled from an OCI registry (`oci://` module
 # URIs, Sigstore-verified) turns this on; off, the closure holds no
 # `oci-client` / `oci-spec` (check 109 refuses them) and `module_fetcher::fetch`
 # refuses an `oci://` dispatch with `NoRegistryClientInThisBuild`.
-oci = ["aegix-worker-runtime/oci"]
+oci = ["aegix-wasm-host/oci"]
 # An embedder that serves a Prometheus `/metrics` exposition turns this on;
 # off, the closure holds no `prometheus` / `opentelemetry-prometheus` (check
 # 109 refuses them) and `metrics::init_telemetry` refuses with
 # `NoMetricsExporterInThisBuild`; the OTel instruments record into the no-op
 # global meter.
-prometheus = ["aegix-worker-runtime/prometheus"]
+prometheus = ["aegix-wasm-host/prometheus"]
 
 [dev-dependencies]
 anyhow.workspace = true

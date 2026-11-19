@@ -74,8 +74,8 @@ fn every_scripted_command_is_granted() {
     let mut seen = 0;
     for file in [
         "aegix-local-inference/src/fleet.rs",
-        "aegix-worker-runtime/src/host/cache.rs",
-        "aegix-worker-runtime/src/host/graphql.rs",
+        "aegix-wasm-host/src/host/cache.rs",
+        "aegix-wasm-host/src/host/graphql.rs",
     ] {
         for cmd in scripted_commands(&read(file)) {
             seen += 1;
@@ -100,7 +100,7 @@ fn every_worker_key_family_is_granted() {
     // Prefixes the code exports.
     for prefix in [
         crate::dispatch_replay::KEY_PREFIX,
-        aegix_worker_runtime::job_idempotency::REDIS_JOB_PREFIX,
+        aegix_wasm_host::job_idempotency::REDIS_JOB_PREFIX,
     ] {
         assert!(writable(&rules, &format!("{prefix}x")), "{prefix}");
     }
@@ -108,25 +108,25 @@ fn every_worker_key_family_is_granted() {
     // is granted as the worker uses it.
     for (file, literal, sample, write) in [
         (
-            "aegix-worker-runtime/src/runtime.rs",
+            "aegix-wasm-host/src/runtime.rs",
             "wasm:result:",
             "wasm:result:h:d",
             true,
         ),
         (
-            "aegix-worker-runtime/src/module_fetcher.rs",
+            "aegix-wasm-host/src/module_fetcher.rs",
             "oci_cache:",
             "oci_cache:sha256:d",
             true,
         ),
         (
-            "aegix-worker-runtime/src/host/cache.rs",
+            "aegix-wasm-host/src/host/cache.rs",
             "talos_cache:",
             "talos_cache:u=x:k",
             true,
         ),
         (
-            "aegix-worker-runtime/src/host/secrets.rs",
+            "aegix-wasm-host/src/host/secrets.rs",
             "talos:tier2_expose:",
             "talos:tier2_expose:u:d",
             true,
@@ -138,13 +138,13 @@ fn every_worker_key_family_is_granted() {
             true,
         ),
         (
-            "aegix-worker-runtime/src/host/governance.rs",
+            "aegix-wasm-host/src/host/governance.rs",
             "approval:",
             "approval:w",
             true,
         ),
         (
-            "aegix-workflow-engine-core/src/wasm_cache.rs",
+            "aegix-dispatch-types/src/wasm_cache.rs",
             "wasm:",
             "wasm:u:m",
             false,

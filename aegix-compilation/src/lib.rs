@@ -14,10 +14,8 @@ mod analyze;
 pub mod catalog;
 pub mod container;
 pub mod dependency_allowlist;
-pub mod js_templates;
 pub mod sandbox_run;
 pub mod scaffold;
-pub mod source_entities;
 mod target_cache;
 
 // Re-export the allowlist gate at the crate root so callers (and the
@@ -80,7 +78,7 @@ pub(crate) fn nonzero_env_or_default(var: &str, default: usize) -> usize {
 /// `aegix_advisory_db_age_days`, so what the gate consults and what the
 /// alerts read cannot drift. This function only renders the outcome.
 pub(crate) fn check_advisory_db_age(db_path: &str) -> Result<()> {
-    check_advisory_db_age_as(db_path, aegix_config::is_production())
+    check_advisory_db_age_as(db_path, aegix_deploy_posture::is_production())
 }
 
 /// [`check_advisory_db_age`] with the posture passed in, so the refusal arm
@@ -100,7 +98,7 @@ pub(crate) fn check_measured_advisory_db_age(
     db_path: &str,
     age: std::result::Result<u64, advisory_db::AdvisoryDbAgeError>,
 ) -> Result<()> {
-    check_measured_advisory_db_age_as(db_path, age, aegix_config::is_production())
+    check_measured_advisory_db_age_as(db_path, age, aegix_deploy_posture::is_production())
 }
 
 pub(crate) fn check_measured_advisory_db_age_as(
@@ -354,10 +352,12 @@ mod advisory_db_age_tests {
             .next()
             .expect("production text");
         assert_eq!(
-            prod.matches("check_advisory_db_age_as(db_path, aegix_config::is_production())")
-                .count(),
+            prod.matches(
+                "check_advisory_db_age_as(db_path, aegix_deploy_posture::is_production())"
+            )
+            .count(),
             1,
-            "check_advisory_db_age must pass aegix_config::is_production() to the seam"
+            "check_advisory_db_age must pass aegix_deploy_posture::is_production() to the seam"
         );
     }
 
@@ -390,7 +390,7 @@ mod advisory_db_age_tests {
         // The gate reads AEGIX_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
         let _g = crate::container::env_lock();
         assert!(
-            !aegix_config::is_production(),
+            !aegix_deploy_posture::is_production(),
             "this test binary must not run as production"
         );
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -480,7 +480,7 @@ pub fn max_concurrent_compilations() -> usize {
 
 /// The refusal every compile, lint and source-analysis entry point returns
 /// on a deployment that has turned module compilation off
-/// (`AEGIX_MODULE_COMPILATION=false`, see [`aegix_config::module_compilation`]).
+/// (`AEGIX_MODULE_COMPILATION=false`, see [`aegix_deploy_posture::module_compilation`]).
 ///
 /// A type, not a string, so a protocol surface can tell it from a toolchain
 /// failure ([`is_compilation_disabled`]): the first is the deployment's
@@ -561,7 +561,7 @@ pub struct CompilationService {
     wit_path: PathBuf,
     event_tx: aegix_engine_events::CompilationEventSender,
     /// `false` on a registry-only deployment. Read once at construction
-    /// from [`aegix_config::module_compilation_enabled`].
+    /// from [`aegix_deploy_posture::module_compilation_enabled`].
     compilation_enabled: bool,
 }
 
@@ -593,7 +593,7 @@ impl CompilationService {
             );
         }
 
-        let compilation_enabled = aegix_config::module_compilation_enabled();
+        let compilation_enabled = aegix_deploy_posture::module_compilation_enabled();
         if !compilation_enabled {
             tracing::info!(
                 target: "aegix_compilation",
@@ -2500,7 +2500,7 @@ fn extract_wit_world(source: &str) -> String {
     // placeholder) would otherwise yield an empty world that the
     // compilation pipeline rejects with a confusing "unknown world"
     // error rather than using the least-privilege default.
-    aegix_config::get_env("AEGIX_DEFAULT_WIT_WORLD", "minimal-node")
+    aegix_deploy_posture::get_env("AEGIX_DEFAULT_WIT_WORLD", "minimal-node")
 }
 
 /// wasm-security-review (2026-05-22): returns the offending token when
@@ -3123,7 +3123,7 @@ mod jspy_world_detection_tests {
 /// `wasi:http/outgoing-handler` interface (StarlingMonkey's `fetch`).
 ///
 /// Only the automation (Trusted) tier does — the worker links the GATED
-/// handler there (`aegix-worker-runtime/src/host/wasi_http.rs`, since
+/// handler there (`aegix-wasm-host/src/host/wasi_http.rs`, since
 /// 2026-09-25: the `aegix:core/http` gate set, not upstream's unfiltered
 /// `add_only_http_to_linker_async`) and `add_wasi_http_types_only` (types, no
 /// handler) everywhere else. So JS for any lower world must be
@@ -4473,6 +4473,7 @@ mod reconcile_declared_world_tests {
             imported_interfaces: vec!["aegix:core/llm".to_string()],
             is_aegix_node: true,
             former_package_imports: vec![],
+            unreadable: None,
         }
     }
 
@@ -4520,6 +4521,7 @@ mod reconcile_declared_world_tests {
             imported_interfaces: imports.iter().map(|s| s.to_string()).collect(),
             is_aegix_node: true,
             former_package_imports: vec![],
+            unreadable: None,
         }
     }
 

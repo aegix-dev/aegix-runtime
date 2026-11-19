@@ -33,8 +33,8 @@ use crate::dispatch::{
 };
 use crate::keys::Posture;
 use crate::ledger::{Actor, ActorStatus};
+use aegix_dispatch_types::{EgressScope, LlmTier, SecretMap, WriteCeiling};
 use aegix_wit_inspector::WorldFit;
-use aegix_workflow_engine_core::{EgressScope, LlmTier, SecretMap, WriteCeiling};
 use aegix_workflow_job_protocol::MAX_JOB_FUEL;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};

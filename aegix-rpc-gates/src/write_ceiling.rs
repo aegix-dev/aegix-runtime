@@ -35,7 +35,7 @@
 //! is testable with no process env and no Postgres, and so the two states that
 //! mean *unknown* cannot be collapsed into the state that means *permitted*.
 //! The DECISION itself is [`aegix_workflow_job_protocol::write_ceiling_denies`]
-//! (a re-export of `aegix_workflow_engine_core`'s), shared with the worker and
+//! (a re-export of `aegix_dispatch_types`'s), shared with the worker and
 //! with #750's envelope gate rather than re-derived here: two paths answering
 //! one question differently IS the defect.
 //!
@@ -60,8 +60,8 @@
 //! It does not gate `talos.state.write`. See [`CONTROLLER_SERVED_WRITE_OPS`].
 
 use crate::ledger::GateLedger;
+use aegix_dispatch_types::{write_ceiling_denies, WriteCeiling};
 use aegix_rpc_protocol::{database_rpc, integration_state_rpc, memory_rpc};
-use aegix_workflow_engine_core::{write_ceiling_denies, WriteCeiling};
 
 /// The answer to "what is this actor's ceiling?", kept three-valued so a
 /// caller must say what an unreadable answer means at its own site.
@@ -281,7 +281,7 @@ fn log_refusal(
         target: "talos_audit",
         event_kind = "rpc_write_ceiling_refused",
         op,
-        policy = aegix_workflow_engine_core::WRITE_CEILING_POLICY,
+        policy = aegix_dispatch_types::WRITE_CEILING_POLICY,
         subject,
         %actor_id,
         reason = reason.as_str(),
@@ -402,7 +402,7 @@ pub const DATABASE_QUERY_OP: &str = "database-query";
 /// being laxer: one control, two answers.
 pub const CONTROLLER_SERVED_WRITE_OPS: &[(&str, &str)] = &[
     (
-        aegix_workflow_engine_core::AGENT_MEMORY_SET_OP,
+        aegix_dispatch_types::AGENT_MEMORY_SET_OP,
         memory_rpc::SUBJECT_MEMORY_OP,
     ),
     (
@@ -624,7 +624,7 @@ mod write_ceiling_tests {
             ledger,
             enforced,
             actor,
-            aegix_workflow_engine_core::AGENT_MEMORY_SET_OP,
+            aegix_dispatch_types::AGENT_MEMORY_SET_OP,
             memory_rpc::SUBJECT_MEMORY_OP,
             "probe/key",
         )

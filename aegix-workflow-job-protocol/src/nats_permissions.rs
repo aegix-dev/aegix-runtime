@@ -150,7 +150,7 @@ const fn queued(subject: &'static str) -> SubscribeAllow {
 
 /// Subjects the worker credential may SUBSCRIBE to. Closed set; every entry
 /// maps to a `subscribe`/`queue_subscribe` call in `worker/` or
-/// `aegix-worker-runtime/`, listed in the order the worker takes them at boot.
+/// `aegix-wasm-host/`, listed in the order the worker takes them at boot.
 pub const WORKER_SUBSCRIBE_ALLOW: &[SubscribeAllow] = &[
     // worker/src/main.rs — the single-job queue (`NATS_JOB_TOPIC` default) and
     // its per-user edge-routing children `talos.jobs.<user_id>`, QUEUE-ONLY:
@@ -164,7 +164,7 @@ pub const WORKER_SUBSCRIBE_ALLOW: &[SubscribeAllow] = &[
     // NOT here: it has zero publishers and zero subscribers
     // (`docs/inert-mechanisms.md`), and an inert subject earns no permission.
     plain("talos.workers.cmd.cancel"),
-    // aegix-worker-runtime/src/host/governance.rs — the approve/reject reply
+    // aegix-wasm-host/src/host/governance.rs — the approve/reject reply
     // for a suspended governance node, keyed on the node's exec id.
     plain("talos.approvals.wait.>"),
     // Every `Client::request` the worker issues (the seven signed RPCs, the
@@ -175,7 +175,7 @@ pub const WORKER_SUBSCRIBE_ALLOW: &[SubscribeAllow] = &[
 /// Subjects the worker credential may NOT PUBLISH to. Everything not listed
 /// is permitted (see the module docs for why this is a deny-list). Every
 /// entry is a subject the controller authors or the broker owns, and that no
-/// line in `worker/` or `aegix-worker-runtime/` publishes to.
+/// line in `worker/` or `aegix-wasm-host/` publishes to.
 pub const WORKER_PUBLISH_DENY: &[&str] = &[
     // Job dispatch is the controller's alone. A forged JobRequest fails its
     // signature check on the receiving worker, but the broker refusing it is
@@ -200,7 +200,7 @@ pub const WORKER_PUBLISH_DENY: &[&str] = &[
     // Other workers' request inboxes — the worker only ever RECEIVES here.
     "_WINBOX.>",
     // NATS system and JetStream API namespaces. The worker uses no JetStream
-    // (zero `jetstream` references in `worker/` and `aegix-worker-runtime/`).
+    // (zero `jetstream` references in `worker/` and `aegix-wasm-host/`).
     "$SYS.>",
     "$JS.>",
     "$KV.>",

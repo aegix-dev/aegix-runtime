@@ -60,7 +60,16 @@ async fn claim_handshake_over_live_nats() {
         let in_flight = in_flight.clone();
         let controller_sk = controller_sk.clone();
         tokio::spawn(async move {
-            let _ = run_claim_responder(nc, subject, in_flight, controller_sk, 60, None).await;
+            let _ = run_claim_responder(
+                nc,
+                subject,
+                in_flight,
+                controller_sk,
+                60,
+                None,
+                aegix_envelope_seal::claim_drops_uncounted,
+            )
+            .await;
         });
     }
     // Give the subscription a moment to establish.

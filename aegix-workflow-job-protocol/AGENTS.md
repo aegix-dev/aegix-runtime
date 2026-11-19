@@ -13,8 +13,9 @@ security drift**.
 ## Sibling crates
 
 ```
+aegix-dispatch-types                keys, ceilings, secret map (this crate's one sibling dependency)
 aegix-workflow-job-protocol       ← you are here (wire format + HMAC)
-aegix-workflow-engine-core        trait surface
+aegix-workflow-engine-core        trait surface (re-exports aegix-dispatch-types)
 aegix-workflow-engine             scheduler (builds JobRequests)
     └── aegix-workflow-engine-nats   transport (signs, publishes, verifies)
 aegix-workflow-engine-test-utils  in-memory trait impls

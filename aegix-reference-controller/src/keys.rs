@@ -19,7 +19,7 @@
 //!   admission. A job's secrets are sealed to the one worker that claims the
 //!   job, and only that worker's result is taken.
 
-use aegix_workflow_engine_core::{WorkerKeyRing, WorkerSharedKey};
+use aegix_dispatch_types::{WorkerKeyRing, WorkerSharedKey};
 use aegix_workflow_job_protocol::{DispatchSigner, DispatchSigningKey};
 use std::sync::Arc;
 

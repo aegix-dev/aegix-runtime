@@ -13,7 +13,8 @@
 //! and no series counted down to the day the gate would start refusing (the
 //! Vault KEK token's shape before package BA). The age computation, the
 //! limit, the verdict and the gate's decision each live here once; the
-//! controller samples the age hourly through [`sample_and_publish_advisory_db_age`].
+//! controller samples the age hourly through [`sample_and_log_advisory_db_age`]
+//! and publishes what it read to its own metrics registry: this crate links none.
 //!
 //! **Which copy.** The controller image and the builder image each bake
 //! their own copy. In container mode `cargo audit` reads the BUILDER's, and
@@ -28,7 +29,25 @@
 use std::io;
 use std::time::{Duration, SystemTime};
 
-use aegix_metrics::{AdvisoryDbCopy, AdvisoryDbSampleOutcome, AegixMetrics};
+/// Which baked copy of the advisory database a sample describes. The
+/// controller and the builder image each bake their own; only the
+/// controller's is sampled today (the module's stated limit), and the name is
+/// what lets a builder-side sampler join without renaming anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdvisoryDbCopy {
+    /// The copy baked into the controller image.
+    Controller,
+}
+
+impl AdvisoryDbCopy {
+    /// The copy's name in a log line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+        }
+    }
+}
 
 /// Age at which the gate starts warning. `TalosAdvisoryDbAging` fires at the
 /// same number (pinned by `alerts_read_the_gates_own_thresholds`).
@@ -273,47 +292,18 @@ pub fn sample_advisory_db() -> AdvisoryDbSample {
     sample_advisory_db_with(
         crate::container::ADVISORY_DB_PATH,
         advisory_db_max_age_days(),
-        aegix_config::is_production(),
+        aegix_deploy_posture::is_production(),
     )
 }
 
-/// Publish a sample: the limit and posture always; the age ONLY when it was
-/// measured, so an unreadable sample leaves the last reading standing and is
-/// visible on the `unreadable` outcome instead of as a fresh-looking zero.
-pub fn publish_advisory_db_sample(metrics: &AegixMetrics, sample: &AdvisoryDbSample) {
-    aegix_metrics::publish_advisory_db_limits_on(
-        metrics,
-        sample.copy,
-        sample.max_age_days,
-        sample.enforced,
-    );
-    match &sample.age_days {
-        Ok(age) => {
-            aegix_metrics::publish_advisory_db_age_on(metrics, sample.copy, *age);
-            aegix_metrics::record_advisory_db_sample_on(
-                metrics,
-                sample.copy,
-                AdvisoryDbSampleOutcome::Measured,
-            );
-        }
-        Err(_) => aegix_metrics::record_advisory_db_sample_on(
-            metrics,
-            sample.copy,
-            AdvisoryDbSampleOutcome::Unreadable,
-        ),
-    }
-}
-
-/// One sampler tick: sample the controller's copy, publish it to `metrics`
-/// when there is a registry, and log the reading. INFO on a measured sample
-/// (24 lines a day — the series is the signal, not the log); WARN on an
-/// unreadable one, because `cargo audit --no-fetch` fails in every
-/// environment while the database cannot be read.
-pub fn sample_and_publish_advisory_db_age(metrics: Option<&AegixMetrics>) -> AdvisoryDbSample {
+/// One sampler tick: sample the controller's copy and log the reading. INFO
+/// on a measured sample (24 lines a day — the series is the signal, not the
+/// log); WARN on an unreadable one, because `cargo audit --no-fetch` fails in
+/// every environment while the database cannot be read. The caller publishes
+/// the returned sample: an `Err` age is an unreadable sample, and whoever
+/// publishes it leaves the last measured age standing.
+pub fn sample_and_log_advisory_db_age() -> AdvisoryDbSample {
     let sample = sample_advisory_db();
-    if let Some(m) = metrics {
-        publish_advisory_db_sample(m, &sample);
-    }
     match &sample.age_days {
         Ok(age) => tracing::info!(
             target: "aegix_compilation",
@@ -549,53 +539,27 @@ mod tests {
     }
 
     #[test]
-    fn publish_sets_the_age_only_on_a_measured_sample() {
-        let m = AegixMetrics::new().unwrap();
+    fn a_tick_samples_the_controllers_copy() {
+        // The tick returns what it read of the real baked path (absent on a
+        // developer machine, present in the image) and must not panic on
+        // either.
+        let s = sample_and_log_advisory_db_age();
+        assert_eq!(s.copy, AdvisoryDbCopy::Controller);
+        assert_eq!(s.copy.as_str(), "controller");
+        assert!(s.max_age_days > 0);
+    }
+
+    #[test]
+    fn a_sample_keeps_an_unreadable_age_as_an_error() {
+        // What the publisher is handed: a measured age, or the error that
+        // says the reading is stale. Never a zero.
         let tmp = tempfile::tempdir().unwrap();
         set_age(tmp.path(), 75 * DAY + 3600);
         let measured = sample_advisory_db_with(tmp.path().to_str().unwrap(), 90, true);
         assert_eq!(*measured.age_days.as_ref().unwrap(), 75);
-        publish_advisory_db_sample(&m, &measured);
-        let r = m.render_prometheus().unwrap();
-        assert!(
-            r.contains(r#"aegix_advisory_db_age_days{copy="controller"} 75"#),
-            "{r}"
-        );
-        assert!(r.contains(r#"aegix_advisory_db_max_age_days{copy="controller"} 90"#));
-        assert!(r.contains(r#"aegix_advisory_db_age_enforced{copy="controller"} 1"#));
-        assert!(r.contains(
-            r#"aegix_advisory_db_age_samples_total{copy="controller",outcome="measured"} 1"#
-        ));
-        assert!(r.contains(
-            r#"aegix_advisory_db_age_samples_total{copy="controller",outcome="unreadable"} 0"#
-        ));
-
-        // An unreadable sample: limits move, the age does NOT, the counter says so.
+        assert_eq!((measured.max_age_days, measured.enforced), (90, true));
         let unreadable = sample_advisory_db_with("/does/not/exist/advisory-db", 120, false);
         assert!(unreadable.age_days.is_err());
-        publish_advisory_db_sample(&m, &unreadable);
-        let r = m.render_prometheus().unwrap();
-        assert!(
-            r.contains(r#"aegix_advisory_db_age_days{copy="controller"} 75"#),
-            "{r}"
-        );
-        assert!(r.contains(r#"aegix_advisory_db_max_age_days{copy="controller"} 120"#));
-        assert!(r.contains(r#"aegix_advisory_db_age_enforced{copy="controller"} 0"#));
-        assert!(r.contains(
-            r#"aegix_advisory_db_age_samples_total{copy="controller",outcome="measured"} 1"#
-        ));
-        assert!(r.contains(
-            r#"aegix_advisory_db_age_samples_total{copy="controller",outcome="unreadable"} 1"#
-        ));
-    }
-
-    #[test]
-    fn a_tick_without_a_registry_still_samples() {
-        // No global registry in this binary: the tick must neither panic nor
-        // publish; it returns what it read of the real baked path (absent on a
-        // developer machine, present in the image).
-        let s = sample_and_publish_advisory_db_age(None);
-        assert_eq!(s.copy, AdvisoryDbCopy::Controller);
-        assert!(s.max_age_days > 0);
+        assert_eq!((unreadable.max_age_days, unreadable.enforced), (120, false));
     }
 }

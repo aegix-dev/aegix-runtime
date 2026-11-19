@@ -9,7 +9,11 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 aegix-capability-world = { path = "../aegix-capability-world" }
-wasmparser = "0.224"
+# The version wasmtime reads a component with (`wasmtime-environ`'s own
+# dependency): this crate says what a binary imports before wasmtime links
+# it, so the two must parse alike. A wasmtime bump moves this line with it;
+# `the_parser_is_the_one_wasmtime_reads_with` refuses the tree otherwise.
+wasmparser = "0.258"
 
 [dev-dependencies]
 proptest.workspace = true

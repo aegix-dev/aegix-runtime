@@ -1,0 +1,208 @@
+[package]
+name = "aegix-wasm-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Internal workspace crate — not published to crates.io. Set `publish = false`
+# + a license string so cargo-deny's unlicensed-crate check passes without
+# requiring legal review for code that never leaves this repo.
+publish.workspace = true
+license.workspace = true
+
+# The WebAssembly host (named aegix-worker-runtime until 2026-11-18), the
+# worker's LIBRARY half (wasmtime WASM host: AegixRuntime, AegixContext,
+# host/ modules, module_fetcher, sql_validator, wit_inspector, …), extracted
+# from the `worker` bin crate in July 2026 so controller-side consumers
+# depend on a library instead of a deployable binary. The `worker` crate is
+# now the thin bin (main.rs + self_register + metrics_server + secret_claim)
+# plus a re-export shim lib.
+
+[dependencies]
+aegix-local-inference = { path = "../aegix-local-inference" }
+# Core async runtime
+tokio = { workspace = true, features = ["full"] }
+async-nats.workspace = true
+
+# Wasmtime 43.0.2 — critical security updates. 43.0.1 covered:
+#   CVE-2026-34971 sandbox escape, CVE-2026-27572 HTTP headers DoS,
+#   CVE-2026-27195 call_async DoS, GHSA-6wgr-89rj-399p pooling allocator leak.
+# 43.0.2 adds RUSTSEC-2026-0114 fix.
+# 44.0.2 fixes RUSTSEC-2026-0149 (HIGH, CVSS 7.5): WASI path_open(TRUNCATE)
+#   bypasses the host FilePerms::WRITE restriction. Reachable here via the
+#   Database/Agent capability worlds' read-only preopen (FilePerms::READ) in
+#   context.rs — a guest could TRUNCATE files in its per-execution ephemeral
+#   tempdir despite the read-only ceiling. The 43.x line has no patched
+#   release; 44.0.2 is the first fixed version in the next major. Drop-in: no
+#   API changes (verified — worker compiles + full lib suite green).
+# Also brings: per-operator fuel costs, Store::try_new (OOM-safe), WASIp3 preview.
+# Pinning to the exact version ensures reproducible builds. The version
+# itself is in the root Cargo.toml's [workspace.dependencies], with
+# wasmtime-wasi and wasmtime-wasi-http (2026-10-06).
+# wasmtime's defaults without `cache` (see the root manifest), plus
+# memory-protection-keys.
+wasmtime = { workspace = true, features = [
+  "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat", "profiling",
+  "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump",
+  "debug-builtins", "runtime", "component-model", "component-model-async", "threads",
+  "stack-switching", "std", "debug", "compile-time-builtins", "wit-parser", "memory-protection-keys",
+] }
+wasmtime-wasi.workspace = true
+
+# Core utilities
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["serde", "v4"] }
+aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
+# Zero-dependency leaf: the vocabulary of the weak `[after_host_failure=…]`
+# marker, shared with the controller-side classifiers that read it.
+aegix-reason-class = { path = "../aegix-reason-class" }
+aegix-dlp-provider = { path = "../aegix-dlp-provider" }
+aegix-secrets = { path = "../aegix-secrets" }
+zeroize.workspace = true
+aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
+aegix-ssrf-classify = { path = "../aegix-ssrf-classify" }
+aegix-sigstore-policy = { path = "../aegix-sigstore-policy" }
+aegix-wit-inspector = { path = "../aegix-wit-inspector" }
+aegix-trace = { path = "../aegix-trace" }
+aegix-trace-nats = { path = "../aegix-trace-nats" }
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
+aegix-audit-event = { path = "../aegix-audit-event" }
+# Worker-side in-memory idempotency dedup store (belt-and-suspenders on top of
+# the Idempotency-Key header). The Redis-backed IdempotencyService in this crate
+# is unused by the worker; only InMemoryIdempotencyStore is.
+aegix-idempotency = { path = "../aegix-idempotency" }
+# MCP-1046: char-boundary-aware truncation for wit_logging.
+aegix-text-util = { path = "../aegix-text-util" }
+regex.workspace = true  # For error message sanitization
+sqlparser = { workspace = true, features = ["visitor"] }  # AST-based SQL validation (replaces pattern matching)
+aegix-sql-classify = { path = "../aegix-sql-classify" }  # THE read-only/mutation classifier, shared with the controller
+
+# Security & sandboxing
+cap-std.workspace = true  # Capability-based filesystem security
+tempfile.workspace = true  # Ephemeral per-execution sandbox directories (auto-shredded on Drop)
+
+# HTTP client
+reqwest = { workspace = true, features = ["json", "gzip", "brotli", "deflate", "stream", "rustls"] }
+url.workspace = true
+
+# Async utilities
+futures-util.workspace = true
+
+# Performance & caching
+dashmap.workspace = true  # Lock-free concurrent HashMap for component caches
+
+# Cryptography (for host functions)
+sha2.workspace = true  # For cache key hashing and crypto interface
+md5 = "0.8"  # MD5 hashing (crypto interface)
+hmac.workspace = true  # HMAC operations (crypto interface)
+# Seals the Redis tier of the module result cache (`result_cache_seal`, E-4).
+aes-gcm.workspace = true
+base64.workspace = true  # Base64 encoding/decoding (crypto interface)
+hex.workspace = true  # Hex encoding/decoding (crypto interface)
+
+# Constant-time comparison (used for AOT HMAC verification)
+subtle.workspace = true
+
+# Random number generation
+rand = { workspace = true, features = ["default", "std"] }
+aegix-random = { path = "../aegix-random" }
+
+# Date/time operations
+chrono = { workspace = true, features = ["serde"] }
+# IANA zone rules for `datetime::local-offset-seconds`: the one home the
+# scheduler and the module test kit ask too (2026-11-17; it brings `jiff` and
+# its compiled-in zone database below the runtime boundary, in place of
+# `chrono-tz`).
+aegix-zones = { path = "../aegix-zones" }
+
+# Phase 3: Advanced capabilities (v3.0)
+# `fuel` feature gates per-render instruction budget (set_fuel) so a
+# guest template's CPU is bounded host-side (see wit_templates::render).
+minijinja = { version = "2.5", features = ["fuel"] }  # Jinja2-compatible template engine
+csv = "1.3"  # CSV parsing and generation
+quick-xml = { version = "0.42", features = ["serialize"] }  # XML parsing with security
+redis = { workspace = true, features = ["default", "tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # Redis client; rustls for rediss:// (Upstash, ElastiCache TLS)
+aegix-redis = { path = "../aegix-redis" }
+# OpenTelemetry for production observability
+opentelemetry = { workspace = true, features = ["metrics", "trace"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "metrics", "trace"] }
+# The Prometheus exposition — the `prometheus` default registry and the OTel
+# reader that renders into it — is this crate's `prometheus` feature, OFF by
+# default (2026-11-02, docs/engineering-log/packages/2026-11-02-oci-and-prometheus-below-the-runtime-boundary.md):
+# an embedder links no registry it did not ask for (check 109), the OTel
+# instruments stay and record into the no-op global meter, and
+# `metrics::init_telemetry` refuses with `NoMetricsExporterInThisBuild`.
+opentelemetry-prometheus = { version = "0.33", optional = true }
+# `process`: see aegix-metrics/Cargo.toml — the worker registers the same
+# ProcessCollector into the default registry in `metrics::init_telemetry`.
+prometheus = { workspace = true, features = ["process"], optional = true } # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
+                    # vulnerable protobuf 2.x dependency (prometheus 0.14 uses protobuf 3.x, optional).
+                    # This clears RUSTSEC-2024-0437 (protobuf recursion crash) — the deny.toml exemption
+                    # is removed. worker's metrics_server.rs still enforces 4KB max request size, auth
+                    # tokens, and rate limiting as defence-in-depth.
+tracing-opentelemetry.workspace = true
+wasmtime-wasi-http.workspace = true
+# The OCI registry client behind `module_fetcher::fetch`'s `oci://` path is this
+# crate's `oci` feature, OFF by default (2026-11-02, the record above): an
+# embedder that runs modules from bytes links no registry client and its 23
+# crates (check 109 refuses `oci-client` / `oci-spec`); without it an `oci://`
+# dispatch is refused with `NoRegistryClientInThisBuild`, never fetched by
+# another route. The worker binary turns it on.
+oci-client = { workspace = true, features = ["rustls-tls"], optional = true }
+bytes.workspace = true
+# `host::wasi_http` (2026-09-25): the gated wasi:http send path converts the
+# upstream hyper request/response to and from the hardened reqwest client, and
+# (Wasmtime 48) bounds the response body's between-bytes idle time itself.
+# All already in Cargo.lock via wasmtime-wasi-http / reqwest — no new crate.
+http.workspace = true
+http-body = "1"
+http-body-util = "0.1"
+thiserror.workspace = true
+
+# `tests/metrics_shape.rs` pins the rendered Prometheus exposition, which exists
+# only with the `prometheus` feature; the workspace build (the worker binary
+# turns it on) builds and runs it, a build without the feature has no binary to
+# run — the same shape as `aegix-idempotency`'s `axum` test (2026-11-02).
+[[test]]
+name = "metrics_shape"
+required-features = ["prometheus"]
+
+[dev-dependencies]
+# `test-util` for `tokio::time::pause`/`advance`. The LLM failure-counter
+# tests drive the real `complete_impl` against a loopback mock provider, and
+# one of its exits is the 60 s `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` wrapper —
+# proving that path with a real clock would mean a 60 s unit test. The clock
+# is paused only AFTER the mock server confirms it has the full request, so
+# no connect timer is pending when time jumps and the exit under test is the
+# only one that can fire. Same dev-only pattern as
+# `aegix-integration-helpers`, which already enables this feature.
+tokio = { workspace = true, features = ["full", "test-util"] }
+# `testing` unlocks `InMemorySpanExporter`, so `job_span`'s redaction tests can
+# assert on the span status/attributes the sink ACTUALLY exported rather than on
+# a reconstruction of them. `tracing-subscriber` installs the otel bridge layer
+# for the duration of those tests.
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "metrics", "trace", "testing"] }
+tracing-subscriber = { workspace = true, features = ["default"] }
+
+[features]
+default = []
+# The OTLP span exporter in `aegix-trace` (`init_tracing` builds it when an
+# endpoint is configured). Off here and in `aegix-runtime`, so an embedder links
+# no gRPC stack (check 109); the worker binary turns it on through this
+# passthrough because it reaches `init_tracing` as `worker::tracing`, this
+# crate's re-export (docs/engineering-log/packages/2026-11-01-otlp-below-the-runtime-boundary.md).
+otlp = ["aegix-trace/otlp"]
+# The OCI registry client (`oci-client`, `oci-spec` and what they bring) for
+# `module_fetcher::fetch`'s `oci://` path. Off here and in `aegix-runtime`; the
+# worker binary turns it on (2026-11-02,
+# docs/engineering-log/packages/2026-11-02-oci-and-prometheus-below-the-runtime-boundary.md).
+oci = ["dep:oci-client"]
+# The Prometheus exposition: the `prometheus` default registry, the process
+# collector and the OTel→Prometheus reader `metrics::init_telemetry` installs.
+# Off here and in `aegix-runtime`; the worker binary turns it on (same record).
+prometheus = ["dep:prometheus", "dep:opentelemetry-prometheus"]
+
+[lints]
+workspace = true

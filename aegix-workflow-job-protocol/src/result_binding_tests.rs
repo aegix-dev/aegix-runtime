@@ -76,8 +76,8 @@ fn the_binding_is_signed_and_a_bound_result_still_verifies() {
     let key = [0x5Au8; 32];
     let mut r = result(2, Some(execution()));
     r.sign_with_worker_id(&key, "worker-a").unwrap();
-    let ring = aegix_workflow_engine_core::WorkerKeyRing::single(
-        aegix_workflow_engine_core::WorkerSharedKey::new(key.to_vec()),
+    let ring = aegix_dispatch_types::WorkerKeyRing::single(
+        aegix_dispatch_types::WorkerSharedKey::new(key.to_vec()),
     );
     r.verify_no_replay_dispatch(&ring, &[], 300, true)
         .expect("a bound result verifies");

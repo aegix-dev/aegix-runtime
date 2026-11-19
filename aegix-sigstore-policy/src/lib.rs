@@ -12,7 +12,7 @@
 //!
 //! The POLICY enum had the same history one level up (2026-09-13, package
 //! AR): `SigstorePolicy` / `from_env_str` / `raw_env_is_explicit` existed as
-//! two byte-identical copies — `aegix-worker-runtime::module_fetcher` and
+//! two byte-identical copies — `aegix-wasm-host::module_fetcher` and
 //! `aegix-registry::sync` — each carrying a comment promising to "mirror"
 //! the other. Identical today; nothing but a reader kept them so. Both now
 //! import [`SigstorePolicy`] from here, and the source pins in this crate's
@@ -740,7 +740,7 @@ mod tests {
         }
         for v in ["", "typo", "enabled", "yes", "on"] {
             // `yes` / `on` are deliberately NOT sigstore spellings: this is a
-            // three-valued policy, not `aegix_config::bool_env`'s vocabulary.
+            // three-valued policy, not `aegix_deploy_posture::bool_env`'s vocabulary.
             assert!(!SigstorePolicy::raw_env_is_explicit(v));
             if v.is_empty() {
                 assert_eq!(
@@ -778,8 +778,8 @@ mod tests {
     #[test]
     fn neither_consumer_carries_a_private_policy_enum() {
         carries_no_private_policy_enum(
-            "aegix-worker-runtime",
-            include_str!("../../aegix-worker-runtime/src/module_fetcher.rs"),
+            "aegix-wasm-host",
+            include_str!("../../aegix-wasm-host/src/module_fetcher.rs"),
         );
     }
 

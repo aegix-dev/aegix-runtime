@@ -1,7 +1,7 @@
 //! `JobProgress` signing and verification (RFC 0014 P2).
 
 use super::*;
-use aegix_workflow_engine_core::{WorkerKeyRing, WorkerSharedKey};
+use aegix_dispatch_types::{WorkerKeyRing, WorkerSharedKey};
 
 fn ring() -> WorkerKeyRing {
     WorkerKeyRing::single(WorkerSharedKey::new(vec![0x5Au8; 32]))

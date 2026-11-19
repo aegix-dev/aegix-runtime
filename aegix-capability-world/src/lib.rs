@@ -219,7 +219,8 @@ impl CapabilityWorld {
     ///
     /// - Any world is a subset of itself.
     /// - `Minimal` ⊆ everything.
-    /// - `Network` ⊆ `Secrets | Filesystem | Messaging | Cache | Database | Trusted`.
+    /// - `Http` ⊆ `Network | Secrets | Filesystem | Messaging | Cache | Database | Agent | Trusted`.
+    /// - `Network` ⊆ `Trusted` only: it alone below `Trusted` holds raw sockets.
     /// - `Secrets` ⊆ `Database | Agent | Trusted`.
     /// - `Governance` ⊆ `Agent | Trusted`.
     /// - `Filesystem | Messaging | Cache` ⊆ `Trusted` only.
@@ -249,16 +250,13 @@ impl CapabilityWorld {
                 | Self::Trusted,
             ) => true,
             (Self::Http, _) => false,
-            (
-                Self::Network,
-                Self::Secrets
-                | Self::Filesystem
-                | Self::Messaging
-                | Self::Cache
-                | Self::Database
-                | Self::Agent
-                | Self::Trusted,
-            ) => true,
+            // `Network` is `Http` plus raw sockets, and the worker gives
+            // sockets to `Network` and `Trusted` only (`socket_grant`). No
+            // other world holds what `Network` holds, so it is under
+            // `Trusted` alone (2026-11-18; until then a secrets, database or
+            // agent ceiling admitted a module that could open sockets no
+            // module at the ceiling's own world can).
+            (Self::Network, Self::Trusted) => true,
             (Self::Network, _) => false,
             // Secrets can escalate to Database, Agent, or Trusted.
             (Self::Secrets, Self::Database | Self::Agent | Self::Trusted) => true,
@@ -1156,10 +1154,10 @@ mod ceiling_tests {
             }
             assert!(ceiling_permits(w, w), "{w} must permit itself");
         }
-        // Minimal/Http/Network are subsets of higher worlds.
+        // Minimal/Http are subsets of higher worlds.
         assert!(ceiling_permits("secrets-node", "minimal-node"));
         assert!(ceiling_permits("secrets-node", "http-node"));
-        assert!(ceiling_permits("secrets-node", "network-node"));
+        assert!(ceiling_permits("network-node", "http-node"));
         // Secrets escalates to Database/Agent/Trusted.
         assert!(ceiling_permits("database-node", "secrets-node"));
         assert!(ceiling_permits("agent-node", "secrets-node"));
@@ -1172,6 +1170,21 @@ mod ceiling_tests {
             assert!(
                 ceiling_permits("automation-node", w),
                 "automation-node must permit every compilable world ({w})"
+            );
+        }
+    }
+
+    /// `network-node` is the one world below `automation-node` whose modules
+    /// can be given raw sockets. Only a ceiling that itself holds sockets
+    /// admits it.
+    #[test]
+    fn only_a_socket_ceiling_admits_a_network_node_module() {
+        for ceiling in ACTOR_CEILING_WORLDS {
+            let holds_sockets = matches!(*ceiling, "network-node" | "automation-node");
+            assert_eq!(
+                ceiling_permits(ceiling, "network-node"),
+                holds_sockets,
+                "{ceiling} ceiling over a network-node module"
             );
         }
     }

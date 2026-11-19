@@ -11,7 +11,7 @@
 //!   (`nats_permissions::worker_inbox_prefix_for`). The broker's auth callout
 //!   (served by the controller, `aegix-nats-callout`) mints it a credential
 //!   whose only inbox scope is that prefix.
-//! * `AEGIX_WORKER_IDENTITY=ephemeral` (`aegix_worker_runtime::worker_identity`):
+//! * `AEGIX_WORKER_IDENTITY=ephemeral` (`aegix_wasm_host::worker_identity`):
 //!   the key is minted here, in memory, at boot, and never written anywhere;
 //!   the connect carries `AEGIX_WORKER_REGISTRATION_TOKEN` so the callout can
 //!   register it. It requires `identity`.
@@ -25,7 +25,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 
-use aegix_worker_runtime::worker_identity::IdentityMode;
+use aegix_wasm_host::worker_identity::IdentityMode;
 use aegix_workflow_job_protocol::nats_permissions::worker_inbox_prefix_for;
 use aegix_workflow_job_protocol::DispatchSigningKey;
 

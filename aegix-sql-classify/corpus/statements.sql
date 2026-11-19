@@ -3,7 +3,7 @@
 #
 # This is the corpus the four SQL gates are pinned against:
 #   classify.snapshot         aegix_sql_classify::classify
-#   worker.snapshot           aegix_worker_runtime::sql_validator::validate_sql_with_policy
+#   worker.snapshot           aegix_wasm_host::sql_validator::validate_sql_with_policy
 #   controller.snapshot       the controller's admission functions (aegix-rpc-subscribers)
 #   query_paginated.snapshot  aegix_admin_query_gate (the platform-admin query_paginated tool)
 # A sqlparser bump that changes any verdict changes a snapshot line, and the

@@ -131,6 +131,42 @@ job: a data call must name a job the controller is running.
   dispatch jobs and write any actor's memory, with no ceiling. It is guarded
   by the permissions of its directory and nothing else.
 
+## Compiling a module's source
+
+The threat model is about a module that is **run**. Compiling one is a
+different act, and nothing here makes it safe to compile source you did not
+write.
+
+* **The compile runs on your machine, as you.** `compile_module`, the
+  example in [embedding.md](embedding.md), runs `cargo component build` in a
+  scratch project with your user's rights. A source file can read the build
+  machine into the module it becomes: `include_bytes!("/path/to/a/file")`
+  embeds a file, and `env!("NAME")` embeds a variable of the environment the
+  compile ran in. The module can then return what it embedded.
+* **The source lint does not stop that.** Before a compile, the source is
+  read for `unsafe`, `extern "…"`, `std::process::`, `env!`, `include_str!`,
+  `include_bytes!`, `include!` and `#[path = …]`, and a finding refuses the
+  compile (`aegix-module-source/src/lint.rs`, `errors`). It reads the text
+  line by line. A space before the `!`, a quote earlier on the line or an
+  attribute split over two lines gets past it, and each finding has an
+  opt-out comment the source's own author writes. It tells an honest author
+  early what will not work. It is not a control.
+* **The crates a source asks for are code too.** A dependency's build script
+  and its procedural macros run during the compile. The list of crates a
+  source may ask for (`aegix-compilation/src/dependency_allowlist.rs`) says
+  which crates, not what they do.
+* **What contains a compile is a container.** `aegix-compilation` can run
+  the build in one with no network, a read-only root and an empty
+  environment (`AEGIX_COMPILATION_CONTAINER=true`, image named by
+  `AEGIX_BUILDER_IMAGE`). This tree carries that code and no image for it:
+  you build the image, with the toolchain and the crates a build may use
+  already in it. Off the host, a source that reads a file reads the image's.
+
+So: compile source from an author you trust, or in a container or a machine
+that holds nothing you would mind a module carrying away. A module you were
+given as a compiled component needs none of this; running it is the case the
+threat model covers.
+
 ## Availability
 
 Not defended. The records that stop replays are of fixed size and refuse new
@@ -222,9 +258,8 @@ other route exists, and it runs a development profile.
 
 It is made from a private repository by a script. Remarks in the source
 sometimes name files, checks and records of that repository that are not
-here, and two crates carry instructions written for its maintainers
-(`aegix-workflow-job-protocol/AGENTS.md` and
-`aegix-workflow-engine-core/AGENTS.md`). The project is published as
+here, and one crate carries instructions written for its maintainers
+(`aegix-workflow-job-protocol/AGENTS.md`). The project is published as
 Aegix Runtime, its crates are named `aegix-*`, its environment variables
 begin `AEGIX_`, its metric names `aegix_`, and the interface a module is
 compiled against is the package `aegix:core`. It was developed as Talos, a

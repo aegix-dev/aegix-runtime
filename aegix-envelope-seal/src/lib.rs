@@ -44,7 +44,9 @@ use aegix_workflow_job_protocol::{
 };
 
 pub mod responder;
-pub use responder::{run_claim_responder, ClaimRecord, ClaimRecorder};
+pub use responder::{
+    claim_drops_uncounted, run_claim_responder, ClaimDropCounter, ClaimRecord, ClaimRecorder,
+};
 
 // The worker-verifying-key registry (`set_dynamic_worker_public_keys`) is a
 // process-global that REPLACES its contents, so every test that mutates it must
@@ -68,19 +70,21 @@ pub enum EnvelopeSealingMode {
 }
 
 impl EnvelopeSealingMode {
-    /// Resolve from `AEGIX_ENVELOPE_SEALING` ∈ {off, audit, required}. Unknown or
-    /// unset → `Off` (fail-safe to today's behaviour).
+    /// Resolve from `AEGIX_ENVELOPE_SEALING` ∈ {off, audit, required}; unset
+    /// is `Off`. An unrecognised value is `Err`: a controller calls this at
+    /// boot and refuses to start (2026-11-18; until then it was read as
+    /// `Off`). The one parser is `aegix_deploy_posture::envelope_sealing`,
+    /// which the worker reads too.
+    pub fn try_from_env() -> Result<Self, String> {
+        aegix_deploy_posture::envelope_sealing::from_env().map(Self::from)
+    }
+
+    /// The mode for a reader after boot. Boot has refused an unrecognised
+    /// value ([`Self::try_from_env`]); should one be read all the same it is
+    /// read as `Required`, the strictest, never as `Off`.
     #[must_use]
     pub fn from_env() -> Self {
-        match std::env::var("AEGIX_ENVELOPE_SEALING")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("audit") => Self::Audit,
-            Some("required") => Self::Required,
-            _ => Self::Off,
-        }
+        aegix_deploy_posture::envelope_sealing::from_env_or_strictest().into()
     }
 
     /// Whether the controller should seal claim-based for a dispatch. `true` for
@@ -94,6 +98,17 @@ impl EnvelopeSealingMode {
     #[must_use]
     pub fn refuses_inline(self) -> bool {
         matches!(self, Self::Required)
+    }
+}
+
+impl From<aegix_deploy_posture::envelope_sealing::SealingMode> for EnvelopeSealingMode {
+    fn from(mode: aegix_deploy_posture::envelope_sealing::SealingMode) -> Self {
+        use aegix_deploy_posture::envelope_sealing::SealingMode;
+        match mode {
+            SealingMode::Off => Self::Off,
+            SealingMode::Audit => Self::Audit,
+            SealingMode::Required => Self::Required,
+        }
     }
 }
 
@@ -713,10 +728,7 @@ mod tests {
             ("Required", EnvelopeSealingMode::Required),
             // Whitespace-trimmed.
             ("  required  ", EnvelopeSealingMode::Required),
-            // Unknown values fail SAFE to Off — a typo'd value must not
-            // silently flip the fleet into refuse-inline enforcement.
-            ("enforce", EnvelopeSealingMode::Off),
-            ("1", EnvelopeSealingMode::Off),
+            // Empty is unset.
             ("", EnvelopeSealingMode::Off),
         ];
         for (raw, expected) in cases {
@@ -725,6 +737,24 @@ mod tests {
                 EnvelopeSealingMode::from_env(),
                 expected,
                 "AEGIX_ENVELOPE_SEALING={raw:?}"
+            );
+            assert_eq!(EnvelopeSealingMode::try_from_env(), Ok(expected));
+        }
+
+        // An unrecognised value is refused at boot (`try_from_env`), and a
+        // reader after boot takes it for the strictest mode. Until
+        // 2026-11-18 both `enforce` and `1` were read as `Off` here, on the
+        // reasoning that a typo must not turn enforcement ON; the typo that
+        // matters is the one that leaves it off, with every job's secrets
+        // under the fleet key and nothing said.
+        for raw in ["enforce", "1", "requried", "true"] {
+            std::env::set_var("AEGIX_ENVELOPE_SEALING", raw);
+            let err = EnvelopeSealingMode::try_from_env().expect_err(raw);
+            assert!(err.contains(raw), "{err}");
+            assert_eq!(
+                EnvelopeSealingMode::from_env(),
+                EnvelopeSealingMode::Required,
+                "AEGIX_ENVELOPE_SEALING={raw:?} is never read as Off"
             );
         }
 

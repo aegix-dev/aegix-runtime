@@ -1023,7 +1023,7 @@ fn a_changed_base64_character_fails_verification() {
 /// `max_payload`; as base64 the whole message is under it.
 #[test]
 fn a_four_mib_module_fits_the_reference_max_payload_as_base64() {
-    use aegix_workflow_engine_core::inline_wasm::{WasmBytesEncoding, REFERENCE_NATS_MAX_PAYLOAD};
+    use aegix_dispatch_types::inline_wasm::{WasmBytesEncoding, REFERENCE_NATS_MAX_PAYLOAD};
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
     let bytes: Vec<u8> = (0..4 * 1024 * 1024)
         .map(|_| {

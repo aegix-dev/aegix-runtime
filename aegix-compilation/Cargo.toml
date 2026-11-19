@@ -16,17 +16,14 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 aegix-capability-world = { path = "../aegix-capability-world" }
-aegix-config = { path = "../aegix-config" }
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
 aegix-engine-events = { path = "../aegix-engine-events" }
-# The advisory-database age sampler publishes through the controller's registry
-# (a leaf: prometheus + aegix-workflow-liveness, no cycle back to here).
-aegix-metrics = { path = "../aegix-metrics" }
 # The static source lint both compile paths run; one home, shared with the
 # catalog gate and the authoring lane.
 aegix-module-source = { path = "../aegix-module-source" }
 aegix-text-util = { path = "../aegix-text-util" }
 aegix-wit-inspector = { path = "../aegix-wit-inspector" }
-aegix-workflow-engine-core = { path = "../aegix-workflow-engine-core" }
+aegix-dispatch-types = { path = "../aegix-dispatch-types" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "process", "time", "io-util", "fs"] }
 tracing.workspace = true
 uuid.workspace = true

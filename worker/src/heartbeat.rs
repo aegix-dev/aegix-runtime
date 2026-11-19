@@ -279,7 +279,7 @@ mod tests {
     }
 
     /// Guest WASM code must not be able to publish here. The enforcement lives
-    /// in `aegix_worker_runtime::host::limits::reject_reserved_topic_prefix`
+    /// in `aegix_wasm_host::host::limits::reject_reserved_topic_prefix`
     /// and is pinned there (`rejects_talos_internal_subjects` already names
     /// `talos.workers.heartbeat.worker-1` explicitly); that predicate is
     /// crate-private, so what THIS test can add is the other half of the

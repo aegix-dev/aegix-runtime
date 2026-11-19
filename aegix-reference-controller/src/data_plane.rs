@@ -27,7 +27,7 @@
 use crate::counters::{Decision, Refusals};
 use crate::ledger::Ledger;
 use crate::memory::{self, MemoryStore};
-use aegix_config::dispatch_binding::Requirement;
+use aegix_deploy_posture::dispatch_binding::Requirement;
 use aegix_rpc_gates::admission::{self, AdmitError, OneController};
 use aegix_rpc_gates::dispatch_binding::{self, BindingDecision};
 use aegix_rpc_protocol::memory_rpc::{MemoryRpcError, MemoryRpcReply, SUBJECT_MEMORY_OP};
@@ -246,9 +246,9 @@ mod tests {
     use crate::keys::testing::fleet_keys;
     use crate::ledger::testing::{actor, outcome};
     use crate::ledger::{ActorStatus, JobState};
+    use aegix_dispatch_types::WriteCeiling;
     use aegix_rpc_protocol::dispatch_binding::DispatchBinding;
     use aegix_rpc_protocol::memory_rpc::{MemoryOp, MemoryOpResult, MemoryRpcRequest};
-    use aegix_workflow_engine_core::WriteCeiling;
     use uuid::Uuid;
 
     struct Fixture {

@@ -22,8 +22,8 @@
 
 use crate::keys::Keys;
 use crate::ledger::{Actor, ActorStatus, JobState, Outcome};
+use aegix_dispatch_types::SecretMap;
 use aegix_envelope_seal::SealContext;
-use aegix_workflow_engine_core::SecretMap;
 use aegix_workflow_job_protocol::{
     sealed_result_refused, vault_path_permitted, EncryptedSecrets, JobRequest, JobResult,
     JobStatus, RecordedClaimant, ResultAnswer, SEALING_CLAIM_ECIES,
@@ -493,7 +493,7 @@ mod tests {
     use super::*;
     use crate::keys::testing::{fleet_keys, identity_keys, FLEET_KEY};
     use crate::ledger::testing::actor;
-    use aegix_workflow_engine_core::{EgressScope, LlmTier, WriteCeiling};
+    use aegix_dispatch_types::{EgressScope, LlmTier, WriteCeiling};
     use aegix_workflow_job_protocol::DispatchSigningKey;
     use zeroize::Zeroizing;
 

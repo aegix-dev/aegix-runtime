@@ -4,6 +4,47 @@ One section per release, the newest first. A release is the tag `v<version>`;
 `make release-check` holds the workspace version, `compose.yaml` and the first
 section here to one another.
 
+## 0.2.0
+
+The tree carries less of the platform, and three checks refuse what they
+used to let through. Crates were removed and one was renamed, so an embedder
+changes its manifest.
+
+- **Security: wasmtime 49.0.6**, for RUSTSEC-2026-0566 to -0573. Two can be
+  driven by a module: empty writes to a WASI stream, and to a `wasi:http`
+  body over HTTP/2, grew host memory without bound. The others are host
+  panics and aborts; four of them need a build or a setting this worker does
+  not have (it is built with the `gc` and `threads` features, and runs with
+  the GC proposal off). Compiled modules the worker cached are compiled
+  again on first use. Upgrade a worker that runs modules you did not write.
+- **Removed from the tree: `aegix-metrics`, `aegix-workflow-engine-core`,
+  `aegix-config` and `aegix-workflow-liveness`.** They are the platform's.
+  What a runtime and its controller share is in two new leaf crates:
+  `aegix-dispatch-types` (the dispatch key, the secret map, the tiers, the
+  write ceiling, fuel) and `aegix-deploy-posture` (the security profile, the
+  boot refusals, the environment readers). An embedder that named a removed
+  crate names one of these.
+- **Renamed: `aegix-worker-runtime` is `aegix-wasm-host`.**
+  `aegix_runtime::wasm_host` is the facade's path to it;
+  `aegix_runtime::worker_runtime` stays as a deprecated alias until 1.0. A
+  log line's target begins `aegix_wasm_host::`, so a `RUST_LOG` directive
+  written for the old prefix matches nothing.
+- **Changed: a module run is asked for with one `JobRun` value**, in place
+  of 27 positional arguments. It has no `Default`: every input that grants
+  or limits a module is stated by the caller.
+- **Changed: a module binary the inspector cannot read to its end is
+  refused.** It used to be read as importing less than it does.
+  `ComponentInspection` has a new field, `unreadable`, and the inspector
+  parses with the `wasmparser` release wasmtime itself reads with.
+- **Changed: `network-node` is under `automation-node` only** in the
+  capability lattice. Raw sockets are a grant no other world carries, so a
+  ceiling of another world no longer admits a `network-node` module.
+- **Changed: an unrecognised `AEGIX_ENVELOPE_SEALING` refuses boot** in both
+  binaries. It used to be read as `off`.
+- **Removed: the worker's three demonstration binaries.**
+- **Documented: compiling a module's source is outside what this tree
+  guarantees** (`docs/limits.md`, "Compiling a module's source").
+
 ## 0.1.1
 
 Answers the first outside review of 0.1.0.

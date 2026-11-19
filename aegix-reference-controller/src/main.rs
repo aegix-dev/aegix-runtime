@@ -307,7 +307,7 @@ async fn main() {
         print!("{USAGE}");
         std::process::exit(if argv.is_empty() { 2 } else { 0 });
     }
-    if let Err(why) = aegix_config::legacy_env::refuse_legacy_names() {
+    if let Err(why) = aegix_deploy_posture::legacy_env::refuse_legacy_names() {
         eprintln!("aegix-reference-controller: {why}");
         std::process::exit(1);
     }

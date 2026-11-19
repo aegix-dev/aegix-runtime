@@ -11,7 +11,7 @@ license.workspace = true
 
 # The deployable worker BINARY. The library half (wasmtime WASM host:
 # AegixRuntime, AegixContext, host/ modules, module_fetcher, sql_validator,
-# wit_inspector, …) lives in `aegix-worker-runtime`; `src/lib.rs` here is a
+# wit_inspector, …) lives in `aegix-wasm-host`; `src/lib.rs` here is a
 # thin re-export shim so `worker::…` paths keep resolving. Only bin-side
 # modules remain: main.rs, metrics_server, secret_claim, self_register.
 
@@ -24,7 +24,7 @@ aegix-auth-types = { path = "../aegix-auth-types" }
 # `prometheus`: it serves `/metrics` (`metrics_server.rs`) from the registry
 # `metrics::init_telemetry` installs. Both are off in the runtime library and
 # in `aegix-runtime` (2026-11-02, check 109).
-aegix-worker-runtime = { path = "../aegix-worker-runtime", features = ["otlp", "oci", "prometheus"] }
+aegix-wasm-host = { path = "../aegix-wasm-host", features = ["otlp", "oci", "prometheus"] }
 # The build identity self-registration reports, composed as the controller composes its own.
 aegix-build-info = { path = "../aegix-build-info" }
 
@@ -45,10 +45,10 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["default", "env-filter", "fmt"] }
 uuid = { workspace = true, features = ["serde", "v4"] }
 aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
-aegix-workflow-engine-core = { path = "../aegix-workflow-engine-core" }
+aegix-dispatch-types = { path = "../aegix-dispatch-types" }
 aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
 aegix-shutdown = { path = "../aegix-shutdown" }
-aegix-config = { path = "../aegix-config" }
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
 
 # HTTP client (self_register boot-time identity registration)
 reqwest = { workspace = true, features = ["json", "gzip", "brotli", "deflate", "stream", "rustls"] }
@@ -81,13 +81,12 @@ rustls = { workspace = true, features = ["ring"] }
 # Observability (OTLP trace-context propagation + Prometheus metrics endpoint)
 opentelemetry = { workspace = true, features = ["metrics", "trace"] }
 prometheus.workspace = true
-tracing-opentelemetry.workspace = true
 
 bytes.workspace = true
 
 [dev-dependencies]
 # Integration tests (tests/) compile guest fixtures and poke the runtime
-# directly; the runtime itself comes through aegix-worker-runtime.
+# directly; the runtime itself comes through aegix-wasm-host.
 # wasmtime's defaults without `cache` (see the root manifest), plus
 # memory-protection-keys.
 wasmtime = { workspace = true, features = [

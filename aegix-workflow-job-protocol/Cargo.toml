@@ -17,7 +17,7 @@ repository = "https://github.com/aegix-dev/aegix-runtime"
 homepage = "https://github.com/aegix-dev/aegix-runtime"
 
 [dependencies]
-aegix-workflow-engine-core = { path = "../aegix-workflow-engine-core", version = "0.3", default-features = false }
+aegix-dispatch-types = { path = "../aegix-dispatch-types", version = "0.2.0" }
 # RFC 0010 P2 inc.4: lock-free swap of the worker-verifying-key snapshot so the
 # controller can merge the DB-backed dynamic registry over the env base without
 # blocking the verify hot path.
@@ -36,7 +36,7 @@ uuid = { workspace = true, features = ["serde", "v4"] }
 
 # Encryption and signing (for secure secret transport and job authentication)
 aes-gcm.workspace = true
-aegix-random = { path = "../aegix-random", version = "0.1.0" }
+aegix-random = { path = "../aegix-random", version = "0.2.0" }
 hex.workspace = true
 hmac.workspace = true
 sha2.workspace = true

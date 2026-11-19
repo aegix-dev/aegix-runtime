@@ -94,10 +94,10 @@ COPY scripts/demo/refusal-judge.sh scripts/demo/hostile-module.rs scripts/demo/
 COPY deploy/nats/nats-shared-worker.conf deploy/nats/worker-permissions.conf deploy/nats/
 COPY aegix-reference-controller/src/serve.rs aegix-reference-controller/src/
 COPY aegix-rpc-gates/src/dispatch_binding.rs aegix-rpc-gates/src/
-COPY worker/src/main.rs worker/src/
-COPY aegix-worker-runtime/src/context.rs aegix-worker-runtime/src/
-COPY aegix-worker-runtime/src/host/vault.rs aegix-worker-runtime/src/host/egress_admission.rs \
-     aegix-worker-runtime/src/host/egress.rs aegix-worker-runtime/src/host/
+COPY worker/src/job_execution.rs worker/src/
+COPY aegix-wasm-host/src/context.rs aegix-wasm-host/src/
+COPY aegix-wasm-host/src/host/vault.rs aegix-wasm-host/src/host/egress_admission.rs \
+     aegix-wasm-host/src/host/egress.rs aegix-wasm-host/src/host/
 
 RUN groupadd -r talos && useradd -r -g talos -u 1000 -d /home/talos talos \
  && mkdir -p /home/talos && chown talos:talos /home/talos

@@ -13,7 +13,7 @@ description = "The signed worker → controller data-plane RPC protocols (rpc_au
 # anywhere in aegix-runtime's closure, which this crate is in; a new
 # dependency here is a boundary change.
 [dependencies]
-aegix-config = { path = "../aegix-config" }
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
 aegix-random = { path = "../aegix-random" }
 # The SINGLE per-worker identity-key surface — Ed25519 key parsing and the
 # AEGIX_WORKER_SIGNING_KEY / AEGIX_WORKER_PUBLIC_KEYS registry — so RPC signing
@@ -22,7 +22,6 @@ aegix-random = { path = "../aegix-random" }
 # this crate.
 aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
 arc-swap.workspace = true
-chrono = { workspace = true, features = ["serde"] }
 dashmap.workspace = true
 # Same major as aegix-workflow-job-protocol so the re-exported key types unify.
 ed25519-dalek.workspace = true

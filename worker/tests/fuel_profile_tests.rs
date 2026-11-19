@@ -1,6 +1,6 @@
 //! A rehearsal can ask where a run's fuel went (2026-10-03).
 //!
-//! The profile's arithmetic is unit-tested in `aegix-worker-runtime`. This
+//! The profile's arithmetic is unit-tested in `aegix-wasm-host`. This
 //! drives the part a unit test cannot: a real component, the real linker, the
 //! wasmtime call hook reading the store's fuel at each guest↔host transition,
 //! and a host function naming itself. A hook that is never installed, or a
@@ -74,35 +74,32 @@ async fn run(policy: SecurityPolicy) -> (String, u64) {
     let rt = AegixRuntime::new().expect("runtime");
     let fuel = worker::context::FuelAcc::default();
     let out = rt
-        .execute_job_with_full_features(
-            &build_minimal_component(BURN_CORE_WAT),
-            vec![],
-            vec![],
-            128,
-            json!({}),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            None,
-            Duration::from_secs(30),
-            RetryPolicy::none(),
-            None,
-            policy,
-            None,                                             // capability_world_hint
-            None,                                             // max_fuel_override
-            false,                                            // dry_run
-            None,                                             // actor_id
-            Uuid::nil(),                                      // user_id
-            LlmTier::Tier2,                                   // max_llm_tier
-            aegix_workflow_job_protocol::WriteCeiling::Write, // max_write_ceiling
-            None,                                             // http_verb_ceiling
-            None,                                             // egress_scope
-            None,                                             // llm_usage_out
-            None,                                             // host_diag_out
-            0,                                                // dispatch_attempt
-            None,                                             // inference_wait
-            Some(fuel.clone()),                               // fuel_out
-        )
+        .execute_job_with_full_features(aegix_wasm_host::runtime::JobRun {
+            wasm_bytes: &build_minimal_component(BURN_CORE_WAT),
+            input: json!({}),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            secrets: std::collections::HashMap::new(),
+            max_memory_mb: 128,
+            max_fuel_override: None,
+            timeout: Duration::from_secs(30),
+            execution_context: None,
+            retry_policy: RetryPolicy::none(),
+            security_policy: policy,
+            capability_world_hint: None,
+            dry_run: false,
+            actor_id: None,
+            user_id: Uuid::nil(),
+            max_llm_tier: LlmTier::Tier2,
+            max_write_ceiling: aegix_workflow_job_protocol::WriteCeiling::Write,
+            http_verb_ceiling: None,
+            egress_scope: None,
+            dispatch_attempt: 0,
+            options: aegix_wasm_host::runtime::JobRunOptions {
+                fuel_out: Some(fuel.clone()),
+                ..Default::default()
+            },
+        })
         .await
         .unwrap_or_else(|e| panic!("guest failed: {e:#}"));
     let consumed = fuel

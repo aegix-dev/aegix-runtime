@@ -626,7 +626,7 @@ mod write_ceiling_wire_compat_tests {
     //! So an old worker sees the correct guest-visible answer, with a
     //! misleading log line, and never a panic and never a success. The
     //! worker-side half of that chain is pinned in
-    //! `aegix_worker_runtime::host::memory`'s own tests; this half pins the
+    //! `aegix_wasm_host::host::memory`'s own tests; this half pins the
     //! wire bytes and the decode outcome.
     use super::*;
 

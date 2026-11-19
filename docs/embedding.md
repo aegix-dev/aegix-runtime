@@ -10,7 +10,7 @@ the versions its tests ran on:
 
 ```toml
 [dependencies]
-aegix-runtime = { git = "https://github.com/aegix-dev/aegix-runtime", tag = "v0.1.1" }
+aegix-runtime = { git = "https://github.com/aegix-dev/aegix-runtime", tag = "v0.2.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
 ```
@@ -31,9 +31,14 @@ comes with a Rust install.
 rustup target add wasm32-wasip2
 cargo install cargo-component@0.21.1 --locked
 cargo run -p aegix-compilation --example compile_module -- \
-    module-templates/echo-debug/template.rs minimal-node echo_debug.wasm
+    module-templates/echo-debug echo_debug.wasm
 cargo run -p aegix-runtime --example embed_worker -- echo_debug.wasm '{"message":"hello"}'
 ```
+
+The first command compiles on your machine, as you. Compile only source you
+trust that way: a source file can embed the build machine's files and
+environment in the module, and the check that reads the source first does
+not prevent it ([limits.md](limits.md), "Compiling a module's source").
 
 The second command prints the module's output, with the fuel it spent
 beside its own fields. The program is
@@ -65,12 +70,13 @@ test, with a component built from text, so it needs no toolchain.
 
 ## 2. Run a job with grants
 
-`aegix-worker-runtime/src/runtime.rs`, `execute_job_with_full_features`,
-is what a worker calls for each job. It takes the module's grants (hosts,
+`aegix-wasm-host/src/runtime.rs`, `execute_job_with_full_features`,
+is what a worker calls for each job. It takes one `JobRun`, every field of
+which the caller states: the module's grants (hosts,
 verbs, secrets), its fuel, memory and time limits, the actor's ceilings and
 the secrets the controller sealed for the job. Your program is then a
 worker: it decides nothing about what a module may do, and must be handed
-all of it by something it can verify. `worker/src/main.rs`, `execute_job`,
+all of it by something it can verify. `worker/src/job_execution.rs`, `execute_job`,
 is that sequence: verify the job, claim its secrets, run, sign the result.
 [aegix-runtime/README.md](../aegix-runtime/README.md), "How to talk to a
 controller", lists the types for each step.

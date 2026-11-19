@@ -10,7 +10,7 @@ publish.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "blocking"] }
 serde_json.workspace = true
-aegix-config = { path = "../aegix-config" }
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
 tracing.workspace = true
 

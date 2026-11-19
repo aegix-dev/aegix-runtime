@@ -170,14 +170,15 @@ fn nonempty_env_or(name: &str, default: &str) -> String {
 /// A dev box with no container runtime then fail-closes through
 /// the sandbox rule and refuses to compile any module at all. Empty
 /// now means unset, matching this file's own `nonempty_env_or` (whose doc
-/// comment cites the same class) and `aegix_config::bool_env_or_default`,
+/// comment cites the same class) and `aegix_deploy_posture::bool_env_or_default`,
 /// which likewise returns its default on empty.
 fn container_enabled() -> bool {
-    aegix_config::bool_env("AEGIX_COMPILATION_CONTAINER").unwrap_or_else(compile_sandbox_required)
+    aegix_deploy_posture::bool_env("AEGIX_COMPILATION_CONTAINER")
+        .unwrap_or_else(compile_sandbox_required)
 }
 
 /// Whether every compile must run in the sandbox container: the security
-/// profile enforces (`aegix_config::security_profile::profile().enforces()`,
+/// profile enforces (`aegix_deploy_posture::security_profile::profile().enforces()`,
 /// 2026-10-29 — `hardened` and `transitional`, which is every deployment that
 /// faces users: `RUST_ENV=production` AND `staging`, as
 /// `docker-compose.prod.yml` runs; until then this read
@@ -190,7 +191,7 @@ fn container_enabled() -> bool {
 /// `RUST_ENV=staging` ran it with no token.
 #[must_use]
 pub fn compile_sandbox_required() -> bool {
-    aegix_config::security_profile::profile().enforces()
+    aegix_deploy_posture::security_profile::profile().enforces()
 }
 
 /// The retired escape (G-9): it no longer runs a compile on the host.

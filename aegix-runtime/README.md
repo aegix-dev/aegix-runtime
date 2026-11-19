@@ -15,7 +15,7 @@ dependency closure.
 
 ```text
 aegix-runtime            ← you depend on this, at RUNTIME_API_VERSION
-├── aegix-worker-runtime      the wasmtime host: AegixRuntime, AegixContext, host functions
+├── aegix-wasm-host      the wasmtime host: AegixRuntime, AegixContext, host functions
 ├── aegix-workflow-job-protocol  JobRequest / JobResult, signing, the secrets envelope
 ├── aegix-rpc-protocol        the signed-RPC client side (rpc_auth) and the per-subject protocols
 ├── aegix-capability-world    the capability lattice
@@ -66,7 +66,7 @@ aegix-runtime            ← you depend on this, at RUNTIME_API_VERSION
   `otlp` feature, off by default; the runtime keeps the span types, the
   `tracing`→OTel bridge layer and the redaction sink, and exports nothing);
   and, since 2026-11-02, `oci-client` / `oci-spec` (the `oci://` registry
-  pull of `module_fetcher` is `aegix-worker-runtime`'s `oci` feature, off by
+  pull of `module_fetcher` is `aegix-wasm-host`'s `oci` feature, off by
   default: an embedder runs modules from bytes) and `prometheus` /
   `opentelemetry-prometheus` (the Prometheus default registry and the
   OTel→Prometheus reader are its `prometheus` feature, off by default; the
@@ -97,7 +97,7 @@ repository's README, as an embedder meets them.
 
 1. **Credential-free worker.** A module receives an opaque handle to a secret,
    never the string; the worker holds no master key and decrypts a per-job
-   envelope only. `worker_runtime::host_impl::check_secret_allowlist` enforces
+   envelope only. `wasm_host::host_impl::check_secret_allowlist` enforces
    both the module's `allowed_secrets` grant and the host-reserved deny-list;
    `job_protocol::EncryptedSecrets` is the AES-256-GCM envelope; a resolved
    map is a `SecretMap` of zeroizing values from the moment it opens.
@@ -116,7 +116,7 @@ repository's README, as an embedder meets them.
    given world.
 4. **Per-actor LLM tier ceiling.** `LlmTier::Tier1` means local inference
    only. The tier travels HMAC-bound in the job and is enforced at five host
-   surfaces in `worker_runtime::host_impl` (key resolution, `vault://` header
+   surfaces in `wasm_host::host_impl` (key resolution, `vault://` header
    substitution, HTTP, GraphQL, webhook and stream egress to
    `job_protocol::EXTERNAL_LLM_HOSTS`); `EgressScope` is the separate axis
    that lets a tier-1 module reach a declared public API without an external
@@ -124,7 +124,7 @@ repository's README, as an embedder meets them.
 5. **Sigstore-verified module supply chain.** A module pulled from a registry
    is digest-checked and, under `SigstorePolicy::Required`, `cosign`-verified
    against a pinned certificate identity and OIDC issuer before it is
-   instantiated or cached (`worker_runtime::module_fetcher`, with this
+   instantiated or cached (`wasm_host::module_fetcher`, with this
    crate's `oci` feature on); a cached result is sealed under a key the cache
    key is bound to.
 
@@ -164,15 +164,16 @@ smallest), or, as `tests/embed.rs` does, a core module with `run` and
 To build that component yourself, the host needs the `wasm32-wasip2` target
 and `cargo-component` (0.21.1 is the version the builder images pin);
 neither comes with a Rust install. The `compile_module` example of
-`aegix-compilation` takes one source file through the compile path a
-controller uses, which writes the module's Cargo project and bindings for
-it:
+`aegix-compilation` takes a template directory through the compile path a
+controller uses: it reads the world and any extra crates from the
+directory's `talos.json`, and writes the module's Cargo project and bindings
+for it. (Given one source file and a world, it compiles that instead.)
 
 ```bash
 rustup target add wasm32-wasip2
 cargo install cargo-component@0.21.1 --locked
 cargo run -p aegix-compilation --example compile_module -- \
-    module-templates/echo-debug/template.rs minimal-node echo_debug.wasm
+    module-templates/echo-debug echo_debug.wasm
 cargo run -p aegix-runtime --example embed_worker -- echo_debug.wasm '{"message":"hello"}'
 ```
 
@@ -191,7 +192,7 @@ was 375 when that was measured; it is 346 since the 2026-11-02 cut. The
 `aegix-compilation` as well.)
 
 For more than one module at a time use `execute_job_with_full_features`,
-which takes the module's grants (`allowed_hosts`, `allowed_secrets`, the
+which takes one `JobRun`: the module's grants (`allowed_hosts`, `allowed_secrets`, the
 method allowlist), its fuel and wall-clock budgets, the actor's ceilings and
 the `SecretMap` the controller sealed for it; `AegixRuntime::with_resources`
 adds Redis (the sealed result cache, the OCI pull cache), NATS (the signed

@@ -508,10 +508,10 @@ pub const FUEL_PER_BYTE_GUIDANCE: &str = "`fuel_per_byte` (integer 1–100, defa
 pub const FUEL_MIN: u64 = 1_000_000;
 
 /// The share of its fuel limit above which a module has too little headroom.
-/// Its home is `aegix_workflow_engine_core::HIGH_FUEL_UTILISATION` (the
+/// Its home is `aegix_dispatch_types::HIGH_FUEL_UTILISATION` (the
 /// validator reads it there); this name is kept for the fleet gauge, the
 /// `get_fuel_usage_report` headroom section and the catalog's recorded-run gate.
-pub const HIGH_FUEL_UTILISATION: f64 = aegix_workflow_engine_core::HIGH_FUEL_UTILISATION;
+pub const HIGH_FUEL_UTILISATION: f64 = aegix_dispatch_types::HIGH_FUEL_UTILISATION;
 /// Dispatcher clamp ceiling — the largest max_fuel any module is given.
 pub const FUEL_MAX: u64 = 50_000_000;
 

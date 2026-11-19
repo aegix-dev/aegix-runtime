@@ -49,10 +49,10 @@ die()    { red "✗ $*"; exit 1; }
 # that function is declared on, read from the tree when this runs, so it
 # cannot go stale.
 #   id | title | expected | policy | file | pattern
-ATTEMPTS='ungranted-secret|read a secret it was not granted|Err(unauthorized)|secret-allowlist|aegix-worker-runtime/src/host/vault.rs|fn check_secret_allowlist
-unlisted-host|call a host that is not on its list|Err(forbiddenhost)|allowed-hosts|aegix-worker-runtime/src/host/egress_admission.rs|fn admit_parsed_url
-external-model|reach an external model as a local-only actor|Err(forbiddenhost)|tier1-llm-egress|aegix-worker-runtime/src/host/egress.rs|fn egress_posture_deny_reason
-memory-write|write as a read-only actor|Err(not-available)|write-ceiling|aegix-worker-runtime/src/context.rs|pub async fn write_ceiling_refuses_detailed
+ATTEMPTS='ungranted-secret|read a secret it was not granted|Err(unauthorized)|secret-allowlist|aegix-wasm-host/src/host/vault.rs|fn check_secret_allowlist
+unlisted-host|call a host that is not on its list|Err(forbiddenhost)|allowed-hosts|aegix-wasm-host/src/host/egress_admission.rs|fn admit_parsed_url
+external-model|reach an external model as a local-only actor|Err(forbiddenhost)|tier1-llm-egress|aegix-wasm-host/src/host/egress.rs|fn egress_posture_deny_reason
+memory-write|write as a read-only actor|Err(not-available)|write-ceiling|aegix-wasm-host/src/context.rs|pub async fn write_ceiling_refuses_detailed
 ended-job|ask for its data after its job has ended|Unauthorized|not_live|aegix-rpc-gates/src/dispatch_binding.rs|pub async fn gate'
 
 field() { printf '%s\n' "$ATTEMPTS" | awk -F'|' -v id="$1" -v n="$2" '$1 == id { print $n }'; }

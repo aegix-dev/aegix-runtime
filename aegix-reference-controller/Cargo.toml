@@ -16,9 +16,9 @@ path = "src/main.rs"
 aegix-capability-world = { path = "../aegix-capability-world" }
 # `Requirement` (a worker key must name a dispatch) and the posture predicate.
 aegix-auth-types = { path = "../aegix-auth-types" }
-aegix-config = { path = "../aegix-config" }
-# The claim responder and its in-flight seal store. Built WITHOUT its
-# `metrics` feature: this crate links no metrics registry.
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
+# The claim responder and its in-flight seal store. It links no metrics
+# registry; this crate hands the responder `claim_drops_uncounted`.
 aegix-envelope-seal = { path = "../aegix-envelope-seal" }
 aegix-random = { path = "../aegix-random" }
 # Admission and the two gates, over this crate's in-memory ledger.
@@ -29,7 +29,7 @@ aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
 # `world_fit_at_dispatch`: a module is checked against the world it declares,
 # by the rule the worker links it with.
 aegix-wit-inspector = { path = "../aegix-wit-inspector" }
-aegix-workflow-engine-core = { path = "../aegix-workflow-engine-core" }
+aegix-dispatch-types = { path = "../aegix-dispatch-types" }
 # `JobRequest` / `JobResult`, their signatures, the secret envelope, the
 # sealing types and the subjects.
 aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }

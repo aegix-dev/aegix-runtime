@@ -13,6 +13,7 @@
 //! `method`.
 
 use crate::counters::{Decision, Refusals};
+use aegix_dispatch_types::AGENT_MEMORY_SET_OP;
 use aegix_rpc_gates::write_ceiling::{
     self, CeilingDecision, AGENT_MEMORY_DELETE_OP, AGENT_MEMORY_STORE_WITH_EMBEDDING_OP,
 };
@@ -24,7 +25,6 @@ use aegix_rpc_protocol::memory_rpc::{
 use aegix_rpc_protocol::{
     is_valid_memory_type, validate_memory_key, MAX_METADATA_BYTES, MAX_TTL_HOURS, MAX_VALUE_BYTES,
 };
-use aegix_workflow_engine_core::AGENT_MEMORY_SET_OP;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -371,7 +371,7 @@ mod tests {
     use super::*;
     use crate::ledger::testing::actor;
     use crate::ledger::Ledger;
-    use aegix_workflow_engine_core::WriteCeiling;
+    use aegix_dispatch_types::WriteCeiling;
     use serde_json::json;
 
     struct Fixture {

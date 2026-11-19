@@ -10,18 +10,18 @@ why, and when the operator should bump.
 
 | Crate                | Version  | Pinned in                                  |
 |----------------------|----------|--------------------------------------------|
-| `wasmtime`           | 49.0.5   | `Cargo.toml`, `[workspace.dependencies]`   |
-| `wasmtime-wasi`      | 49.0.5   | `Cargo.toml`, `[workspace.dependencies]`   |
-| `wasmtime-wasi-http` | 49.0.5   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime`           | 49.0.6   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime-wasi`      | 49.0.6   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime-wasi-http` | 49.0.6   | `Cargo.toml`, `[workspace.dependencies]`   |
 
 Since 2026-10-06 the three versions are declared once, in the workspace
-manifest. `aegix-worker-runtime` (which links all three) and `worker` (whose
+manifest. `aegix-wasm-host` (which links all three) and `worker` (whose
 tests use `wasmtime` as a dev-dependency) inherit them with
 `workspace = true`, so the two manifests can no longer name different
 versions.
 
 The runtime library (`AegixRuntime`, the engine config, the AOT cache) was
-extracted from `worker/` to `aegix-worker-runtime/` in July 2026, so that
+extracted from `worker/` to `aegix-wasm-host/` in July 2026, so that
 crate's manifest is the one that governs which wasmtime the fleet actually
 runs — all three production entries live there. The deployable `worker`
 binary's own wasmtime entry is a **dev-dependency**: `worker/tests/` builds
@@ -47,6 +47,14 @@ column is the version bumped *to*.
 
 | Version  | Identifier             | Class                                    |
 |----------|------------------------|------------------------------------------|
+| 49.0.6   | RUSTSEC-2026-0566      | `wasmtime-wasi`: unbounded host memory growth via empty writes to `AsyncWriteStream` |
+| 49.0.6   | RUSTSEC-2026-0567      | Abort in builds without the `threads` cargo feature |
+| 49.0.6   | RUSTSEC-2026-0568      | Stale GC heap base pointer in compiled code lets a guest abort the host process |
+| 49.0.6   | RUSTSEC-2026-0569      | Panic in `Caller::get_module_export` when a host function is not called from WebAssembly |
+| 49.0.6   | RUSTSEC-2026-0570      | Abort in builds without the `gc` cargo feature |
+| 49.0.6   | RUSTSEC-2026-0571      | `wasmtime-wasi-http`: empty body writes can use unbounded heap with HTTP/2 |
+| 49.0.6   | RUSTSEC-2026-0572      | Panic when a component cancels a stream or future copy on the wrong end |
+| 49.0.6   | RUSTSEC-2026-0573      | Process abort when a GC heap's reservation is not a multiple of the page size |
 | 49.0.5   | RUSTSEC-2026-0420      | wasmtime-wasi wasip3: UDP `send` to a receive-only address |
 | 49.0.5   | RUSTSEC-2026-0421      | `wasi:http` p2: outgoing content-length can be invalid or mismatch the body |
 | 49.0.5   | RUSTSEC-2026-0422      | Typed functions with `i31`/`nullref` arguments may panic the host |
@@ -137,7 +145,7 @@ what makes any given build exact. Both properties are deliberate:
 When bumping wasmtime, the following Aegix-side surfaces are most
 likely to need a corresponding change:
 
-* `aegix-worker-runtime/src/runtime.rs::with_resources` — explicit
+* `aegix-wasm-host/src/runtime.rs::with_resources` — explicit
   `wasm_threads/simd/memory64/gc/tail_call/multi_memory/function_references(false)`.
   Each disabled proposal removes Cranelift attack surface; verify the
   list still matches what's available in the new wasmtime release.
@@ -156,6 +164,13 @@ likely to need a corresponding change:
 * `PoolingAllocationConfig` field set — same shape. New tuning knobs
   may need to be set explicitly to retain current behaviour.
 
+* The inspector's parser — `aegix-wit-inspector/Cargo.toml` pins `wasmparser`
+  to the version `wasmtime-environ` depends on, so what the inspection reads
+  as a component's imports is what wasmtime will link. Move the line with
+  the bump; `the_parser_is_the_one_wasmtime_reads_with` fails until it
+  matches. Then run `controller audit-module-worlds` against the stored
+  modules before a roll: a binary the new parser stops in is refused at
+  dispatch.
 * Memory protection keys — read what the new release's documentation of
   `PoolingAllocationConfig::memory_protection_keys` says: whether the option
   is still called experimental, and whether its default is still `no`. A
@@ -171,7 +186,7 @@ The pooling allocator is not asked for memory protection keys (wasmtime's
 `PoolingAllocationConfig::memory_protection_keys`, "MPK"; Linux calls the
 processor feature `pku`). Until 2026-11-18 the engine asked for `auto` on
 Linux x86_64 and nowhere else.
-`aegix-worker-runtime/src/runtime.rs` now leaves it at wasmtime's default,
+`aegix-wasm-host/src/runtime.rs` now leaves it at wasmtime's default,
 `no`, and the test `pooling_asks_for_no_memory_protection_keys` holds that.
 
 ### What the option does
@@ -270,7 +285,7 @@ every disabled proposal stays in the explicit-opt-out list.
 The three edits a wasmtime bump requires, all named by
 `fingerprint_wasmtime_version_matches_cargo_toml` when it fails:
 
-1. the `wasmtime_version!` macro in `aegix-worker-runtime/src/runtime.rs`
+1. the `wasmtime_version!` macro in `aegix-wasm-host/src/runtime.rs`
    (the single source — it feeds BOTH the `Engine created` boot log's
    `wasmtime_version` field and `ENGINE_CONFIG_FINGERPRINT`'s `wasmtime=`
    line, so there is nothing else in the code to update);

@@ -373,7 +373,7 @@ printf '\n  \033[1m%s\033[0m\n' "start a job after its deadline"
 printf '     %-10s %s\n' "sent" "job $LATE_JOB, signed with a start deadline ${PICKUP_WINDOW}s out; the worker was stopped for $(( PICKUP_WINDOW + 3 ))s"
 printf '     %-10s %s\n' "worker" "received it after the deadline and answered: ${LATE_ERROR:-(nothing)}"
 printf '     %-10s %s\n' "job" "${LATE_STATE:-unknown}${LATE_ERROR:+: $LATE_ERROR}"
-printf '     %-10s %s\n' "decided in" "worker/src/main.rs:$(grep -n -m1 'job deadline expired' "$REPO_ROOT/worker/src/main.rs" | cut -d: -f1), on the deadline aegix-reference-controller/src/dispatch.rs signs"
+printf '     %-10s %s\n' "decided in" "worker/src/job_execution.rs:$(grep -n -m1 'job deadline expired' "$REPO_ROOT/worker/src/job_execution.rs" | cut -d: -f1), on the deadline aegix-reference-controller/src/dispatch.rs signs"
 if [ "$LATE_STATE" = completed ]; then
     fail "NOT REFUSED: the job ran after its deadline"
 elif [ -z "$LATE_STATE" ] || [ "$(jq -r '.ended' "$RUN/late.json")" != true ]; then

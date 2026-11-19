@@ -22,7 +22,7 @@
 //! # What this crate does not do
 //!
 //! It reads no environment: whether a binding is required
-//! ([`aegix_config::dispatch_binding::Requirement`]) and whether the ceiling
+//! ([`aegix_deploy_posture::dispatch_binding::Requirement`]) and whether the ceiling
 //! is enforced are arguments, so the process that calls a gate says what it
 //! runs under. It registers no metric: a refusal is returned to the caller,
 //! which counts it, and written once to the `talos_audit` log target. It

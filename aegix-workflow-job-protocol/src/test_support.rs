@@ -141,7 +141,7 @@ pub fn round_trip_unstable_count(seed: &mut u64, iters: usize, depth: u32) -> us
 /// Byte-preserving, so a correctly-implemented signed message must still
 /// verify afterwards. Faithful to both surfaces: the dispatcher publishes and
 /// consumes NATS payloads as bytes, and the worker/controller memory-RPC path
-/// does the same (`aegix-worker-runtime/src/host/memory.rs` →
+/// does the same (`aegix-wasm-host/src/host/memory.rs` →
 /// `aegix-rpc-subscribers/src/admission.rs`). No intermediate `Value` hop
 /// exists on either side.
 ///

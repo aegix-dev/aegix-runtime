@@ -44,23 +44,23 @@ section here ends with what remains.
 
 Trusted: the controller process and its machine, its configuration and
 secrets file, whoever can reach its control socket, the toolchain that
-compiled the module, and wasmtime.
+compiled the module and the machine it compiled on, and wasmtime.
 
 ## A. The module
 
 | The module tries to | What stops it | Decided in |
 |---|---|---|
-| read a secret outside its grant | the job is handed only the secrets its module is granted, and the worker refuses any other path. A grant is a path and covers the paths beneath it; `*` grants nothing | `aegix-reference-controller/src/dispatch.rs`, `granted`; `aegix-worker-runtime/src/host/vault.rs`, `check_secret_allowlist` |
-| read the value of a secret it is granted | it is given a handle. The host signs with the secret or places it in a request; the value does not enter the module. The one host function that returns a value needs a flag under the job's signature, and the reference controller never sets it | `aegix-worker-runtime/src/host/secrets.rs`, `get_secret`, and `expose_secret`; `aegix-reference-controller/src/dispatch.rs`, `prepare` |
-| have a secret sent somewhere of its choosing | a `vault://` reference is filled in only for a host the grant names, in a header or a JSON body, never in a URL and never in a message-bus header | `aegix-worker-runtime/src/host/vault.rs`, `secret_destination_refusal` |
-| call a host that is not on its list, or with a verb it was not given | `allowed_hosts` is exact hosts and `.suffix` entries; empty denies everything, and so does an empty `allowed_methods`. HTTPS only. The worker also takes `*` as every public host; the reference controller refuses to load a module granted it (see [The operator's side](#the-operators-side)) | `aegix-worker-runtime/src/host/egress_admission.rs`, `admit_parsed_url`; `aegix-workflow-job-protocol/src/lib.rs`, `method_permitted` |
-| name another site to the server than the one its URL was admitted for | a `Host` header, and the fields that belong to the connection (`Transfer-Encoding`, `Connection`, `Upgrade` and the rest), are refused on every request path before a secret is filled in or a connection is opened. The worker writes them from the URL | `aegix-worker-runtime/src/host/request_headers.rs`, `request_headers_refusal` |
-| reach a private address: loopback, the local network, a cloud metadata service | an address literal is refused at admission, and a name is checked when it is resolved for the connection, so a name that changes its answer is checked on the answer that is used. Redirects are not followed | `aegix-worker-runtime/src/host/egress.rs`, `denied_ip_literal`; `aegix-worker-runtime/src/ssrf_resolver.rs`, `resolved_addr_permitted`; `aegix-ssrf-classify/src/lib.rs`, `classify_private_ip` |
-| reach an outside model, as an actor held to local ones | provider hosts are refused whatever the grant says, provider keys are not resolved, and a local model server's cloud-served models are refused | `aegix-worker-runtime/src/host/egress.rs`, `egress_posture_deny_reason`; `aegix-worker-runtime/src/host/llm.rs`, `decide_llm_tier_access`, and `admit_local_model` |
-| write, as a read-only actor | the worker refuses the host call, and the controller refuses the write again when a worker signs one | `aegix-worker-runtime/src/context.rs`, `write_ceiling_refuses_detailed`; `aegix-rpc-gates/src/write_ceiling.rs`, `gate` |
+| read a secret outside its grant | the job is handed only the secrets its module is granted, and the worker refuses any other path. A grant is a path and covers the paths beneath it; `*` grants nothing | `aegix-reference-controller/src/dispatch.rs`, `granted`; `aegix-wasm-host/src/host/vault.rs`, `check_secret_allowlist` |
+| read the value of a secret it is granted | it is given a handle. The host signs with the secret or places it in a request; the value does not enter the module. The one host function that returns a value needs a flag under the job's signature, and the reference controller never sets it | `aegix-wasm-host/src/host/secrets.rs`, `get_secret`, and `expose_secret`; `aegix-reference-controller/src/dispatch.rs`, `prepare` |
+| have a secret sent somewhere of its choosing | a `vault://` reference is filled in only for a host the grant names, in a header or a JSON body, never in a URL and never in a message-bus header | `aegix-wasm-host/src/host/vault.rs`, `secret_destination_refusal` |
+| call a host that is not on its list, or with a verb it was not given | `allowed_hosts` is exact hosts and `.suffix` entries; empty denies everything, and so does an empty `allowed_methods`. HTTPS only. The worker also takes `*` as every public host; the reference controller refuses to load a module granted it (see [The operator's side](#the-operators-side)) | `aegix-wasm-host/src/host/egress_admission.rs`, `admit_parsed_url`; `aegix-workflow-job-protocol/src/http_methods.rs`, `method_permitted` |
+| name another site to the server than the one its URL was admitted for | a `Host` header, and the fields that belong to the connection (`Transfer-Encoding`, `Connection`, `Upgrade` and the rest), are refused on every request path before a secret is filled in or a connection is opened. The worker writes them from the URL | `aegix-wasm-host/src/host/request_headers.rs`, `request_headers_refusal` |
+| reach a private address: loopback, the local network, a cloud metadata service | an address literal is refused at admission, and a name is checked when it is resolved for the connection, so a name that changes its answer is checked on the answer that is used. Redirects are not followed | `aegix-wasm-host/src/host/egress.rs`, `denied_ip_literal`; `aegix-wasm-host/src/ssrf_resolver.rs`, `resolved_addr_permitted`; `aegix-ssrf-classify/src/lib.rs`, `classify_private_ip` |
+| reach an outside model, as an actor held to local ones | provider hosts are refused whatever the grant says, provider keys are not resolved, and a local model server's cloud-served models are refused | `aegix-wasm-host/src/host/egress.rs`, `egress_posture_deny_reason`; `aegix-wasm-host/src/host/llm.rs`, `decide_llm_tier_access`, and `admit_local_model` |
+| write, as a read-only actor | the worker refuses the host call, and the controller refuses the write again when a worker signs one | `aegix-wasm-host/src/context.rs`, `write_ceiling_refuses_detailed`; `aegix-rpc-gates/src/write_ceiling.rs`, `gate` |
 | read or write another actor's memory | the actor is the job's, under the controller's signature. The module does not name it | `aegix-reference-controller/src/data_plane.rs`, `memory_op` |
 | use a host function outside its world | the module is linked with its declared world's functions only, and a binary that imports more is refused before it starts. The world is under the job's signature | `aegix-wit-inspector/src/lib.rs`, `link_world`, and `imports_outside_world` |
-| read the worker's environment or files | no environment is passed in and no directory is opened, except a per-run scratch directory for the worlds that have files | `aegix-worker-runtime/src/context.rs`, `capability_world_has_fs_preopen` |
+| read the worker's environment or files | no environment is passed in and no directory is opened, except a per-run scratch directory for the worlds that have files | `aegix-wasm-host/src/context.rs`, `capability_world_has_fs_preopen` |
 | run for ever, or take the machine's memory | fuel (10 million units when the job names none; the job may name up to 50 million, a ceiling the operator can move with `AEGIX_WORKER_MAX_JOB_FUEL`), 128 MB of memory, a wall-clock limit enforced every 100 ms, and caps on input, output and each kind of call | `worker/src/main.rs`, `clamp_job_fuel`; `aegix-workflow-job-protocol/src/lib.rs`, `MAX_JOB_FUEL` |
 
 **What remains.**
@@ -87,6 +87,11 @@ compiled the module, and wasmtime.
   state, cache, scratch files or events.
 * A module in a world with messaging can publish on any bus subject that is
   not reserved, with the worker's login.
+* All of this is about a module that is run. Compiling a module's source is
+  not covered: the compile runs on the build machine with the builder's
+  rights, and a source can embed that machine's files and environment in
+  the module it becomes. The lint that reads the source first is advice
+  ([limits.md](limits.md), "Compiling a module's source").
 * The sandbox is wasmtime's. A flaw there is a flaw here.
 
 ## B. A worker that has been taken over
@@ -105,7 +110,7 @@ posture, shares one key among all workers and is weaker in every row
 | use another worker's job | once a job's secrets are claimed, its data calls and its result are taken only from the claimant | `aegix-rpc-gates/src/dispatch_binding.rs`, `dispatch_is_live`; `aegix-workflow-job-protocol/src/envelope_seal.rs`, `sealed_result_refused` |
 | write above the actor's ceiling by signing the write itself | the controller reads the ceiling from its own record. An actor it cannot find is refused | `aegix-rpc-gates/src/write_ceiling.rs`, `gate` |
 | send a job of its own making to other workers | a job is signed with the controller's Ed25519 key, which no worker holds | `aegix-workflow-job-protocol/src/lib.rs`, `verify_dispatch` |
-| send a signed request twice, or an old one | every request carries a nonce the receiver remembers, and a time: 60 seconds old at most for a data call, 5 minutes for a job, and for a job the start deadline its controller signed | `aegix-rpc-protocol/src/rpc_auth.rs`, `check_and_record_nonce`, and `verify_freshness`; `worker/src/main.rs`, `execute_job`, and `run_verified_job` |
+| send a signed request twice, or an old one | every request carries a nonce the receiver remembers, and a time: 60 seconds old at most for a data call, 5 minutes for a job, and for a job the start deadline its controller signed | `aegix-rpc-protocol/src/rpc_auth.rs`, `check_and_record_nonce`, and `verify_freshness`; `worker/src/job_execution.rs`, `execute_job`, and `run_verified_job` |
 | have its result taken for another job | a result names the job, the attempt and the run it answers, under its signature | `aegix-reference-controller/src/dispatch.rs`, `accept_result` |
 
 **What remains.**
@@ -165,7 +170,7 @@ not a deployment.
 * With the *controller's* broker login and no key, they can publish a job. A
   worker sends nothing in answer to a job that does not verify, so a job of
   their own making gets them no signed result
-  (`worker/src/main.rs`, `refused_dispatch_answer`). What is left is a job
+  (`worker/src/refused_dispatch.rs`, `refused_dispatch_answer`). What is left is a job
   the controller did sign, sent a second time more than five minutes after
   it was signed, while it is still running. The worker's check of a job's
   age comes before its check of the signature, and a job that is too old but
@@ -184,12 +189,12 @@ easiest to get wrong.
 | the secrets file and the key files are refused unless only their owner can read them | `aegix-reference-controller/src/config.rs`, `read_private_file` |
 | the control directory is refused if anyone but its owner can enter it. There is no other check on who is asking: whoever reaches the socket can dispatch jobs and write memory | `aegix-reference-controller/src/control.rs`, `prepare_dir` |
 | the shared-key posture is refused unless `RUST_ENV` is unset or names a development environment | `aegix-reference-controller/src/keys.rs`, `load` |
-| a model-provider key is never handed to a job, whatever the grant says | `aegix-workflow-job-protocol/src/lib.rs`, `is_controller_internal_vault_path` |
+| a model-provider key is never handed to a job, whatever the grant says | `aegix-workflow-job-protocol/src/vault_paths.rs`, `is_controller_internal_vault_path` |
 
 ## What a deployment must set
 
 A worker runs under one of three profiles
-(`aegix-config/src/security_profile.rs`, `SecurityProfile`).
+(`aegix-deploy-posture/src/security_profile.rs`, `SecurityProfile`).
 `AEGIX_SECURITY_PROFILE` names it: `hardened`, `transitional` or
 `development`. Any other value stops the worker at start. Left unset, the
 profile follows `RUST_ENV`: **development** when that is unset or is

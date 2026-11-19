@@ -10,13 +10,13 @@ description = "The two gates a controller puts in front of a worker's signed dat
 [dependencies]
 # `Requirement`: whether a worker key must name a dispatch. The type only;
 # this crate reads no environment.
-aegix-config = { path = "../aegix-config" }
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
 # The wire types the gates read: `DispatchBinding`, the crypto-scheme tag,
 # the run statuses a state write honours, the gated subjects.
 aegix-rpc-protocol = { path = "../aegix-rpc-protocol" }
 # THE write-ceiling decision (`write_ceiling_denies`) and its audit
 # vocabulary, shared with the worker's gate and the engine's envelope gate.
-aegix-workflow-engine-core = { path = "../aegix-workflow-engine-core" }
+aegix-dispatch-types = { path = "../aegix-dispatch-types" }
 # `CONTROLLER_RPC_IDENTITY`, the reserved id the controller signs under.
 aegix-workflow-job-protocol = { path = "../aegix-workflow-job-protocol" }
 # The dispatch-binding gate's bounded positive cache.

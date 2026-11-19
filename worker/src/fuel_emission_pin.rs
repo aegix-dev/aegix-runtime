@@ -11,32 +11,10 @@
 //! needles (#944/#947). Stated as a TEXTUAL pin: `execute_job` needs a
 //! broker to drive.
 
-/// `main.rs` with every column-0 `#[cfg(test)] mod … { … }` region and every
-/// whole-line comment removed.
+/// The worker's job path, production code only: `job_execution.rs` and
+/// `main.rs`, read together (`retry_policy_pin::production_source`).
 fn production_source() -> String {
-    let src = include_str!("main.rs");
-    let mut out = String::new();
-    let mut lines = src.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line == "#[cfg(test)]"
-            && lines
-                .peek()
-                .is_some_and(|next| next.starts_with("mod ") && next.ends_with('{'))
-        {
-            for inner in lines.by_ref() {
-                if inner == "}" {
-                    break;
-                }
-            }
-            continue;
-        }
-        if line.trim_start().starts_with("//") {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
+    crate::retry_policy_pin::production_source()
 }
 
 #[test]
@@ -57,6 +35,8 @@ fn the_nats_job_path_passes_a_fuel_accumulator_and_drains_it_on_every_branch() {
         "every result branch drains it"
     );
     // The oversize replacement keeps the fuel the dropped output spent.
+    // It lives in `job_result.rs` since 2026-11-18; that file's own test
+    // module has no such line, so the whole file is read.
     let keep = ["fuel: result", ".fuel,"].concat();
-    assert_eq!(prod.matches(&keep).count(), 1);
+    assert_eq!(include_str!("job_result.rs").matches(&keep).count(), 1);
 }

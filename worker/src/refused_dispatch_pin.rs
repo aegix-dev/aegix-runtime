@@ -2,22 +2,24 @@
 //! rule for what is sent in answer is asked where the intake learns of it
 //! (2026-11-15).
 //!
-//! `refused_dispatch_answer` is unit-tested in `main.rs`
-//! (`refused_dispatch_tests`). What those tests cannot see is whether the
+//! `refused_dispatch_answer` is unit-tested beside itself, in
+//! `refused_dispatch.rs` (`refused_dispatch_tests`). What those tests cannot see is whether the
 //! intake asks it: until this date `execute_job` built a `Failed` result for a
 //! dispatch that failed verification and the intake signed and published it
 //! like any other, so a sender with no key was handed a worker-signed result
 //! for a job of its choosing. A rule nobody calls would leave that as it was
-//! with every unit test green. This reads `main.rs`, like `retry_policy_pin`,
-//! and lives in its own file so its needles are not in the file it scans.
+//! with every unit test green. This reads `main.rs` for the intake, like
+//! `retry_policy_pin`, and `refused_dispatch.rs` for the rule (moved there
+//! 2026-11-18), and lives in its own file so its needles are not in a file
+//! it scans.
 
-use crate::retry_policy_pin::production_source;
+use crate::retry_policy_pin::{production_of, production_source};
 
 /// `prod` from `start` up to the next top-level `fn`.
 fn top_level_fn<'a>(prod: &'a str, start: &str) -> &'a str {
     let at = prod
         .find(start)
-        .unwrap_or_else(|| panic!("vacuity guard: `{start}` not found in main.rs"));
+        .unwrap_or_else(|| panic!("vacuity guard: `{start}` not found in the scanned source"));
     let rest = &prod[at..];
     let end = rest[1..]
         .find("\nasync fn ")
@@ -76,8 +78,14 @@ fn the_intake_asks_the_one_rule_and_sends_nothing_when_it_says_so() {
     let prod = production_source();
     assert_eq!(
         prod.matches("refused_dispatch_answer(").count(),
-        2,
-        "the rule is defined once and asked once"
+        1,
+        "the rule is asked once"
+    );
+    let rule_file = production_of(include_str!("refused_dispatch.rs"));
+    assert_eq!(
+        rule_file.matches("fn refused_dispatch_answer(").count(),
+        1,
+        "and defined once, in its own file"
     );
     let asked = prod
         .find("Err(refusal) => match refused_dispatch_answer(")
@@ -108,19 +116,24 @@ fn the_intake_asks_the_one_rule_and_sends_nothing_when_it_says_so() {
     );
     // Only the rule builds the refusal payload that is signed; the other call
     // writes the operator's field dump to this worker's log.
-    let rule = top_level_fn(&prod, "fn refused_dispatch_answer(");
+    let rule = top_level_fn(&rule_file, "fn refused_dispatch_answer(");
     assert_eq!(
         rule.matches("signature_failure_payload(").count(),
         1,
         "the rule builds the one answer"
     );
     assert_eq!(
+        rule_file.matches("signature_failure_payload(").count(),
+        2,
+        "its definition and the rule's answer"
+    );
+    assert_eq!(
         prod.matches("signature_failure_payload(").count(),
-        3,
-        "its definition, the rule's answer and the diagnostic log line; no other caller"
+        1,
+        "and in main.rs the diagnostic log line; no other caller"
     );
     assert!(
         nothing_arm.contains("diag = %signature_failure_payload(true, &req, &refusal),"),
-        "the third is the log line in the nothing arm"
+        "that one is the log line in the nothing arm"
     );
 }

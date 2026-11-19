@@ -579,7 +579,7 @@ pub async fn install(client: redis::Client, backend_url: &str, sink: Option<Arc<
     if cap == 0 {
         return;
     }
-    if !aegix_config::bool_env_or_default(FLEET_ADMISSION_ENV, true) {
+    if !aegix_deploy_posture::bool_env_or_default(FLEET_ADMISSION_ENV, true) {
         tracing::info!("local LLM fleet admission: off ({FLEET_ADMISSION_ENV}=false)");
         return;
     }

@@ -38,7 +38,7 @@
 //! (`AEGIX_WRITE_CEILING_ENFORCED` / `AEGIX_WRITE_CEILING_STRICT_EGRESS`) so
 //! controller-side operator surfaces can stop describing `max_write_ceiling`
 //! in the abstract. That posture is read from
-//! [`aegix_worker_runtime::context::write_ceiling_enforcement`] — the SAME
+//! [`aegix_wasm_host::context::write_ceiling_enforcement`] — the SAME
 //! `OnceLock`s the host-fn gates consult — never from a second env read here,
 //! because a report that can disagree with the gate it describes is worse than
 //! no report. Like `build_version` it is DIAGNOSTIC ONLY and deliberately
@@ -75,7 +75,7 @@ pub(crate) fn build_registration_body(
     issued_at_ms: u64,
     nonce: &str,
     build_version: &str,
-    write_ceiling: aegix_worker_runtime::context::WriteCeilingEnforcement,
+    write_ceiling: aegix_wasm_host::context::WriteCeilingEnforcement,
     signing_key: &DispatchSigningKey,
 ) -> serde_json::Value {
     let proof = sign_worker_registration_proof(
@@ -192,7 +192,7 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
     let public_key = signing_key.verifying_key().to_bytes();
     let build_version = worker_build_version();
     // From the runtime's own gate readers, not a second env parse here.
-    let write_ceiling = aegix_worker_runtime::context::write_ceiling_enforcement();
+    let write_ceiling = aegix_wasm_host::context::write_ceiling_enforcement();
     let url = format!("{}/internal/worker-key", base_url.trim_end_matches('/'));
 
     // Explicit redirect policy (lint check 32) + bounded timeouts; the target is
@@ -317,7 +317,7 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegix_worker_runtime::context::WriteCeilingEnforcement;
+    use aegix_wasm_host::context::WriteCeilingEnforcement;
     use aegix_workflow_job_protocol::verify_worker_registration_proof;
 
     /// Fixture posture with the two bits DIFFERENT, so a swapped field

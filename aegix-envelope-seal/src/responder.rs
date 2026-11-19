@@ -51,19 +51,25 @@ pub const MAX_CLAIM_BYTES: usize = 16 * 1024;
 /// and its dispatch fails, as for any lost claim.
 pub const MAX_CLAIMS_IN_FLIGHT: usize = 64;
 
-/// Whether this build counts a dropped claim on
-/// `aegix_envelope_claims_dropped_total` (feature `metrics`). A build without
-/// it still logs the drop; the platform controller's build has it, and a test
-/// in `aegix-engine` holds that.
-pub const HAS_CLAIM_DROP_COUNTER: bool = cfg!(feature = "metrics");
+/// A claim larger than [`MAX_CLAIM_BYTES`], dropped unread.
+pub const CLAIM_DROP_TOO_LARGE: &str = "too_large";
+/// A claim that arrived while every one of [`MAX_CLAIMS_IN_FLIGHT`] slots was
+/// busy, dropped unread.
+pub const CLAIM_DROP_SATURATED: &str = "saturated";
+/// Every reason a [`ClaimDropCounter`] is called with, and nothing else.
+pub const CLAIM_DROP_REASONS: [&str; 2] = [CLAIM_DROP_TOO_LARGE, CLAIM_DROP_SATURATED];
 
-#[cfg(feature = "metrics")]
-fn count_dropped_claim(reason: &'static str) {
-    aegix_metrics::record_claim_dropped(reason);
-}
+/// Where the responder counts a claim it dropped unread, called once per drop
+/// with one of [`CLAIM_DROP_REASONS`]. It is an argument of
+/// [`run_claim_responder`] and has no default: this crate links no metrics
+/// registry, so whoever runs the responder says where a drop is counted. The
+/// platform passes its registry's recorder, and a test in `aegix-engine` holds
+/// that; a caller with no registry passes [`claim_drops_uncounted`]. Every
+/// drop is logged either way.
+pub type ClaimDropCounter = fn(reason: &'static str);
 
-#[cfg(not(feature = "metrics"))]
-fn count_dropped_claim(_reason: &'static str) {}
+/// The [`ClaimDropCounter`] of a caller that has no registry to count on.
+pub fn claim_drops_uncounted(_reason: &'static str) {}
 
 /// Whether a claim message is taken, and why not.
 #[derive(Debug)]
@@ -96,6 +102,7 @@ pub async fn run_claim_responder(
     controller_key: Arc<DispatchSigningKey>,
     max_age_secs: u64,
     recorder: Option<ClaimRecorder>,
+    count_dropped_claim: ClaimDropCounter,
 ) -> Result<(), String> {
     let mut sub = nc
         .subscribe(claim_subject.clone())
@@ -125,9 +132,9 @@ pub async fn run_claim_responder(
             refused => {
                 dropped += 1;
                 let reason = if matches!(refused, ClaimIntake::TooLarge) {
-                    "too_large"
+                    CLAIM_DROP_TOO_LARGE
                 } else {
-                    "saturated"
+                    CLAIM_DROP_SATURATED
                 };
                 // Every drop is counted (B2-3, 2026-10-15); at most one line
                 // per 1 024 drops: a flood is not a log flood.

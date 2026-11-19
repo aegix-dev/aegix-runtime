@@ -28,8 +28,8 @@ use crate::dispatch::{self, Module, Plan, PrepareError, SecretStore, MAX_LOG_LIN
 use crate::keys::{Keys, Posture};
 use crate::ledger::{JobState, Ledger, RecordError};
 use crate::memory::{self, MemoryStore};
+use aegix_dispatch_types::inline_wasm::refuse_over_max_payload;
 use aegix_envelope_seal::{ClaimRecord, ClaimRecorder, InFlightSeals};
-use aegix_workflow_engine_core::inline_wasm::refuse_over_max_payload;
 use aegix_workflow_job_protocol::subjects;
 use aegix_workflow_job_protocol::{CancelCommand, JobRequest};
 use futures::StreamExt;
@@ -137,6 +137,8 @@ impl Controller {
                 controller_key.clone(),
                 CLAIM_MAX_AGE_SECS,
                 Some(recorder),
+                // No registry in this controller: a dropped claim is logged.
+                aegix_envelope_seal::claim_drops_uncounted,
             );
             tokio::spawn(async move {
                 if let Err(e) = responder.await {
@@ -431,7 +433,7 @@ pub fn claim_recorder(ledger: Arc<Ledger>) -> ClaimRecorder {
 mod tests {
     use super::*;
     use crate::ledger::testing::{actor, outcome};
-    use aegix_workflow_engine_core::WriteCeiling;
+    use aegix_dispatch_types::WriteCeiling;
 
     fn claim(job: Uuid, attempt: u32) -> ClaimRecord {
         ClaimRecord {

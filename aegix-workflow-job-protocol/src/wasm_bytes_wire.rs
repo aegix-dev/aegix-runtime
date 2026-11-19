@@ -9,7 +9,7 @@
 //! base64 (1.33×) and READS BOTH forms, so a worker of this release accepts a
 //! controller of either, and a controller rolled before its workers can keep
 //! the old spelling with `AEGIX_WASM_BYTES_WIRE=integer-list`
-//! ([`aegix_workflow_engine_core::inline_wasm::WasmBytesEncoding`] is the
+//! ([`aegix_dispatch_types::inline_wasm::WasmBytesEncoding`] is the
 //! one place that decides which is written).
 //!
 //! The dispatch signature is untouched: both `signing_payload` formulas hash
@@ -18,7 +18,7 @@
 //! snapshots (`job_request_non_empty_wasm_bytes_snapshot` and the legacy
 //! round-trip beside it).
 
-use aegix_workflow_engine_core::inline_wasm::WasmBytesEncoding;
+use aegix_dispatch_types::inline_wasm::WasmBytesEncoding;
 use base64::Engine as _;
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserializer, Serializer};

@@ -1,8 +1,8 @@
-//! Thin re-export shim over [`aegix_worker_runtime`].
+//! Thin re-export shim over [`aegix_wasm_host`].
 //!
 //! The worker's library half (the entire wasmtime WASM host: runtime,
 //! context, host/ modules, module_fetcher, sql_validator, wit_inspector, …)
-//! moved to the `aegix-worker-runtime` workspace crate in July 2026 so
+//! moved to the `aegix-wasm-host` workspace crate in July 2026 so
 //! controller-side consumers depend on a library crate instead of this
 //! deployable binary. This shim keeps `worker::…` paths resolving for the
 //! bin (`main.rs`), the integration tests, and anything not yet migrated —
@@ -17,9 +17,9 @@
 //! `heartbeat` (the periodic NATS fleet heartbeat — an observability signal
 //! under the FLEET-SHARED key, deliberately weaker than `liveness` and
 //! forbidden from touching the trust boundary). New runtime logic goes in
-//! `aegix-worker-runtime`, not here.
+//! `aegix-wasm-host`, not here.
 
-pub use aegix_worker_runtime::*;
+pub use aegix_wasm_host::*;
 
 pub mod heartbeat;
 pub mod liveness;

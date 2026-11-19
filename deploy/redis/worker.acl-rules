@@ -11,7 +11,7 @@
 #
 # Dispatch replay guard (worker/src/dispatch_replay.rs): SET NX PX.
 ~talos:jobnonce:*
-# Job idempotency (aegix-worker-runtime job_idempotency): GET, SET EX, DEL.
+# Job idempotency (aegix-wasm-host job_idempotency): GET, SET EX, DEL.
 ~talos:idem:*
 # Sealed module results (runtime.rs): GET, TTL, SETEX.
 ~wasm:result:*

@@ -7,7 +7,7 @@ line:
 | Snapshot | Gate | Test |
 |---|---|---|
 | `classify.snapshot` | `aegix_sql_classify::classify` — read, write, or neither | `aegix-sql-classify/tests/corpus.rs` |
-| `worker.snapshot` | the worker's `validate_sql_with_policy`, under three allowlist configurations | `aegix-worker-runtime/tests/sql_corpus.rs` |
+| `worker.snapshot` | the worker's `validate_sql_with_policy`, under three allowlist configurations | `aegix-wasm-host/tests/sql_corpus.rs` |
 | `controller.snapshot` | the controller's admission functions for `talos.database.query` | the platform's `aegix-rpc-subscribers` crate, `sql_corpus_tests` |
 | `query_paginated.snapshot` | `aegix_admin_query_gate`, the platform-admin `query_paginated` tool: `T=` its text rules, `P=` its parsed gate on its own (the tool runs a statement only when both say `ok`) | the platform's `aegix-admin-query-gate` crate, `sql_corpus` |
 
@@ -34,7 +34,7 @@ Then record the new verdicts and commit the snapshots with the change:
 
 ```bash
 SQL_CORPUS_BLESS=1 cargo test -p aegix-sql-classify --test corpus
-SQL_CORPUS_BLESS=1 cargo test -p aegix-worker-runtime --test sql_corpus
+SQL_CORPUS_BLESS=1 cargo test -p aegix-wasm-host --test sql_corpus
 SQL_CORPUS_BLESS=1 cargo test -p aegix-rpc-subscribers --lib sql_corpus_tests
 SQL_CORPUS_BLESS=1 cargo test -p aegix-admin-query-gate --test sql_corpus
 ```

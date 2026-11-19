@@ -9,7 +9,7 @@
 //! POST node the controller allowed zero retries ran up to four times.
 //!
 //! `RetryPolicy::controller_dispatched()` is the one home for the answer and is
-//! unit-tested in `aegix-worker-runtime`. What a test of the constructor cannot
+//! unit-tested in `aegix-wasm-host`. What a test of the constructor cannot
 //! see is whether THIS call site uses it — which is what regressed — so this
 //! reads `main.rs` itself. It lives in its own file because a pin inside the
 //! file it scans matches its own needles (#944/#947).
@@ -18,7 +18,18 @@
 /// whole-line comment removed, so neither test code nor prose can vouch for, or
 /// against, the production call.
 pub(crate) fn production_source() -> String {
-    let src = include_str!("main.rs");
+    // The job path is two files since 2026-11-18: `execute_job` and
+    // `run_verified_job` in `job_execution.rs`, the intake in `main.rs`.
+    // Read together, every count a pin makes is over what `main.rs` held.
+    let mut both = production_of(include_str!("job_execution.rs"));
+    both.push('\n');
+    both.push_str(&production_of(include_str!("main.rs")));
+    both
+}
+
+/// A source file with every column-0 `#[cfg(test)] mod … { … }` region and
+/// every whole-line comment removed.
+pub(crate) fn production_of(src: &str) -> String {
     let mut out = String::new();
     let mut lines = src.lines().peekable();
     while let Some(line) = lines.next() {

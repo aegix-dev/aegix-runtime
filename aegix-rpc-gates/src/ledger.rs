@@ -9,7 +9,7 @@
 //! actor, claimant or run, and it must not turn "I could not read" into
 //! `Ok(None)`.
 
-use aegix_workflow_engine_core::WriteCeiling;
+use aegix_dispatch_types::WriteCeiling;
 use std::fmt::Display;
 use std::future::Future;
 use uuid::Uuid;

@@ -1,6 +1,6 @@
 //! In-flight gate for LOCAL (Ollama) LLM exchanges.
 //!
-//! Moved here from `aegix_worker_runtime::host::llm_gate` in RFC 0014 P3a so
+//! Moved here from `aegix_wasm_host::host::llm_gate` in RFC 0014 P3a so
 //! the controller's `aegix_llm::OllamaClient` takes the same gate: one rule,
 //! one cap, one env var, in both processes. The worker keeps a thin wrapper
 //! that records a queued call on the job's `InferenceWaitLedger` (P2a).

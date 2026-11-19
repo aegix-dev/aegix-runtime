@@ -297,7 +297,8 @@ pub fn shared_replay_guard() -> Option<Arc<dyn ReplayGuard>> {
 /// 1/true/yes/on or 0/false/no/off) always wins over the environment default.
 pub fn fail_closed_from_env() -> bool {
     // Unset (or an unrecognised value): fail-closed in prod, open in dev.
-    aegix_config::bool_env("AEGIX_REPLAY_FAIL_CLOSED").unwrap_or_else(aegix_config::is_production)
+    aegix_deploy_posture::bool_env("AEGIX_REPLAY_FAIL_CLOSED")
+        .unwrap_or_else(aegix_deploy_posture::is_production)
 }
 
 /// Resolve an [`ReplayOutcome`] into an admit/reject decision under a fail
@@ -321,16 +322,16 @@ pub const DISTRIBUTED_REPLAY: &str = "AEGIX_DISTRIBUTED_REPLAY";
 /// 2026-10-29): on under `hardened`, off under the other two.
 #[must_use]
 pub fn distributed_replay_from_env() -> bool {
-    aegix_config::bool_env_or_default(
+    aegix_deploy_posture::bool_env_or_default(
         DISTRIBUTED_REPLAY,
-        aegix_config::security_profile::profile().default_on(),
+        aegix_deploy_posture::security_profile::profile().default_on(),
     )
 }
 
 /// Whether this process may boot with the replay posture it was given
 /// (operator decision D2-B, 2026-10-15). Where the security profile enforces
 /// — `hardened`, which since 2026-10-29 is
-/// `aegix_config::security_profile::profile().enforces()`: `hardened` and
+/// `aegix_deploy_posture::security_profile::profile().enforces()`: `hardened` and
 /// `transitional`, every deployment that faces users (`RUST_ENV=production`
 /// AND `staging` as `docker-compose.prod.yml` runs it) — the shared guard is
 /// REQUIRED: [`DISTRIBUTED_REPLAY`] on and `REDIS_URL`

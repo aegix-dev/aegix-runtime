@@ -19,7 +19,7 @@ reqwest = { workspace = true, features = ["json", "stream", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-aegix-config = { path = "../aegix-config" }
+aegix-deploy-posture = { path = "../aegix-deploy-posture" }
 aegix-dlp-provider = { path = "../aegix-dlp-provider" }
 aegix-http-body = { path = "../aegix-http-body" }
 tokio = { workspace = true, features = ["sync", "time", "rt"] }

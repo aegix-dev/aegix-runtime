@@ -74,7 +74,7 @@
 //! [`CONTROLLER_RPC_IDENTITY`], or a worker built before the field. The first
 //! is admitted on its identity; the second is refused unless the operator
 //! waived it for the upgrade window (`AEGIX_RPC_REQUIRE_DISPATCH_BINDING=false`,
-//! `aegix_config::dispatch_binding`). A binding that IS present is checked
+//! `aegix_deploy_posture::dispatch_binding`). A binding that IS present is checked
 //! whatever the switch says.
 //!
 //! # Shape
@@ -115,7 +115,7 @@
 //! request pays nothing: it is admitted before any read.
 
 use crate::ledger::{DispatchFacts, GateLedger};
-use aegix_config::dispatch_binding::Requirement;
+use aegix_deploy_posture::dispatch_binding::Requirement;
 use aegix_rpc_protocol::dispatch_binding::DispatchBinding;
 use aegix_rpc_protocol::rpc_auth::RPC_CRYPTO_SCHEME_ED25519;
 use aegix_rpc_protocol::state_rpc::STATE_WRITABLE_STATUSES;

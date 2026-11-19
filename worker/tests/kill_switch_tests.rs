@@ -18,7 +18,7 @@
 //!     half of the same guarantee: a guest that makes no host call after
 //!     entry reaches none of the ~20 `is_cancelled()` guards, and used to
 //!     burn its whole timeout. The epoch-deadline callback
-//!     (`aegix_worker_runtime::epoch_budget`) re-reads the same flag and
+//!     (`aegix_wasm_host::epoch_budget`) re-reads the same flag and
 //!     traps it out of its loop. Its sibling
 //!     `an_uncancelled_compute_bound_job_still_traps_at_its_own_budget`
 //!     is the regression guard: with no cancel, the SAME module on the
@@ -647,41 +647,36 @@ async fn cancellation_preempts_a_compute_bound_module() {
         let rt = rt.clone();
         let execution_id = execution_id.to_string();
         tokio::spawn(async move {
-            rt.execute_job_with_full_features(
-                &bytes,
-                vec![],
-                vec![],
-                128,
-                serde_json::json!({}),
-                None,
+            rt.execute_job_with_full_features(aegix_wasm_host::runtime::JobRun {
+                wasm_bytes: &bytes,
+                input: serde_json::json!({}),
+                allowed_hosts: vec![],
+                allowed_methods: vec![],
+                secrets: HashMap::new(),
+                max_memory_mb: 128,
+                max_fuel_override: Some(HUGE_FUEL),
+                timeout: JOB_TIMEOUT,
                 // Element 0 is the workflow_executions.id — what an operator
                 // cancels, and what `cancel_registry` keys on.
-                Some((
+                execution_context: Some((
                     execution_id,
                     Uuid::new_v4().to_string(),
                     "oci://loop".to_string(),
                 )),
-                HashMap::new(),
-                None,
-                JOB_TIMEOUT,
-                worker::runtime::RetryPolicy::none(),
-                None,
-                SecurityPolicy::default(),
-                None,            // capability_world_hint — let it inspect
-                Some(HUGE_FUEL), // max_fuel_override
-                false,           // dry_run
-                None,            // actor_id
-                Uuid::nil(),     // user_id
-                LlmTier::Tier2,
-                aegix_workflow_job_protocol::WriteCeiling::Write,
-                None, // http_verb_ceiling — inherit the ceiling above
-                None, // egress_scope
-                None, // llm_usage_out
-                None, // host_diag_out
-                0,    // dispatch_attempt
-                None, // inference_wait (RFC 0014 P2): no controller is timing this call
-                None, // fuel_out: this caller reports no fuel
-            )
+                retry_policy: worker::runtime::RetryPolicy::none(),
+                security_policy: SecurityPolicy::default(),
+                capability_world_hint: None, // capability_world_hint — let it inspect
+                dry_run: false,
+                actor_id: None,
+                user_id: Uuid::nil(),
+                max_llm_tier: LlmTier::Tier2,
+                max_write_ceiling: aegix_workflow_job_protocol::WriteCeiling::Write,
+                http_verb_ceiling: None, // http_verb_ceiling — inherit the ceiling above
+                egress_scope: None,
+                dispatch_attempt: 0,
+                // inference_wait (RFC 0014 P2): no controller is timing this call
+                options: aegix_wasm_host::runtime::JobRunOptions::default(),
+            })
             .await
         })
     };
@@ -786,39 +781,34 @@ async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
 
     let start = std::time::Instant::now();
     let res = rt
-        .execute_job_with_full_features(
-            &bytes,
-            vec![],
-            vec![],
-            128,
-            serde_json::json!({}),
-            None,
-            Some((
+        .execute_job_with_full_features(aegix_wasm_host::runtime::JobRun {
+            wasm_bytes: &bytes,
+            input: serde_json::json!({}),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            secrets: HashMap::new(),
+            max_memory_mb: 128,
+            max_fuel_override: Some(HUGE_FUEL),
+            timeout: JOB_TIMEOUT,
+            execution_context: Some((
                 Uuid::new_v4().to_string(),
                 Uuid::new_v4().to_string(),
                 "oci://loop".to_string(),
             )),
-            HashMap::new(),
-            None,
-            JOB_TIMEOUT,
-            worker::runtime::RetryPolicy::none(),
-            None,
-            SecurityPolicy::default(),
-            None,
-            Some(HUGE_FUEL),
-            false,
-            None,
-            Uuid::nil(),
-            LlmTier::Tier2,
-            aegix_workflow_job_protocol::WriteCeiling::Write,
-            None, // http_verb_ceiling — inherit the ceiling above
-            None,
-            None,
-            None,
-            0,    // dispatch_attempt
-            None, // inference_wait (RFC 0014 P2): no controller is timing this call
-            None, // fuel_out: this caller reports no fuel
-        )
+            retry_policy: worker::runtime::RetryPolicy::none(),
+            security_policy: SecurityPolicy::default(),
+            capability_world_hint: None,
+            dry_run: false,
+            actor_id: None,
+            user_id: Uuid::nil(),
+            max_llm_tier: LlmTier::Tier2,
+            max_write_ceiling: aegix_workflow_job_protocol::WriteCeiling::Write,
+            http_verb_ceiling: None, // http_verb_ceiling — inherit the ceiling above
+            egress_scope: None,
+            dispatch_attempt: 0,
+            // inference_wait (RFC 0014 P2): no controller is timing this call
+            options: aegix_wasm_host::runtime::JobRunOptions::default(),
+        })
         .await;
     let elapsed = start.elapsed();
 
@@ -875,35 +865,32 @@ async fn run_measuring_fuel(
     let rt = AegixRuntime::new().expect("runtime");
     let acc: worker::context::FuelAcc = Arc::new(std::sync::Mutex::new(None));
     let out = rt
-        .execute_job_with_full_features(
-            &build_minimal_component(core_wat),
-            vec![],
-            vec![],
-            128,
-            serde_json::json!({}),
-            None,
-            None,
-            HashMap::new(),
-            None,
-            Duration::from_secs(30),
-            worker::runtime::RetryPolicy::none(),
-            None,
-            SecurityPolicy::default(),
-            None,
-            Some(max_fuel),
-            false,
-            None,
-            uuid::Uuid::nil(),
-            LlmTier::Tier2,
-            aegix_workflow_job_protocol::WriteCeiling::Write,
-            None,
-            None,
-            None,
-            None,
-            0,
-            None,
-            Some(acc.clone()),
-        )
+        .execute_job_with_full_features(aegix_wasm_host::runtime::JobRun {
+            wasm_bytes: &build_minimal_component(core_wat),
+            input: serde_json::json!({}),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            secrets: HashMap::new(),
+            max_memory_mb: 128,
+            max_fuel_override: Some(max_fuel),
+            timeout: Duration::from_secs(30),
+            execution_context: None,
+            retry_policy: worker::runtime::RetryPolicy::none(),
+            security_policy: SecurityPolicy::default(),
+            capability_world_hint: None,
+            dry_run: false,
+            actor_id: None,
+            user_id: uuid::Uuid::nil(),
+            max_llm_tier: LlmTier::Tier2,
+            max_write_ceiling: aegix_workflow_job_protocol::WriteCeiling::Write,
+            http_verb_ceiling: None,
+            egress_scope: None,
+            dispatch_attempt: 0,
+            options: aegix_wasm_host::runtime::JobRunOptions {
+                fuel_out: Some(acc.clone()),
+                ..Default::default()
+            },
+        })
         .await;
     (out, worker::context::take_fuel(&acc))
 }

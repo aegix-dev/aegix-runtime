@@ -4,7 +4,7 @@
 //!
 //! # Why this crate exists
 //!
-//! `aegix_worker_runtime::reason_class` MINTS the tokens, but no controller
+//! `aegix_wasm_host::reason_class` MINTS the tokens, but no controller
 //! crate can depend on it — that would pull wasmtime into the retry path, the
 //! MCP handler tree and the ops-alert reconciler. The established workaround
 //! was a HAND-MIRRORED list plus a pin-by-test
@@ -50,9 +50,9 @@
 pub mod after_host_failure;
 pub mod dispatch;
 
-/// Every token `aegix_worker_runtime::reason_class` can stamp.
+/// Every token `aegix_wasm_host::reason_class` can stamp.
 ///
-/// HAND-MIRRORED from `aegix_worker_runtime::reason_class::ALL`, in the same
+/// HAND-MIRRORED from `aegix_wasm_host::reason_class::ALL`, in the same
 /// order, and pinned by [`closed_set_snapshot`]. The worker's own
 /// `closed_set_snapshot` carries the identical literal list, so a token added
 /// or renamed there fails BOTH tests and the failure message on each side
@@ -313,7 +313,7 @@ mod tests {
 
     /// The mirror, pinned as literals.
     ///
-    /// The twin of `aegix_worker_runtime::reason_class::closed_set_snapshot`,
+    /// The twin of `aegix_wasm_host::reason_class::closed_set_snapshot`,
     /// which carries the identical list. A behavioural test cannot catch a
     /// drift that moved the producer and this mirror together; two independent
     /// literal snapshots can.

@@ -2,39 +2,19 @@
 //! from the job's deadlines and tells the dispatcher (RFC 0014 P2).
 //!
 //! The mechanism is tested where it lives — the ledger and the pausable
-//! deadline in `aegix-worker-runtime`, the gate's reporting on its own
+//! deadline in `aegix-wasm-host`, the gate's reporting on its own
 //! semaphore and through both LLM call sites, the dispatcher's pause in
 //! `aegix-workflow-engine-nats`. What none of those can see is whether
 //! `execute_job` WIRES it: a ledger built and never passed, an outer deadline
 //! left as a plain `tokio::time::timeout`, or a notifier aimed at the unsigned
 //! wire reply header would each compile and pass every other test. So this
-//! reads `main.rs` itself, from its own file for the reason
-//! `retry_policy_pin.rs` gives.
+//! reads the source itself (`job_execution.rs` since 2026-11-18, with
+//! `main.rs`), from its own file for the reason `retry_policy_pin.rs` gives.
 
+/// The worker's job path, production code only: `job_execution.rs` and
+/// `main.rs`, read together (`retry_policy_pin::production_source`).
 fn production_source() -> String {
-    let src = include_str!("main.rs");
-    let mut out = String::new();
-    let mut lines = src.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line == "#[cfg(test)]"
-            && lines
-                .peek()
-                .is_some_and(|next| next.starts_with("mod ") && next.ends_with('{'))
-        {
-            for inner in lines.by_ref() {
-                if inner == "}" {
-                    break;
-                }
-            }
-            continue;
-        }
-        if line.trim_start().starts_with("//") {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
+    crate::retry_policy_pin::production_source()
 }
 
 /// The body of `async fn run_verified_job(` (the part of `execute_job` that

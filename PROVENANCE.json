@@ -1,6 +1,6 @@
 {
   "made_by": "scripts/public-export.py",
-  "source_commit": "d005264b3507c7bb4a8740b160bed735091aee71",
+  "source_commit": "011a8e72303a8686840028cbcfd8edee39bf8bf8",
   "uncommitted_paths": 0,
   "crates": [
     "aegix-audit-event",
@@ -8,7 +8,8 @@
     "aegix-build-info",
     "aegix-capability-world",
     "aegix-compilation",
-    "aegix-config",
+    "aegix-deploy-posture",
+    "aegix-dispatch-types",
     "aegix-dlp-provider",
     "aegix-e2e-probe",
     "aegix-engine-events",
@@ -16,7 +17,6 @@
     "aegix-http-body",
     "aegix-idempotency",
     "aegix-local-inference",
-    "aegix-metrics",
     "aegix-module-source",
     "aegix-nats-tls",
     "aegix-random",
@@ -36,15 +36,13 @@
     "aegix-text-util",
     "aegix-trace",
     "aegix-trace-nats",
+    "aegix-wasm-host",
     "aegix-wit-inspector",
-    "aegix-worker-runtime",
-    "aegix-workflow-engine-core",
     "aegix-workflow-job-protocol",
-    "aegix-workflow-liveness",
     "aegix-zones",
     "aegix_sdk_macros",
     "worker"
   ],
-  "files": 446,
-  "tree_sha256": "552a3cd8b7ec5cb4a95ee4c4d8c41d7456293bb866862d4f58dc23c0be85f629"
+  "files": 405,
+  "tree_sha256": "4b8062ecc0e49d19e515f57e68ae4d6bc5a582b7f3f933e4d5af2b21a52f0286"
 }

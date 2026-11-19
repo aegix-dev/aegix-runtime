@@ -3,7 +3,7 @@
 //!
 //! Three sites ask them: a schedule's zone and the zone its cron's next
 //! occurrence is computed in (`aegix-schedule-spec`), the host call
-//! `local-offset-seconds` of the `datetime` interface (`aegix-worker-runtime`),
+//! `local-offset-seconds` of the `datetime` interface (`aegix-wasm-host`),
 //! and that call's stand-in for a module's tests (`aegix-module-testkit`).
 //! Until 2026-11-17 each parsed a `chrono_tz::Tz` itself, and the rules behind
 //! all three were IANA release 2025b, compiled in by a library that had

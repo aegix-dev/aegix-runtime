@@ -6,7 +6,8 @@ members = [
     "aegix-build-info",
     "aegix-capability-world",
     "aegix-compilation",
-    "aegix-config",
+    "aegix-deploy-posture",
+    "aegix-dispatch-types",
     "aegix-dlp-provider",
     "aegix-e2e-probe",
     "aegix-engine-events",
@@ -14,7 +15,6 @@ members = [
     "aegix-http-body",
     "aegix-idempotency",
     "aegix-local-inference",
-    "aegix-metrics",
     "aegix-module-source",
     "aegix-nats-tls",
     "aegix-random",
@@ -34,11 +34,9 @@ members = [
     "aegix-text-util",
     "aegix-trace",
     "aegix-trace-nats",
+    "aegix-wasm-host",
     "aegix-wit-inspector",
-    "aegix-worker-runtime",
-    "aegix-workflow-engine-core",
     "aegix-workflow-job-protocol",
-    "aegix-workflow-liveness",
     "aegix-zones",
     "aegix_sdk_macros",
     "worker",
@@ -48,7 +46,7 @@ members = [
 # (etc.) in their `[package]` table. Keeping these centralised means a
 # version bump or license-string fix touches one file, not eight.
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -135,9 +133,9 @@ uuid = { version = "1.20", features = ["v4", "serde"] }
 # of compiled modules, which Aegix never configures (the worker keeps its own
 # AOT cache), and it was the only path to zstd (RUSTSEC-2026-0391, -0395..0406,
 # -0410). A crate lists every other default itself.
-wasmtime = { version = "49.0.5", default-features = false }
-wasmtime-wasi = "49.0.5"
-wasmtime-wasi-http = "49.0.5"
+wasmtime = { version = "49.0.6", default-features = false }
+wasmtime-wasi = "49.0.6"
+wasmtime-wasi-http = "49.0.6"
 zeroize = "1.8"
 
 # Workspace-level clippy policy.

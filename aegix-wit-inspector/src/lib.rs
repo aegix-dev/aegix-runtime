@@ -14,53 +14,6 @@ use std::collections::HashSet;
 // Canonical interface names (as encoded in the component binary)
 // ============================================================================
 
-/// All aegix:core interface names that can appear in a component's import section.
-///
-/// Pre-extraction this constant + `scan_talos_imports` were used by the
-/// import-section scanner; the current code path detects worlds via the
-/// type-section walk in `detect_world_from_type_section` and the constant
-/// remains as canonical reference for future scanners. `#[allow(dead_code)]`
-/// to suppress the warning without removing the documentation.
-#[allow(dead_code)]
-const ALL_TALOS_INTERFACES: &[&str] = &[
-    // Minimal tier
-    "aegix:core/logging",
-    "aegix:core/json",
-    "aegix:core/datetime",
-    "aegix:core/crypto",
-    "aegix:core/env",
-    // Network tier
-    "aegix:core/http",
-    "aegix:core/webhook",
-    "aegix:core/graphql",
-    "aegix:core/email",
-    "aegix:core/state",
-    "aegix:core/data-transform",
-    "aegix:core/templates",
-    "aegix:core/events",
-    "aegix:core/http-stream",
-    // Sub-world specific
-    "aegix:core/secrets",
-    "aegix:core/files",
-    "aegix:core/cache",
-    "aegix:core/messaging",
-    "aegix:core/governance",
-    "aegix:core/database",
-    // LLM interfaces (part of secrets-node and above)
-    "aegix:core/llm",
-    "aegix:core/llm-tools",
-    "aegix:core/llm-streaming",
-    "aegix:core/context-window",
-    "aegix:core/resource-quotas",
-    "aegix:core/embedding",
-    // Model inference (RFC 0011) — secrets-node and above, same tier as llm
-    "aegix:core/model",
-    // Advanced (automation-node only)
-    "aegix:core/agent-memory",
-    "aegix:core/agent-orchestration",
-    "aegix:core/object-storage",
-];
-
 /// Interfaces that first appear in the `network-node` world (above minimal).
 const NETWORK_TIER: &[&str] = &[
     "aegix:core/http",
@@ -225,6 +178,27 @@ pub struct ComponentInspection {
     /// unresolved import.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_package_imports: Vec<String>,
+    /// Why the binary could not be read to its end, or `None` for one that
+    /// was. The parser is the one wasmtime reads a component with, so a
+    /// binary it stops in is one wasmtime would not load. What was read
+    /// before the stop is in `imported_interfaces`, the world is `Unknown`,
+    /// and [`link_world`] refuses it whatever its hint: an import list that
+    /// may be short is not one a fit can be decided on (2026-11-18; until
+    /// then a parse error was dropped and the binary read as importing
+    /// less, or nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
+}
+
+/// Why a binary the parser stopped in is refused, or `None` for one read to
+/// its end.
+#[must_use]
+pub fn unreadable_refusal(inspection: &ComponentInspection) -> Option<String> {
+    let why = inspection.unreadable.as_ref()?;
+    Some(format!(
+        "this module's binary could not be read as a WebAssembly component ({why}); \
+         what it imports is not known, so it is not linked at any world."
+    ))
 }
 
 /// What the interface package was called until 2026-11-16. A module compiled
@@ -257,9 +231,10 @@ pub fn former_package_refusal(inspection: &ComponentInspection) -> Option<String
 
 /// Inspect a compiled WASM component and determine its capability world.
 ///
-/// Primary detection: scan raw bytes for `aegix:core/*` interface name strings
-/// embedded in the component's import section.  This is reliable because the
-/// Component Model binary format encodes all import names as UTF-8 strings.
+/// Primary detection: parse the component and read the `aegix:core/*`
+/// names in its import sections. A binary the parser stops in, at a section
+/// or at one import or export, is reported `unreadable` with the world
+/// `Unknown`, never as a binary that imports only what was read so far.
 ///
 /// Fallback detection: if no imports survive (Rust's DCE strips all unused WIT
 /// imports for pure-computation modules), scan for the world-name string that
@@ -274,24 +249,50 @@ pub fn inspect_component(wasm_bytes: &[u8]) -> ComponentInspection {
     let former_prefix = format!("{FORMER_PACKAGE}/");
     let mut imported_wasi_sockets = false;
     let mut is_aegix_node = false;
+    let mut unreadable: Option<String> = None;
 
-    for payload in Parser::new(0).parse_all(wasm_bytes) {
+    'payloads: for payload in Parser::new(0).parse_all(wasm_bytes) {
         match payload {
+            Err(e) => {
+                unreadable = Some(e.message().to_string());
+                break 'payloads;
+            }
             Ok(Payload::ComponentImportSection(s)) => {
-                for import in s.into_iter().flatten() {
-                    let name = import.name.0;
-                    if name.starts_with("aegix:core/") {
-                        imported.insert(name.to_string());
-                    } else if name.starts_with(&former_prefix) {
-                        former.insert(name.to_string());
-                    } else if name.starts_with("wasi:sockets/") {
-                        imported_wasi_sockets = true;
+                for import in s {
+                    let import = match import {
+                        Ok(import) => import,
+                        Err(e) => {
+                            unreadable = Some(e.message().to_string());
+                            break 'payloads;
+                        }
+                    };
+                    // An import may be a label that says which interface it
+                    // `implements`. Both are read as the interface: a label
+                    // must not hide the interface behind it.
+                    for name in [Some(import.name.name), import.name.implements]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if name.starts_with("aegix:core/") {
+                            imported.insert(name.to_string());
+                        } else if name.starts_with(&former_prefix) {
+                            former.insert(name.to_string());
+                        } else if name.starts_with("wasi:sockets/") {
+                            imported_wasi_sockets = true;
+                        }
                     }
                 }
             }
             Ok(Payload::ComponentExportSection(s)) => {
-                for export in s.into_iter().flatten() {
-                    let name = export.name.0;
+                for export in s {
+                    let export = match export {
+                        Ok(export) => export,
+                        Err(e) => {
+                            unreadable = Some(e.message().to_string());
+                            break 'payloads;
+                        }
+                    };
+                    let name = export.name.name;
                     // For pure run functions
                     if name == "run" {
                         is_aegix_node = true;
@@ -304,6 +305,18 @@ pub fn inspect_component(wasm_bytes: &[u8]) -> ComponentInspection {
 
     let mut former_package_imports: Vec<String> = former.into_iter().collect();
     former_package_imports.sort();
+
+    if unreadable.is_some() {
+        let mut interfaces: Vec<String> = imported.into_iter().collect();
+        interfaces.sort();
+        return ComponentInspection {
+            capability_world: CapabilityWorld::Unknown,
+            imported_interfaces: interfaces,
+            is_aegix_node,
+            former_package_imports,
+            unreadable,
+        };
+    }
 
     if !imported.is_empty() || imported_wasi_sockets {
         let mut capability_world = classify_world(&imported, imported_wasi_sockets);
@@ -327,6 +340,7 @@ pub fn inspect_component(wasm_bytes: &[u8]) -> ComponentInspection {
             imported_interfaces: interfaces,
             is_aegix_node,
             former_package_imports,
+            unreadable: None,
         };
     }
 
@@ -338,6 +352,7 @@ pub fn inspect_component(wasm_bytes: &[u8]) -> ComponentInspection {
             imported_interfaces: vec![],
             is_aegix_node,
             former_package_imports,
+            unreadable: None,
         };
     }
 
@@ -346,6 +361,7 @@ pub fn inspect_component(wasm_bytes: &[u8]) -> ComponentInspection {
         imported_interfaces: vec![],
         is_aegix_node,
         former_package_imports,
+        unreadable: None,
     }
 }
 
@@ -368,6 +384,9 @@ pub fn validate_capability_level(
     declared: &CapabilityWorld,
 ) -> Result<(), String> {
     if let Some(why) = former_package_refusal(inspection) {
+        return Err(why);
+    }
+    if let Some(why) = unreadable_refusal(inspection) {
         return Err(why);
     }
     // Unknown components cannot be verified — reject them outright.
@@ -417,6 +436,9 @@ pub fn validate_capability_level(
 /// - No hint (or an `Unknown` hint) links at the inspected world — the legacy
 ///   shape. Every production dispatch now sends a hint; a construction site
 ///   that sends none carries `// no-world-hint: <reason>` (lint check 99).
+/// - A binary the parser could not read to its end is refused, whatever the
+///   hint ([`unreadable_refusal`]). It is not the `Unknown` of the bullet
+///   above: that binary was read whole and names no world.
 /// - A binary that imports from [`FORMER_PACKAGE`] is refused first, whatever
 ///   the hint and whatever it inspects as: its world marker still names a
 ///   world, so without this it would be linked at the hint and fail at
@@ -426,6 +448,9 @@ pub fn link_world(
     inspection: &ComponentInspection,
 ) -> Result<CapabilityWorld, String> {
     if let Some(why) = former_package_refusal(inspection) {
+        return Err(why);
+    }
+    if let Some(why) = unreadable_refusal(inspection) {
         return Err(why);
     }
     match hint {
@@ -579,19 +604,6 @@ fn detect_world_from_type_section(bytes: &[u8]) -> Option<CapabilityWorld> {
         }
     }
     found
-}
-
-/// Scan the binary for known `aegix:core/*` interface name strings.
-/// Reference scanner kept alongside `ALL_TALOS_INTERFACES`; current
-/// detection goes through `detect_world_from_type_section`. `#[allow]`
-/// to suppress the unused warning without removing the documented helper.
-#[allow(dead_code)]
-fn scan_talos_imports(bytes: &[u8]) -> HashSet<String> {
-    ALL_TALOS_INTERFACES
-        .iter()
-        .filter(|&&iface| bytes_contain(bytes, iface.as_bytes()))
-        .map(|&iface| iface.to_string())
-        .collect()
 }
 
 /// Return `true` if `haystack` contains `needle` as a contiguous sub-slice.
@@ -801,10 +813,16 @@ mod tests {
         assert!(CapabilityWorld::Minimal.is_subset_of(&CapabilityWorld::Secrets));
         assert!(CapabilityWorld::Minimal.is_subset_of(&CapabilityWorld::Trusted));
 
-        // Network is a subset of every world above it
-        assert!(CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Secrets));
-        assert!(CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Filesystem));
-        assert!(CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Database));
+        // Http is a subset of every world above it
+        assert!(CapabilityWorld::Http.is_subset_of(&CapabilityWorld::Network));
+        assert!(CapabilityWorld::Http.is_subset_of(&CapabilityWorld::Secrets));
+        assert!(CapabilityWorld::Http.is_subset_of(&CapabilityWorld::Filesystem));
+        assert!(CapabilityWorld::Http.is_subset_of(&CapabilityWorld::Database));
+        // Network holds raw sockets: a subset of Trusted only
+        assert!(!CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Secrets));
+        assert!(!CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Filesystem));
+        assert!(!CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Database));
+        assert!(!CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Agent));
         assert!(CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Trusted));
         assert!(!CapabilityWorld::Network.is_subset_of(&CapabilityWorld::Minimal));
 
@@ -848,6 +866,7 @@ mod tests {
             imported_interfaces: vec!["aegix:core/secrets".to_string()],
             is_aegix_node: true,
             former_package_imports: vec![],
+            unreadable: None,
         };
         // Claiming "minimal" — should fail (secrets > minimal).
         assert!(validate_capability_level(&inspection, &CapabilityWorld::Minimal).is_err());
@@ -870,6 +889,7 @@ mod tests {
             imported_interfaces: vec![],
             is_aegix_node: false,
             former_package_imports: vec![],
+            unreadable: None,
         };
         // Unknown components are rejected regardless of declared level.
         assert!(validate_capability_level(&inspection, &CapabilityWorld::Unknown).is_err());
@@ -884,6 +904,7 @@ mod tests {
             imported_interfaces: interfaces.iter().map(|s| s.to_string()).collect(),
             is_aegix_node: true,
             former_package_imports: vec![],
+            unreadable: None,
         }
     }
 
@@ -1017,6 +1038,108 @@ mod tests {
         assert_eq!(c(&["aegix:core/files", "aegix:core/cache"]), W::Trusted);
         assert_eq!(c(&["aegix:core/object-storage"]), W::Trusted);
         assert_eq!(c(&["aegix:core/not-a-thing"]), W::Trusted);
+    }
+
+    /// A real component with one import, as the tests below cut and damage.
+    fn secrets_component_with_the_minimal_marker() -> Vec<u8> {
+        wat::parse_str(
+            r#"(component
+                 (import "aegix:core/logging" (instance))
+                 (import "aegix:core/secrets" (instance))
+                 (core module
+                   (memory 1)
+                   (data (i32.const 0) "__talos_world_minimal-node__")))"#,
+        )
+        .expect("component")
+    }
+
+    /// Bytes that are not WebAssembly are unreadable, and the world marker
+    /// among them names nothing: until 2026-11-18 the parse error was
+    /// dropped and these bytes inspected as `Minimal`, which a dispatch with
+    /// no hint linked.
+    #[test]
+    fn bytes_that_are_not_wasm_are_unreadable_whatever_marker_they_carry() {
+        let inspection = inspect_component(b"not wasm __talos_world_minimal-node__");
+        assert!(inspection.unreadable.is_some());
+        assert_eq!(inspection.capability_world, CapabilityWorld::Unknown);
+        for hint in [
+            None,
+            Some(&CapabilityWorld::Minimal),
+            Some(&CapabilityWorld::Trusted),
+        ] {
+            let refused = link_world(hint, &inspection).expect_err("refused");
+            assert!(refused.contains("could not be read"), "{refused}");
+        }
+        assert!(validate_capability_level(&inspection, &CapabilityWorld::Trusted).is_err());
+        assert!(inspect_component(b"").unreadable.is_some());
+    }
+
+    /// A component cut anywhere before its end is refused at every hint. Cut
+    /// inside the import section it had read `logging` and not `secrets`,
+    /// and with the minimal marker in the bytes it would have passed as a
+    /// minimal module.
+    #[test]
+    fn a_component_cut_short_is_refused_at_every_cut() {
+        let whole = secrets_component_with_the_minimal_marker();
+        let read = inspect_component(&whole);
+        assert_eq!(read.unreadable, None);
+        assert_eq!(read.capability_world, CapabilityWorld::Secrets);
+        // Past the 8-byte preamble a cut can fall on a section boundary and
+        // leave a shorter component that is whole; those are read, and none
+        // of them may claim less than it holds while naming `secrets`.
+        let mut refused = 0;
+        for cut in 0..whole.len() {
+            let inspection = inspect_component(&whole[..cut]);
+            if inspection.unreadable.is_some() {
+                refused += 1;
+                assert_eq!(inspection.capability_world, CapabilityWorld::Unknown);
+                assert!(link_world(Some(&CapabilityWorld::Minimal), &inspection).is_err());
+                assert!(link_world(None, &inspection).is_err());
+            }
+        }
+        assert!(refused > whole.len() / 2, "{refused} of {}", whole.len());
+    }
+
+    /// One import that does not decode stops the reading: the imports after
+    /// it are not known. Until 2026-11-18 it was skipped and the rest of the
+    /// section with it.
+    #[test]
+    fn an_import_that_does_not_decode_is_unreadable() {
+        let mut bytes = secrets_component_with_the_minimal_marker();
+        let name = b"aegix:core/secrets";
+        let at = bytes
+            .windows(name.len())
+            .position(|w| w == name)
+            .expect("the import's name is in the binary");
+        // The byte before a name's length is its leading byte (0x00); no
+        // name begins with 0x7f.
+        bytes[at - 2] = 0x7f;
+        let inspection = inspect_component(&bytes);
+        assert!(inspection.unreadable.is_some(), "{inspection:?}");
+        assert_eq!(inspection.imported_interfaces, ["aegix:core/logging"]);
+        assert!(link_world(Some(&CapabilityWorld::Minimal), &inspection).is_err());
+    }
+
+    /// An import may be a label that says which interface it implements.
+    /// The interface is read, so a label cannot hide it.
+    #[test]
+    fn an_import_under_a_label_is_read_as_the_interface_it_implements() {
+        let bytes = wat::parse_str(
+            r#"(component
+                 (import "vault" (implements "aegix:core/secrets") (instance))
+                 (core module
+                   (memory 1)
+                   (data (i32.const 0) "__talos_world_minimal-node__")))"#,
+        )
+        .expect("component");
+        let inspection = inspect_component(&bytes);
+        // Either answer refuses a minimal dispatch; what must never happen
+        // is a readable binary that names no `secrets`.
+        if inspection.unreadable.is_none() {
+            assert_eq!(inspection.imported_interfaces, ["aegix:core/secrets"]);
+            assert_eq!(inspection.capability_world, CapabilityWorld::Secrets);
+        }
+        assert!(link_world(Some(&CapabilityWorld::Minimal), &inspection).is_err());
     }
 
     /// On a real component: imports `agent-memory` only, carries the
@@ -1208,16 +1331,53 @@ mod tests {
         assert!(world_imports(&CapabilityWorld::Unknown).is_none());
     }
 
+    /// The ceiling lattice (`CapabilityWorld::is_subset_of`) is held to the
+    /// WIT worlds: where it says `a` is under `b`, every interface `a`
+    /// imports is one `b` imports. A ceiling of `b` admits a module at `a`,
+    /// so an edge the imports do not back would hand out an interface the
+    /// ceiling's own world lacks. The lattice lives in a crate that cannot
+    /// read the WIT file; this is where the two meet.
+    #[test]
+    fn every_lattice_edge_is_backed_by_the_wit_imports() {
+        for a in CapabilityWorld::ALL {
+            let imports_a: Vec<String> = world_imports(a)
+                .expect("a known world has a table")
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            for b in CapabilityWorld::ALL {
+                let fits = imports_outside_world(&imports_a, b).is_empty();
+                if a.is_subset_of(b) {
+                    assert!(fits, "{a} is under {b} but imports more than it");
+                    continue;
+                }
+                // The lattice refuses more than the imports do, in two
+                // stated cases. A third is a decision to record here.
+                let stated = *a == CapabilityWorld::Network // raw sockets, not an import
+                    || (*a == CapabilityWorld::Http && *b == CapabilityWorld::Governance);
+                assert!(
+                    !fits || stated,
+                    "{a} imports nothing outside {b}, and the lattice does not put it under {b}"
+                );
+            }
+        }
+    }
+
     // ── PartialOrd ──────────────────────────────────────────────────────────
 
     #[test]
     fn capability_world_ordering() {
         // Direct subset chains
         assert!(CapabilityWorld::Minimal < CapabilityWorld::Network);
-        assert!(CapabilityWorld::Network < CapabilityWorld::Secrets);
-        assert!(CapabilityWorld::Network < CapabilityWorld::Filesystem);
-        assert!(CapabilityWorld::Network < CapabilityWorld::Cache);
-        assert!(CapabilityWorld::Network < CapabilityWorld::Messaging);
+        assert!(CapabilityWorld::Http < CapabilityWorld::Secrets);
+        assert!(CapabilityWorld::Http < CapabilityWorld::Filesystem);
+        assert!(CapabilityWorld::Http < CapabilityWorld::Cache);
+        assert!(CapabilityWorld::Http < CapabilityWorld::Messaging);
+        // `Network` holds raw sockets: under `Trusted` and nothing else.
+        assert!(CapabilityWorld::Network < CapabilityWorld::Trusted);
+        assert!(CapabilityWorld::Network
+            .partial_cmp(&CapabilityWorld::Secrets)
+            .is_none());
         assert!(CapabilityWorld::Secrets < CapabilityWorld::Database);
         assert!(CapabilityWorld::Database < CapabilityWorld::Trusted);
 

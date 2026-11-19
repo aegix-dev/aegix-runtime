@@ -1,0 +1,4869 @@
+use cap_std::fs::Dir;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use tempfile::TempDir;
+use wasmtime::component::ResourceTable;
+use wasmtime::ResourceLimiter;
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+/// R2 token ledger: shared per-job LLM usage accumulator.
+///
+/// Keyed by `(provider, model)`; value is
+/// `(prompt_tokens, completion_tokens, calls)` with saturating adds. A plain
+/// std `Mutex` (never held across an await) mirrors `stderr_capture`. The
+/// dispatch paths in `main.rs` create one per job, thread it into the
+/// context, and drain it into the signed result via
+/// [`drain_llm_usage_entries`].
+pub type LlmUsageAcc = Arc<std::sync::Mutex<LlmUsage>>;
+
+/// What one job's LLM calls came to.
+///
+/// `totals` is the ledger: per `(provider, model)`, the prompt tokens, the
+/// completion tokens and the number of calls, which is what the signed
+/// result carries. `calls` is the first [`MAX_LLM_CALL_RECORDS`] calls in
+/// the order they were made, each with the reason the provider gave for
+/// stopping; it never leaves the process (an operator's `test_module` run
+/// reads it) and the calls past the bound are counted, not kept.
+#[derive(Debug, Default)]
+pub struct LlmUsage {
+    totals: HashMap<(String, String), (u64, u64, u32)>,
+    calls: Vec<LlmCallRecord>,
+    calls_not_listed: u32,
+}
+
+/// Most calls one job's [`LlmUsage`] lists individually.
+pub const MAX_LLM_CALL_RECORDS: usize = 20;
+
+/// Longest stop reason kept, in characters. It is the provider's text.
+const MAX_STOP_REASON_CHARS: usize = 40;
+
+/// One LLM call, as the provider reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmCallRecord {
+    pub provider: String,
+    pub model: String,
+    /// `None` when the provider reported no usage.
+    pub prompt_tokens: Option<u64>,
+    /// `None` when the provider reported no usage. For a model that reasons
+    /// before it answers this INCLUDES the reasoning: no provider path here
+    /// reports reasoning tokens on their own.
+    pub completion_tokens: Option<u64>,
+    /// The provider's own word for why generation stopped (`stop`,
+    /// `length`, `end_turn`, `max_tokens`, …), passed through unchanged.
+    pub stop_reason: Option<String>,
+    /// Wall-clock time of the call, when the call site measured it.
+    pub duration_ms: Option<u64>,
+}
+
+impl LlmUsage {
+    /// The per-`(provider, model)` totals.
+    #[must_use]
+    pub fn totals(&self) -> &HashMap<(String, String), (u64, u64, u32)> {
+        &self.totals
+    }
+
+    /// The first [`MAX_LLM_CALL_RECORDS`] calls, in order.
+    #[must_use]
+    pub fn calls(&self) -> &[LlmCallRecord] {
+        &self.calls
+    }
+
+    /// Calls made after the list was full.
+    #[must_use]
+    pub fn calls_not_listed(&self) -> u32 {
+        self.calls_not_listed
+    }
+}
+
+/// Record one LLM call: fold its usage into the totals (the rule
+/// [`fold_llm_usage`] has always applied) and keep it in the call list while
+/// there is room.
+pub fn record_llm_call(acc: &LlmUsageAcc, mut call: LlmCallRecord) {
+    if let Some(reason) = call.stop_reason.as_mut() {
+        *reason = reason
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_STOP_REASON_CHARS)
+            .collect();
+    }
+    fold_llm_usage(
+        acc,
+        &call.provider,
+        &call.model,
+        call.prompt_tokens.unwrap_or(0),
+        call.completion_tokens.unwrap_or(0),
+    );
+    if let Ok(mut usage) = acc.lock() {
+        if usage.calls.len() < MAX_LLM_CALL_RECORDS {
+            usage.calls.push(call);
+        } else {
+            usage.calls_not_listed = usage.calls_not_listed.saturating_add(1);
+        }
+    }
+}
+
+/// Per-job fuel accumulator: the fuel every in-worker attempt of a job
+/// consumed, drained into the signed `JobResult::fuel`.
+///
+/// It exists because the other carrier, `__fuel_consumed__` in the output,
+/// can be stamped only into a JSON object and a failed attempt has no output,
+/// so the controller's hourly fuel budget never saw a failed, fuel-exhausted
+/// or non-object attempt. The runtime adds to it at the one point every
+/// attempt's fuel is measured, BEFORE any error return, so a trap, an
+/// out-of-fuel kill or a module error is counted too. `None` = no attempt
+/// was measured (a result-cache hit, or an attempt that never reached the
+/// module).
+pub type FuelAcc = Arc<std::sync::Mutex<Option<aegix_workflow_job_protocol::FuelMeasure>>>;
+
+/// Add one measured attempt to `acc`. Attempts sum; the limit is the latest
+/// attempt's (every attempt of one job runs under the same limit).
+pub fn add_attempt_fuel(acc: &FuelAcc, consumed: u64, limit: u64) {
+    let mut g = acc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = g.map_or(0, |m| m.consumed).saturating_add(consumed);
+    *g = Some(aegix_workflow_job_protocol::FuelMeasure {
+        consumed: total,
+        limit,
+    });
+}
+
+/// Take the accumulated measurement out of `acc`, leaving it empty.
+pub fn take_fuel(acc: &FuelAcc) -> Option<aegix_workflow_job_protocol::FuelMeasure> {
+    acc.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// In-process collector for the `[host:*]` diagnostic lines an execution
+/// emits — the SAME lines [`AegixContext::emit_host_diagnostic`] publishes to
+/// `wasm.log.{execution_id}`.
+///
+/// WHY it exists: the NATS route requires an `execution_id` that names a real
+/// `workflow_executions` / `module_executions` row. The in-process diagnostic
+/// surfaces — `run_sandbox` and `test_module` — deliberately have neither
+/// (they pass `execution_context: None`), so `emit_host_diagnostic`
+/// short-circuits and their host diagnostics go nowhere at all. That is
+/// precisely the surface the diagnostics exist for: a developer iterating on
+/// a module, whose fetch just failed with a bare `networkerror`.
+///
+/// This is a SIDE CHANNEL, not a second log store: nothing persists it, it is
+/// bounded by the same per-execution `HOST_DIAG_CAP`, and it carries the same
+/// already-sanitized strings the NATS entry does — never more. A caller that
+/// supplies no sink gets byte-identical behaviour to before.
+///
+/// Same share-outside-the-Store shape as `stderr_capture`: a plain std
+/// `Mutex` (never held across an await) the caller owns and reads after the
+/// call returns, including on failure — a diagnostic about why a job failed
+/// is worth most when the job failed.
+pub type HostDiagSink = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Fold one LLM call's provider-reported usage into the accumulator.
+/// Saturating arithmetic — a hostile provider reporting `u64::MAX` tokens
+/// shows up as a visible spike, never a wrap. Poisoned-lock is impossible in
+/// practice (no panics while held) but degrades to a silent drop rather than
+/// propagating a panic into the host fn.
+pub fn fold_llm_usage(
+    acc: &LlmUsageAcc,
+    provider: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) {
+    if prompt_tokens == 0 && completion_tokens == 0 {
+        return;
+    }
+    if let Ok(mut usage) = acc.lock() {
+        let slot = usage
+            .totals
+            .entry((provider.to_string(), model.to_string()))
+            .or_insert((0, 0, 0));
+        slot.0 = slot.0.saturating_add(prompt_tokens);
+        slot.1 = slot.1.saturating_add(completion_tokens);
+        slot.2 = slot.2.saturating_add(1);
+    }
+}
+
+/// Drain the accumulator into the wire form for the signed result: sorted by
+/// `(provider, model)` (deterministic), token counts saturated to `u32` (the
+/// wire type; a >4B-token job saturates loudly rather than wrapping), and
+/// truncated to [`aegix_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES`].
+pub fn drain_llm_usage_entries(
+    acc: &LlmUsageAcc,
+) -> Vec<aegix_workflow_job_protocol::LlmUsageEntry> {
+    let mut items: Vec<((String, String), (u64, u64, u32))> = match acc.lock() {
+        Ok(mut usage) => usage.totals.drain().collect(),
+        Err(_) => return Vec::new(),
+    };
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+        .into_iter()
+        .take(aegix_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES)
+        .map(
+            |((provider, model), (p, c, calls))| aegix_workflow_job_protocol::LlmUsageEntry {
+                provider,
+                model,
+                prompt_tokens: u32::try_from(p).unwrap_or(u32::MAX),
+                completion_tokens: u32::try_from(c).unwrap_or(u32::MAX),
+                calls,
+            },
+        )
+        .collect()
+}
+
+/// The execution context for a single Wasm job.
+///
+/// Holds WASI state, resource limits, pre-fetched secrets, workflow metadata,
+/// and optional handles to Redis / NATS / sandboxed file-system.
+pub struct AegixContext {
+    /// WASI state (file descriptors, env vars, etc.)
+    wasi: WasiCtx,
+    /// Resource table needed for the component model.
+    pub(crate) table: ResourceTable,
+    http_ctx: wasmtime_wasi_http::WasiHttpCtx,
+    /// The `wasi:http` send path: the execution's hardened client (SSRF
+    /// resolver, local-only egress, no proxy, no redirects) — never upstream's
+    /// raw connect. Reachable only from the trusted world, whose
+    /// `outgoing-handler` is the gated one (`host::wasi_http`).
+    pub(crate) wasi_http_hooks: crate::host::wasi_http::HardenedWasiHttpHooks,
+
+    /// Allowed outbound hosts for the `http::fetch` host function.
+    /// An empty list means "deny all" (safe default; use `["*"]` to allow any host).
+    pub allowed_hosts: Vec<String>,
+
+    /// Allowed HTTP methods for outbound requests (`http::fetch` and `graphql::execute`).
+    /// Empty = DENY every verb (2026-09-24; `aegix_workflow_job_protocol::method_permitted`,
+    /// matching `allowed_hosts` and `allowed_secrets`). Non-empty = only those permitted.
+    /// Checked after the host allowlist so both restrictions must pass.
+    pub allowed_methods: Vec<String>,
+
+    /// Allowed SQL statement types for the `database::execute_query` host function.
+    /// Empty = allow all statements (backwards-compatible). Non-empty = only those
+    /// statement types permitted (e.g., `["SELECT", "INSERT"]`).
+    /// `SELECT` is always allowed regardless. DDL statements (CREATE, DROP, ALTER,
+    /// TRUNCATE) are always blocked regardless.
+    pub allowed_sql_operations: Vec<String>,
+
+    /// Per-module secret allowlist.  When non-empty, only secrets whose key
+    /// matches an entry in this list (or the wildcard `"*"`) are served by
+    /// `secrets::get-secret`.  An empty list means the module has no secret
+    /// allowlist configured and ALL available secrets are accessible
+    /// (backwards-compatible default).
+    pub allowed_secrets: Vec<String>,
+
+    /// Workflow-scoped environment variables surfaced via the `env` interface.
+    pub env_vars: HashMap<String, String>,
+    pub capability_world: crate::wit_inspector::CapabilityWorld,
+
+    /// Integration this module belongs to, if any. `None` means the module
+    /// is not an integration and `integration-state::*` host functions
+    /// return `unauthorized`. The worker NEVER reads this value from
+    /// guest args — it comes from the JobRequest populated by the engine
+    /// from `wasm_modules.integration_name`, which is set at compile
+    /// time via `compile_custom_sandbox(integration_name: "...")`.
+    /// Scopes every integration_state RPC the module makes.
+    pub integration_name: Option<String>,
+
+    /// Opt-in idempotency key stamped by the engine when the workflow node
+    /// declared `__idempotency_key__`. When `Some`, the HTTP host emits it as an
+    /// `Idempotency-Key` header on MUTATING outbound requests (`fetch` /
+    /// `webhook::send`) so a retried send is deduplicated at the destination
+    /// (the Stripe / industry pattern). Never read from guest args — it comes
+    /// from the (HMAC-bound) `JobRequest.idempotency_key` set by the controller.
+    /// `None` for every non-declaring node → no header is added.
+    pub idempotency_key: Option<String>,
+
+    /// Recorded HTTP answers for a rehearsal. When `Some`, `http::fetch` and
+    /// `fetch_all` are answered from it after every policy gate has run, and
+    /// nothing is sent. Set only from a hand-built `SecurityPolicy` in the
+    /// controller process (see [`crate::http_replay`]).
+    pub http_replay: Option<std::sync::Arc<crate::http_replay::HttpReplay>>,
+
+    /// Keeps the responses a real run receives so they can be replayed later.
+    /// Set only from a hand-built `SecurityPolicy` in the controller process.
+    pub http_capture: Option<std::sync::Arc<crate::http_replay::HttpCapture>>,
+
+    /// A rehearsal against an actor's memory: records the keys the run reads
+    /// and writes, and leaves writes unapplied when asked. Set only from a
+    /// hand-built `SecurityPolicy` in the controller process
+    /// (see [`crate::memory_rehearsal`]).
+    pub memory_rehearsal: Option<std::sync::Arc<crate::memory_rehearsal::MemoryRehearsal>>,
+
+    /// The host call in progress, named by the call itself
+    /// ([`Self::host_call`]); read by the fuel profile's call hook when the
+    /// call returns. One store per host call, whether or not a profile is on.
+    pub(crate) host_call_label: &'static str,
+
+    /// Pluggable secret provider — the single source of truth for all secret resolution.
+    ///
+    /// Backs three-tier secret access:
+    ///   Tier 1: host-side ops (fetch-with-bearer, fetch-with-header, hmac-sign) — no plaintext to guest
+    ///   Tier 2: expose-secret(handle, reason) — explicit, audited, rate-limited plaintext crossing
+    ///   Tier 3: vault:// config injection in HTTP headers — unchanged
+    ///
+    /// SlotHandle values are host-internal (u64) — the WASM guest holds only the integer.
+    pub provider: std::sync::Arc<dyn aegix_secrets::SecretProvider>,
+
+    /// Rate-limit counter for Tier-2 `expose-secret` calls.
+    /// Capped at MAX_EXPOSE_CALLS (10) per execution.
+    pub(crate) expose_call_count: std::sync::atomic::AtomicU64,
+
+    /// Set to true when any Tier-2 `expose-secret` call succeeds.
+    /// The execution trace is marked to indicate explicit secret exposure occurred.
+    pub(crate) secret_tier2_exposed: std::sync::atomic::AtomicBool,
+
+    /// When false, `expose_secret` returns Unauthorized before any plaintext
+    /// crosses the WASM boundary. Default: false (Tier-1-only). Modules must
+    /// opt in via `allow_tier2_exposure: true` in their metadata to receive
+    /// raw secret values.
+    pub allow_tier2_exposure: bool,
+
+    /// Per-user in-memory fallback counter for the Tier-2 `expose_secret`
+    /// daily cap, used when Redis is unavailable or unconfigured.
+    ///
+    /// M-2 (2026-05-22): the prior `Arc<AtomicU64>` was process-wide, so
+    /// one tenant exhausting the counter starved every other tenant on
+    /// that worker until the pod restarted. The current shape isolates
+    /// per `(user_id, date)` and self-resets at the day rollover. Shared
+    /// across all executions via `Arc<ExposeFallback>`.
+    pub global_expose_fallback: std::sync::Arc<crate::expose_fallback::ExposeFallback>,
+
+    /// Workflow ID for tracing / logging.
+    pub workflow_id: Option<String>,
+    /// Execution ID for tracing / logging (also used as NATS log topic suffix).
+    pub execution_id: Option<String>,
+    /// Module ID for permissions and logging.
+    pub module_id: Option<String>,
+    /// User ID for global rate limiting and audit logging.
+    pub user_id: Option<uuid::Uuid>,
+    /// Optional request identifier that ties together controller, worker and logs.
+    pub request_id: Option<String>,
+
+    /// Cancellation token for cooperative cancellation.  When set, host functions
+    /// check this token periodically and abort if revoked.
+    pub cancellation_token: Option<String>,
+
+    /// Whether this execution has been cancelled.  Set to true when the
+    /// cancellation token is detected as revoked.  Checked by host functions.
+    ///
+    /// Wrapped in [`Arc`] so spawned background tasks (e.g. the SSE stream
+    /// reader at `host_impl::wit_http_stream::connect`) can hold a clone
+    /// and bail out promptly when the execution is cancelled —
+    /// `AtomicBool` itself is `!Clone`, so without the `Arc` the only
+    /// way a spawned task could observe cancellation was via mpsc
+    /// receiver-drop, which doesn't fire while the task is blocked
+    /// waiting on slow upstream bytes.
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+
+    /// In-memory key-value store scoped to this workflow execution.
+    pub state_store: Arc<std::sync::Mutex<HashMap<String, String>>>,
+
+    /// Optional Redis client for the `cache` interface.
+    pub redis_client: Option<Arc<redis::Client>>,
+    /// ONE lazily-built `redis::aio::ConnectionManager` shared by every job on
+    /// this runtime (2026-09-10). Until then all nine `wit_cache` host
+    /// functions and the tier-2 `expose_secret` daily counter called
+    /// `get_multiplexed_async_connection()` PER GUEST CALL — a TCP (+TLS+AUTH)
+    /// handshake each time. The cell is cloned from `AegixRuntime` into each
+    /// per-job context (`AegixRuntime::attach_shared_redis`), so the manager
+    /// outlives the job; `AegixContext::new` seeds a private empty cell so the
+    /// ~80 direct constructors in tests keep compiling. See
+    /// [`Self::redis_conn`]. Same shape as `talos-node-cache` / `aegix-rate-limit`.
+    pub redis_conn_mgr: Arc<tokio::sync::OnceCell<redis::aio::ConnectionManager>>,
+    /// Optional NATS client for the `messaging` and `logging` interfaces.
+    pub nats_client: Option<Arc<async_nats::Client>>,
+
+    /// The WORM cryptographic ledger for verifiable audit trails.
+    pub audit_ledger: Option<Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>>,
+
+    /// Ephemeral sandbox directory for the `files` interface.
+    ///
+    /// Every execution gets a fresh, empty temporary directory that is:
+    ///   - Mounted at `/` in the WASI preopened-dirs table so WASM nodes can use
+    ///     standard Rust file I/O (`std::fs`, `std::io`) transparently.
+    ///   - Exposed here as a `cap_std::fs::Dir` for the `aegix:core/files` host
+    ///     functions, which enforce additional path‑sanitisation.
+    ///   - Automatically shredded when this `AegixContext` is dropped (panic,
+    ///     timeout, or normal completion), providing strong isolation between jobs.
+    pub fs_dir: Dir,
+
+    // `db_pool` removed Phase 2.10 — the worker has been credential-
+    // free since the database WIT was routed through NATS-RPC
+    // (Phase 2.3). The field was always None at runtime; deleting
+    // it makes "no Postgres credentials in this binary" structural.
+    /// Stores the human-readable detail of the last database error.
+    /// Populated by execute_query (now via NATS-RPC reply), read by get_last_error.
+    pub last_db_error: String,
+
+    /// Human-readable OOM error message set when memory growth is denied.
+    /// Checked after `call_run` failures to provide a clear diagnostic instead
+    /// of a generic trap message.
+    pub oom_error_message: Option<String>,
+
+    /// Actor ID for persistent memory + state operations. All
+    /// durable data flows through NATS-RPC to the controller; the
+    /// worker no longer holds a DB pool directly. Anonymous
+    /// executions (run_sandbox / test harness) leave this as `None`
+    /// and every write-through path short-circuits to a no-op.
+    pub actor_id: Option<uuid::Uuid>,
+
+    /// LLM data-egress tier ceiling. `Tier1` refuses resolution of
+    /// Anthropic / OpenAI / Gemini vault keys and fails closed with
+    /// a clear error. Default `Tier2` for jobs without actor context
+    /// or from pre-tier workers.
+    pub max_llm_tier: aegix_workflow_job_protocol::LlmTier,
+
+    /// The blanket public-egress SSRF posture this context's HTTP client was
+    /// actually built with — `resolve_local_egress_only(egress_scope,
+    /// max_llm_tier)`, stamped at construction so it can never disagree with
+    /// the [`crate::ssrf_resolver::SsrfFilteringResolver`] inside
+    /// `http_client`.
+    ///
+    /// Read it — never `max_llm_tier == Tier1` — when attributing a connect
+    /// failure to the egress gate. The two diverge in BOTH directions since
+    /// the 2026-07-23 `egress_scope` split:
+    ///
+    /// * `Tier1 + egress_scope=Public` (the house pattern for a Gmail-reading
+    ///   privacy actor) has `local_egress_only = false`: its connect failures
+    ///   are ordinary transport failures and must stay retryable. Attributing
+    ///   them to the egress gate marks them `capability_denied` and vetoes the
+    ///   very retries this change exists to restore.
+    /// * `Tier2 + egress_scope=Local` has `local_egress_only = true`: its
+    ///   connect failures ARE the egress gate and must not be retried.
+    pub(crate) local_egress_only: bool,
+
+    /// The two dev-only egress opt-ins this execution runs under, read from
+    /// the process environment ONCE, in [`Self::new`], and held here. Every
+    /// gate that consults either one reads this field, and the
+    /// [`crate::ssrf_resolver::SsrfFilteringResolver`] inside `http_client`
+    /// was built from the same value, so the pre-checks and the connect-time
+    /// filter cannot disagree about one execution. Read-only outside the
+    /// crate ([`Self::dev_egress`]): no caller can widen an execution's
+    /// egress by assigning to it.
+    pub(crate) dev_egress: DevEgressOptIns,
+
+    /// Whether an LLM provider key may come from the worker process
+    /// environment (E-5): refused in production without the opt-in. Read once,
+    /// in [`Self::new`]; see [`EnvProviderKeys`].
+    pub(crate) env_provider_keys: EnvProviderKeys,
+
+    /// Per-actor write ceiling — the mutation-permission gate. `ReadOnly`
+    /// refuses every data-mutating host op (agent-memory writes, non-GET
+    /// HTTP, DB execute, webhook/email/messaging sends, object-storage
+    /// puts/deletes, integration-state writes) when enforcement is on.
+    /// Default `Write` for jobs without actor context or from pre-ceiling
+    /// workers. Enforcement is gated on [`write_ceiling_enforced`] so the
+    /// signed field stays inert until an operator opts in.
+    pub max_write_ceiling: aegix_workflow_job_protocol::WriteCeiling,
+
+    /// Per-actor override for the VERB-INFERRED half of the write ceiling.
+    ///
+    /// `None` = inherit [`Self::max_write_ceiling`], byte-identical to the
+    /// pre-2026-09-24 behaviour. Only the three gates that INFER "is this a
+    /// mutation?" from the HTTP verb consult it — `http::fetch`,
+    /// `http::fetch_all` and `graphql::execute`. The twelve categorical gates
+    /// (`agent-memory-set`, `email-send`, `messaging-publish`,
+    /// `database-query`, …) read `max_write_ceiling` alone, because there is
+    /// no inference there for an override to correct.
+    ///
+    /// Set post-construction beside `max_write_ceiling` (see
+    /// `AegixRuntime::execute_job_*`), not through `new` — the constructor
+    /// already takes twelve parameters and thirty-four call sites.
+    pub http_verb_ceiling: Option<aegix_workflow_job_protocol::WriteCeiling>,
+
+    /// Keeps the ephemeral `TempDir` alive until this context is dropped.
+    /// Dropping `_ephemeral_dir` removes the directory from the file system.
+    _ephemeral_dir: TempDir,
+
+    /// Maximum memory allowed for this execution (bytes) — the TOTAL across
+    /// every linear memory in the store, not per memory.
+    pub max_memory_bytes: usize,
+    /// Linear-memory bytes committed so far across ALL memories in this
+    /// store (see `memory_growth_admitted`).
+    pub(crate) committed_memory_bytes: usize,
+
+    /// Remaining crypto compute budget in microseconds.
+    /// Shared across all `hash()` and `hmac()` calls in this execution.
+    /// Default: 5 seconds (5_000_000 us). When exhausted, crypto calls return empty.
+    pub(crate) crypto_budget_us: AtomicU64,
+
+    /// In-memory quota tracking for this execution.
+    /// Each entry maps a metric name to (used, limit).
+    pub(crate) quota_usage: std::sync::Mutex<HashMap<String, (u64, u64)>>,
+
+    // ── Field-grouping status (B1, 2026-07) ──────────────────────────────
+    // The active-stream receivers were grouped into `StreamRegistry`
+    // (`self.streams`), and every host-internal per-execution counter /
+    // budget below was narrowed `pub` → `pub(crate)` (the WASM guest never
+    // touches them — it drives everything through WIT host functions).
+    //
+    // DEFERRED (left flat, on purpose): the per-execution rate-limit
+    // counters were NOT collapsed into a single `RateLimitCounters`
+    // sub-struct because each is a distinct budget passed by-reference into
+    // `check_rate_limit(&self.<counter>, MAX_*)` from a different host
+    // file, and re-nesting them buys little while touching ~13 sites across
+    // ~10 files. The `ExecutionIdentity` cluster (`actor_id` /
+    // `execution_id` / `max_llm_tier`, ~60 call sites, `max_llm_tier` read
+    // by integration tests) was also left flat — regrouping it is a large,
+    // higher-risk mechanical churn out of scope for a behaviour-preserving
+    // pass. Both remain clean single-field accesses; group them later only
+    // if a new consumer makes it worthwhile.
+    /// Per-execution call counters for rate-limited host functions.
+    /// Each counter tracks calls within the current execution.
+    pub(crate) http_call_count: AtomicU64,
+    /// M-6: per-host HTTP counter. The global `http_call_count` caps
+    /// total fetches at `MAX_HTTP_CALLS_PER_EXECUTION` (1000); without
+    /// a per-host cap, a single guest can issue all 1000 calls to one
+    /// upstream and turn the worker into a third-party DoS
+    /// amplification primitive. The per-host limit
+    /// (`MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION` in host_impl.rs)
+    /// stacks on top of the global cap. Host strings are lowercased
+    /// at insertion so `Example.com` and `example.com` share a slot.
+    /// `DashMap` chosen for lock-free updates on the hot path —
+    /// `Mutex<HashMap>` would serialize every HTTP call.
+    pub(crate) http_calls_per_host: dashmap::DashMap<String, u64>,
+    pub(crate) db_query_count: AtomicU64,
+    pub(crate) messaging_publish_count: AtomicU64,
+    /// Per-execution `cache` host-fn call count (`MAX_CACHE_CALLS_PER_EXECUTION`).
+    pub(crate) cache_call_count: AtomicU64,
+    /// Per-execution `cache` write bytes (`MAX_CACHE_WRITE_BYTES_PER_EXECUTION`).
+    pub(crate) cache_write_bytes: AtomicU64,
+    /// RFC 0011 P2c: per-execution count of `model::predict*` INPUTS
+    /// (a batch of N counts N — each input costs the controller one
+    /// local embed + one ANN query). Capped at
+    /// `MAX_MODEL_PREDICT_INPUTS_PER_EXECUTION` in host/limits.rs.
+    pub(crate) model_predict_input_count: AtomicU64,
+    /// `model::few-shot` calls made by this execution — see
+    /// `MAX_MODEL_FEWSHOT_CALLS_PER_EXECUTION` in host/limits.rs.
+    pub(crate) model_fewshot_call_count: AtomicU64,
+    /// MCP-523: per-execution email-send count. Pre-fix `wit_email::send`
+    /// had no rate limit — see `MAX_EMAIL_SENDS_PER_EXECUTION` in
+    /// `host_impl.rs`.
+    pub(crate) email_send_count: AtomicU64,
+    /// MCP-537: per-execution webhook-send count. Pre-fix `wit_webhook::send`
+    /// had no rate limit — a WASM module could fire arbitrarily many
+    /// outbound POSTs (each up to 1 + max_retries actual requests).
+    /// See `MAX_WEBHOOK_SENDS_PER_EXECUTION` in `host_impl.rs`.
+    pub(crate) webhook_send_count: AtomicU64,
+    /// MCP-537: per-execution GraphQL-query count. Same gap as
+    /// `wit_webhook::send` — `wit_graphql::execute` and
+    /// `execute_with_retry` had no per-execution cap.
+    pub(crate) graphql_query_count: AtomicU64,
+    /// MCP-588: per-execution `wit_secrets::get_secret` count. Pre-fix
+    /// guest-initiated secret access had no rate limit — a module could
+    /// loop `get_secret` thousands of times within its fuel budget,
+    /// each call appending to the local audit ledger AND publishing to
+    /// `talos.audit.ledger` over NATS. The audit-pipeline DoS is the
+    /// concern (one execution flooding many MB of audit traffic), not
+    /// the secret values themselves (host-side allowlist is intact).
+    /// Host-initiated resolutions (`resolve_vault_header` from http /
+    /// graphql / webhook headers) are bounded by their parent surface's
+    /// per-execution cap, but the direct `get_secret` path was the
+    /// straggler.
+    pub(crate) secret_access_count: AtomicU64,
+
+    /// Cumulative bytes written to the sandbox filesystem in this execution.
+    pub(crate) fs_bytes_written: AtomicU64,
+
+    /// Number of log messages emitted in this execution.
+    pub(crate) log_message_count: AtomicU64,
+
+    /// Guest log bytes relayed this execution, against
+    /// [`crate::host::MAX_LOG_BYTES_PER_EXECUTION`] (E-12).
+    pub(crate) log_bytes: AtomicU64,
+
+    /// Host-diagnostic entries published into the per-execution log
+    /// stream this execution (see [`Self::emit_host_diagnostic`]).
+    /// Separate counter from `log_message_count` so guest log spam
+    /// can't starve host diagnostics out of the quota, and a burst of
+    /// host denials can't consume the guest's log budget.
+    pub(crate) host_diag_count: AtomicU64,
+
+    /// Policy denials appended to the audit ledger (and replicated over NATS)
+    /// this execution. See [`Self::DENIAL_LEDGER_CAP`].
+    pub(crate) denial_ledger_count: AtomicU64,
+
+    /// Distinct `(surface, key hash, destination)` credential uses already
+    /// written to the audit ledger this execution, so a module that sends the
+    /// same token to the same host in a loop records ONE `wasi:secret_use`, not
+    /// one per request. See [`Self::record_secret_use`].
+    pub(crate) secret_use_recorded: std::collections::HashSet<String>,
+
+    /// The [`crate::reason_class`] token of the most recent host-side HTTP
+    /// OUTCOME in this execution, or `None` if the most recent outcome was a
+    /// success (or there has been none).
+    ///
+    /// This is what makes the opaque `networkerror` cause visible to the retry
+    /// gates: [`crate::runtime`] reads it after the guest returns and appends
+    /// `[reason_class=<token>]` to the node-failure message.
+    ///
+    /// **Set on failure, CLEARED on success** — deliberately. A "last failure
+    /// seen anywhere in this execution" latch would attribute a stale DNS blip
+    /// to a module that later failed on, say, a 401, and both classifiers
+    /// would then wrongly retry a permanent error. Clearing on success narrows
+    /// the claim to exactly what the code knows: *the last HTTP call this
+    /// module made failed host-side, with this class*.
+    ///
+    /// The latch holds a [`crate::reason_class::Reason`] — the class token
+    /// PAIRED with the WIT discriminant that class is allowed to explain — not
+    /// a bare token. The pairing is what bounds a stale latch: see
+    /// [`crate::runtime::last_network_reason_suffix`]. Before it, the bound
+    /// was a hardcoded "the guest error must say `networkerror`", which
+    /// covered exactly one of the enum's four values and silently excluded
+    /// every `invalidurl` / `forbiddenhost` policy denial from ever being
+    /// explained.
+    ///
+    /// `Arc<Mutex<…>>` because `runtime` must keep a handle after the
+    /// `AegixContext` is moved into the wasmtime `Store` (same shape as
+    /// `stderr_capture`). `&'static str` fields because the token set is
+    /// closed.
+    pub(crate) last_network_reason: Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>>,
+
+    /// Whether the module has made a host call since
+    /// [`Self::last_network_reason`] was last latched with a failure.
+    ///
+    /// `false` means the failed HTTP call is the LAST thing the module did
+    /// with the outside world before it returned. That is the one case in which
+    /// the runtime may attach the weak `[after_host_failure=…]` marker to an
+    /// error whose text does not name the failure
+    /// (`crate::runtime::host_failure_suffix`). A module that swallowed a
+    /// failed fetch, read memory or called a model, and then failed has
+    /// acted since, and gets no marker.
+    ///
+    /// Set in [`Self::host_call`], the one hook every host function calls
+    /// first; logging and the pure helpers do not set it
+    /// ([`Self::is_passive_host_call`]), because a module that logs the
+    /// failure it is about to return has not done anything else.
+    pub(crate) acted_since_network_failure: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Per-execution event emission counter for the events interface.
+    pub(crate) event_emit_count: AtomicU64,
+
+    /// Host-internal registry of active LLM / SSE stream receivers for
+    /// this execution. Grouped (was two loose `llm_streams` /
+    /// `sse_streams` fields) — the guest only ever holds an opaque
+    /// `stream_id` string, so this is `pub(crate)`.
+    pub(crate) streams: StreamRegistry,
+
+    /// L-finding-7 (2026-05-23): per-host CUMULATIVE SSE connect
+    /// counter — sibling to `http_calls_per_host` (M-6). The global
+    /// `MAX_SSE_STREAMS_PER_EXECUTION` (5) caps total concurrent
+    /// streams per execution, but pre-fix all 5 could be opened
+    /// against ONE upstream, turning the worker into a small-but-real
+    /// amplification primitive (each stream stays open for the
+    /// execution timeout and the worker holds a connection slot
+    /// against the target). Tracking CUMULATIVE connects (not
+    /// "currently open") matches the existing http_calls_per_host
+    /// semantics: a guest that opens/closes/reopens a stream against
+    /// the same host still consumes the budget. The host key is
+    /// `host:port` lowercased — same normalisation as
+    /// `http_calls_per_host` so the matcher (`per_host_check_and_bump`)
+    /// stays shared. Cap value lives in `host_impl.rs` as
+    /// `MAX_SSE_CONNECTS_PER_HOST_PER_EXECUTION`.
+    pub(crate) sse_connects_per_host: dashmap::DashMap<String, u64>,
+
+    /// Shared HTTP client for all outbound requests in this execution.
+    ///
+    /// Built once per execution with security defaults (no redirects, user-agent).
+    /// Reused across `fetch`, `fetch_all`, `graphql`, `webhook`, `email`, `llm`,
+    /// and `object_storage` calls to enable TCP/TLS connection reuse via the
+    /// internal connection pool. Per-call timeouts are set on the request builder,
+    /// not the client.
+    pub http_client: reqwest::Client,
+
+    /// S3-compatible endpoint URL (e.g., "http://minio:9000" or "https://s3.amazonaws.com").
+    /// Configured via S3_ENDPOINT env var or secrets.
+    pub s3_endpoint: Option<String>,
+    /// S3 access key ID.
+    pub s3_access_key: Option<String>,
+    /// S3 secret access key.
+    pub s3_secret_key: Option<String>,
+    /// S3 region (default: "us-east-1").
+    pub s3_region: Option<String>,
+
+    /// Optional OpenTelemetry runtime metrics handle.
+    /// Set from the runtime after construction so host functions can record
+    /// rate-limit, approval, LLM, cancellation, and quota metrics.
+    pub metrics: Option<Arc<crate::metrics::RuntimeMetrics>>,
+
+    /// Captures bytes written to WASI stderr during execution (panic messages, etc.).
+    /// Shared with the WasiCtx via a clone; readable from outside the Store after execution.
+    pub stderr_capture: Arc<std::sync::Mutex<Vec<u8>>>,
+
+    /// R2 token ledger: per-job LLM token usage accumulator, keyed by
+    /// `(provider, model)`. The `llm` / `llm-tools` / `llm-streaming` host
+    /// fns fold each provider-reported usage into this map; the job runner
+    /// drains it into the SIGNED `JobResult.llm_usage` (workers are DB-free — the signed
+    /// result is the only path usage takes to the controller). Same
+    /// share-outside-the-Store pattern as `stderr_capture`: the dispatch
+    /// paths in `main.rs` pass their own Arc in so usage survives job
+    /// timeout/failure (tokens spent before a trap are still spent).
+    pub llm_usage: LlmUsageAcc,
+
+    /// Optional in-process mirror of this execution's `[host:*]` diagnostic
+    /// lines. See [`HostDiagSink`]. `None` (the default) for every dispatch
+    /// path that has a real execution id and therefore a working NATS route.
+    pub host_diag_sink: Option<HostDiagSink>,
+
+    /// RFC 0014 P2: this job's waiting-for-the-local-inference-slot account.
+    /// The local-LLM gate records waits here; the job's wall-clock deadlines
+    /// (outer job timeout, inner `call_async` timeout, epoch wall-clock bound)
+    /// stand still while one is open. `None` (the default) for every caller
+    /// with no controller waiting on it, whose deadlines stay fixed.
+    pub inference_wait: Option<Arc<crate::inference_wait::InferenceWaitLedger>>,
+
+    /// When true, non-GET HTTP requests, webhook sends, and messaging publishes
+    /// are mocked with success responses instead of executing real network calls.
+    /// GET requests still execute normally for data fetching.
+    pub dry_run: bool,
+
+    /// The POSTs the module declared to be reads, as `<host><path>` entries.
+    /// Read only when `dry_run` is set: `fetch` and `fetch-all` send a POST an
+    /// entry names where they would have stubbed it. It admits nothing: the
+    /// request has already passed `allowed_hosts`, and still meets
+    /// `allowed_methods` and the write ceiling on its way out.
+    pub read_only_posts: Arc<Vec<String>>,
+
+    /// The calls this execution answered with a dry-run stub, by host
+    /// surface. Every stub site records here; the runtime stamps the count
+    /// onto the module's output (`crate::dry_run`).
+    pub dry_run_ledger: crate::dry_run::DryRunLedger,
+}
+
+/// The sandbox's bytes go back to the process-wide budget when the context —
+/// and with it the execution's tempdir — goes (security review 2026-10-14,
+/// E-8).
+impl Drop for AegixContext {
+    fn drop(&mut self) {
+        crate::host::limits::release_process_fs_bytes(
+            self.fs_bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+}
+
+impl WasiView for AegixContext {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
+
+struct MpscWriter {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl AsyncWrite for MpscWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let _ = self.sender.try_send(buf.to_vec());
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Clone)]
+struct ChannelStdout {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl IsTerminal for ChannelStdout {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for ChannelStdout {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(MpscWriter {
+            sender: self.sender.clone(),
+        })
+    }
+}
+
+/// L-5 (2026-05-22): null sink for WASI stdout when no `token_sender`
+/// channel is wired. Pre-fix the worker called `builder.inherit_stdout()`,
+/// which routed guest stdout to the worker process's own stdout. A
+/// per-Store dropped after execution bounds the cross-job confidentiality
+/// risk, but inherited stdout mingled guest output with worker logs and
+/// could fill operator log volumes from a chatty (or hostile) module.
+/// The null sink discards all writes — the WASI guest sees a successful
+/// write so it doesn't burn fuel on retry. Pair with an explicit
+/// `token_sender` channel if the operator wants stdout captured.
+#[derive(Clone, Copy, Default)]
+struct NullStdout;
+
+impl IsTerminal for NullStdout {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for NullStdout {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(NullWriter)
+    }
+}
+
+struct NullWriter;
+
+impl AsyncWrite for NullWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Captures WASI stderr writes (e.g. panic messages) into an in-process buffer.
+/// The Arc<Mutex<Vec<u8>>> is shared between the WasiCtx and the outer runtime
+/// so that panic text can be read after the Store is consumed.
+struct BufferWriter {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+/// MCP-593: per-execution cap on WASI stderr capture. Pre-fix the
+/// BufferWriter's `extend_from_slice` was unbounded — a malicious or
+/// buggy WASM module writing multi-GB to stderr (WASI stderr flows
+/// to the host buffer, NOT the WASM-bounded heap) would OOM the
+/// worker. The only legitimate consumer of this buffer is
+/// `extract_panic_message_from_stderr` (runtime.rs:163), which
+/// reads the first ~hundred bytes of a Rust panic header. 64 KiB
+/// is generous (covers verbose panics with backtraces) and bounds
+/// the host-side allocation cost per execution.
+const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+
+impl AsyncWrite for BufferWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // Marker stamped into the buffer the first time we drop tail
+        // bytes, so an operator reading the captured stderr can tell
+        // truncation apart from genuine module output ending. Without
+        // this, a malicious module could fill the buffer with forged
+        // "verified by" lines to displace real diagnostic output and
+        // the silent truncation would leave no trace.
+        const TRUNCATION_MARKER: &[u8] =
+            b"\n[stderr truncated by host at MAX_STDERR_CAPTURE_BYTES]\n";
+        if let Ok(mut guard) = self.buffer.lock() {
+            // MCP-593: cap host-side allocation. Returning `buf.len()`
+            // even when we silently drop the tail keeps the WASM guest
+            // believing the write succeeded (so it doesn't get stuck
+            // looping retries on a "short write" — that would just
+            // burn fuel without making progress); the panic-extraction
+            // path only needs the first few hundred bytes anyway.
+            let remaining = MAX_STDERR_CAPTURE_BYTES.saturating_sub(guard.len());
+            if remaining > 0 {
+                let take = buf.len().min(remaining);
+                guard.extend_from_slice(&buf[..take]);
+                // If this write filled the buffer AND there were more
+                // bytes the guest tried to emit, append the truncation
+                // marker once (overwriting the last bytes if needed so
+                // total length stays at MAX_STDERR_CAPTURE_BYTES + marker).
+                if take < buf.len() {
+                    // Reserve marker space at the tail by trimming if
+                    // necessary. This ensures the marker is always at
+                    // the END so it's easy to grep for.
+                    let target_len =
+                        MAX_STDERR_CAPTURE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+                    if guard.len() > target_len {
+                        guard.truncate(target_len);
+                    }
+                    guard.extend_from_slice(TRUNCATION_MARKER);
+                }
+            }
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Clone)]
+struct BufferCapture {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl IsTerminal for BufferCapture {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for BufferCapture {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(BufferWriter {
+            buffer: self.buffer.clone(),
+        })
+    }
+}
+
+/// Parsed SSE event for the http-stream interface.
+pub struct SseEventInternal {
+    pub event_type: Option<String>,
+    pub data: String,
+    pub id: Option<String>,
+    /// This event's share of its stream's buffered-bytes budget
+    /// (`MAX_SSE_BUFFERED_BYTES_PER_STREAM`), held from the moment the reader
+    /// queues it until the guest receives it. `None` for an event not queued
+    /// by the reader (tests plant events directly).
+    pub(crate) buffered: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl SseEventInternal {
+    /// Bytes this event holds while queued.
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.data.len()
+            + self.event_type.as_ref().map_or(0, String::len)
+            + self.id.as_ref().map_or(0, String::len)
+    }
+}
+
+/// Why the spawned SSE body-reader stopped feeding its channel ABNORMALLY.
+///
+/// The `http-stream` WIT spells `next-event` as `-> option<sse-event>`, which
+/// has no error arm, and widening it would break the checked-in `bindings.rs`
+/// of every catalog template — so a mid-stream failure CANNOT reach the guest
+/// without an ABI break. What it can reach is the OPERATOR: the reader sends
+/// one of these as the final item on the existing channel and
+/// [`AegixContext::report_stream_end`] turns it into one
+/// `[host:<reason>]` diagnostic on the execution log stream.
+///
+/// A clean upstream close sends NOTHING — the task simply drops the sender —
+/// so the diagnostic fires only when the stream ended for a reason the guest
+/// would otherwise read as "the endpoint had nothing to say". Exactly one
+/// item can follow the last event, so this costs at most one
+/// `HOST_DIAG_CAP` slot per stream and at most
+/// `MAX_SSE_STREAMS_PER_EXECUTION` per execution.
+///
+/// Deliberately carries NO error text. The raw `reqwest` string is logged —
+/// sanitized, worker-log only — at the site that owns it; nothing derived
+/// from it crosses into a channel a guest-visible surface reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SseStreamEnd {
+    /// The response body failed mid-stream (reset, TLS alert, decode error).
+    /// The ONLY one of these that logged nothing anywhere before 2026-09.
+    TransportError,
+    /// An Aegix byte cap tripped: either the un-newlined receive buffer or the
+    /// accumulated `data:` payload exceeded `AEGIX_SSE_MAX_EVENT_BYTES`.
+    EventBytesCap,
+    /// The execution was cancelled while the stream was open.
+    Cancelled,
+    /// No bytes arrived within `AEGIX_SSE_IDLE_TIMEOUT_SECS`
+    /// (`SSE_STREAM_IDLE_TIMEOUT_SECS` default).
+    IdleTimeout,
+}
+
+impl SseStreamEnd {
+    /// `(reason-tag, operator-facing prose)`.
+    ///
+    /// Both halves are FIXED strings — see the sanitization contract on
+    /// [`AegixContext::emit_host_diagnostic`]. The tag is the `[host:<tag>]`
+    /// marker; it is deliberately NOT a [`crate::reason_class`] token,
+    /// because nothing is returned to the guest here for a class to explain
+    /// and a latch with no paired discriminant is exactly the stale-marker
+    /// hazard the pairing rule exists to prevent.
+    pub(crate) const fn describe(self) -> (&'static str, &'static str) {
+        match self {
+            Self::TransportError => (
+                "sse-stream-transport-error",
+                "the SSE stream ended because the connection failed mid-stream, \
+                 not because the endpoint finished sending. Events already \
+                 delivered are complete; the rest of the stream was lost.",
+            ),
+            Self::EventBytesCap => (
+                "sse-event-bytes-cap",
+                "the SSE stream was aborted because a single event exceeded \
+                 AEGIX_SSE_MAX_EVENT_BYTES. Raise that limit or ask the \
+                 endpoint for smaller events.",
+            ),
+            Self::Cancelled => (
+                "sse-stream-cancelled",
+                "the SSE stream was closed because the execution was cancelled.",
+            ),
+            Self::IdleTimeout => (
+                "sse-stream-idle-timeout",
+                "the SSE stream was closed because the endpoint sent nothing for longer \
+                 than the idle window (AEGIX_SSE_IDLE_TIMEOUT_SECS). Events already \
+                 delivered are complete; ask the endpoint for keep-alive comments or \
+                 raise the window.",
+            ),
+        }
+    }
+}
+
+/// What travels on an SSE stream's channel: the events, then at most one
+/// terminal [`SseStreamEnd`] marker. See that type for why the marker exists.
+pub(crate) enum SseChannelItem {
+    Event(SseEventInternal),
+    End(SseStreamEnd),
+}
+
+/// Host-internal registry of active streaming receivers for one execution.
+///
+/// Groups the two per-execution stream maps that were previously loose
+/// `AegixContext` fields. Both are host-side plumbing — the WASM guest
+/// only ever holds an opaque string `stream_id` and drives the streams
+/// through the `llm-streaming` / `http-stream` WIT host functions, so
+/// these are `pub(crate)` (the guest never accesses them directly).
+///
+/// Behaviour is unchanged from the flat fields: each map is an
+/// independent `Mutex<HashMap<..>>` keyed by stream id, and the two
+/// budgets (`MAX_LLM_STREAMS_PER_EXECUTION` /
+/// `MAX_SSE_STREAMS_PER_EXECUTION`) stay separate. The per-host
+/// CUMULATIVE connect budget (`sse_connects_per_host`) is intentionally
+/// NOT here — it pairs with `http_calls_per_host` as a rate-limit
+/// counter, not with the active-stream registry.
+pub struct StreamRegistry {
+    /// Active LLM streams indexed by stream ID. Each holds a receiver
+    /// channel for SSE events stored as JSON values.
+    pub(crate) llm:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<serde_json::Value>>>,
+    /// Active HTTP SSE streams indexed by stream ID. Each holds a
+    /// receiver for parsed SSE events (`None` = stream ended).
+    pub(crate) sse: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<SseChannelItem>>>,
+    /// The spawned SSE reader task behind each entry of `sse`, keyed by the
+    /// same stream id. Held so the task can be ABORTED — on `close`, and on
+    /// registry drop (= execution end). Until 2026-09 the handle was
+    /// discarded: nothing set `cancelled` on a NORMAL completion, so a reader
+    /// blocked on a quiet upstream outlived its job for as long as the
+    /// upstream kept the connection open, holding a worker connection slot
+    /// and a tokio task with no owner.
+    pub(crate) sse_tasks: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+}
+
+impl StreamRegistry {
+    fn new() -> Self {
+        Self {
+            llm: std::sync::Mutex::new(HashMap::new()),
+            sse: std::sync::Mutex::new(HashMap::new()),
+            sse_tasks: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record the reader task for `stream_id`.
+    pub(crate) fn register_sse_task(&self, stream_id: &str, handle: tokio::task::JoinHandle<()>) {
+        if let Ok(mut tasks) = self.sse_tasks.lock() {
+            tasks.insert(stream_id.to_string(), handle);
+        }
+    }
+
+    /// Abort and forget the reader task for `stream_id` (no-op if it already
+    /// finished — aborting a completed task is harmless).
+    pub(crate) fn abort_sse_task(&self, stream_id: &str) {
+        if let Ok(mut tasks) = self.sse_tasks.lock() {
+            if let Some(h) = tasks.remove(stream_id) {
+                h.abort();
+            }
+        }
+    }
+
+    /// Number of reader tasks currently held (test/introspection).
+    #[cfg(test)]
+    pub(crate) fn sse_task_count(&self) -> usize {
+        self.sse_tasks.lock().map(|t| t.len()).unwrap_or(0)
+    }
+}
+
+impl Drop for StreamRegistry {
+    /// The execution is over (the `Store` owning this `AegixContext` is being
+    /// dropped): every SSE reader still running is aborted so no task outlives
+    /// its job. `is_poisoned`-safe — a poisoned mutex still yields its data.
+    fn drop(&mut self) {
+        let tasks = match self.sse_tasks.lock() {
+            Ok(t) => t,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for h in tasks.values() {
+            h.abort();
+        }
+    }
+}
+
+/// The two dev-only egress opt-ins, as ONE execution sees them.
+///
+/// Both are process-wide operator settings (environment variables). They are
+/// read once per execution, when [`AegixContext::new`] builds the context, and
+/// carried on it from there: the host-function pre-checks read
+/// `AegixContext::dev_egress`, and the connect-time
+/// [`crate::ssrf_resolver::SsrfFilteringResolver`] is constructed with the
+/// same `private_host_targets` value. Until 2026-10-06 each gate read the
+/// environment itself, per call, which left a unit test no way to choose the
+/// setting except by mutating the process environment — and under plain
+/// `cargo test` (one process, many threads) a test that opted in changed the
+/// verdict of an egress-refusal test running beside it.
+///
+/// `Default` is both opt-ins off: the production posture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DevEgressOptIns {
+    /// `WORKER_ALLOW_PRIVATE_HOST_TARGETS`, with the enforcing-profile
+    /// refusal already applied ([`crate::host::allow_private_host_targets`]): a
+    /// hostname named EXPLICITLY in `allowed_hosts` may resolve to a private
+    /// address. Never widens a `*` allowlist or an IP literal.
+    pub private_host_targets: bool,
+    /// `WASM_ALLOW_INSECURE_HTTP`, with the same refusal applied: plaintext
+    /// `http://` is admitted by the scheme gate (and logged as a deviation).
+    pub insecure_http: bool,
+}
+
+impl DevEgressOptIns {
+    /// Test posture for a plaintext loopback listener reached by the
+    /// `localhost` NAME: both opt-ins on.
+    #[cfg(test)]
+    pub(crate) const LOOPBACK: Self = Self {
+        private_host_targets: true,
+        insecure_http: true,
+    };
+
+    /// The process environment's answer. The ONE call site outside tests is
+    /// [`AegixContext::new`].
+    pub(crate) fn from_env() -> Self {
+        Self {
+            private_host_targets: crate::host::allow_private_host_targets(),
+            insecure_http: crate::host::insecure_http_opt_in(),
+        }
+    }
+}
+
+/// Whether an execution may take an LLM provider key (`ANTHROPIC_API_KEY`,
+/// `OPENAI_API_KEY`, `GEMINI_API_KEY`) from the WORKER PROCESS environment
+/// when the job's vault map has none — ONE home (security review 2026-10-14,
+/// E-5).
+///
+/// The env fallback is a development bootstrap: with a key in the worker
+/// pod's environment, every tier-2 tenant's module spends the operator's key,
+/// and the worker holds a provider credential the "credential-free worker"
+/// invariant says it does not. Outside development it is REFUSED unless the
+/// operator sets `AEGIX_WORKER_ALLOW_ENV_PROVIDER_KEYS` true, so the vault path
+/// (`anthropic/api_key`, …, delivered per job) is the only source. "Outside
+/// development" is `aegix_auth_types::browser_hardening_required()` (any
+/// `RUST_ENV` but development/dev/local/test): the fallback is a control a
+/// tenant meets, so it follows that rule, not `is_production()` — a
+/// `RUST_ENV=staging` deployment that faces users refuses it too.
+///
+/// Read once per execution in [`AegixContext::new`], like [`DevEgressOptIns`];
+/// the `read` function is the process environment outside tests.
+#[derive(Clone, Copy)]
+pub struct EnvProviderKeys {
+    permitted: bool,
+    read: fn(&str) -> Option<String>,
+}
+
+/// The operator's explicit production opt-in for [`EnvProviderKeys`].
+pub const ENV_PROVIDER_KEYS_OPT_IN: &str = "AEGIX_WORKER_ALLOW_ENV_PROVIDER_KEYS";
+
+fn process_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+impl EnvProviderKeys {
+    /// The rule, pure: in development the fallback is on; anywhere hardened
+    /// only with the opt-in.
+    #[must_use]
+    pub fn permitted(hardened: bool, opted_in: bool) -> bool {
+        !hardened || opted_in
+    }
+
+    /// The rule under a security profile (2026-10-29): `development` permits
+    /// the fallback, `transitional` only with the opt-in, `hardened` never —
+    /// the boot gate has refused the opt-in before an execution starts, and
+    /// an opt-in that reached this far is not honoured.
+    #[must_use]
+    pub fn permitted_under(
+        profile: aegix_deploy_posture::security_profile::SecurityProfile,
+        opted_in: bool,
+    ) -> bool {
+        Self::permitted(
+            profile.enforces(),
+            opted_in && profile.honours_acknowledgements(),
+        )
+    }
+
+    /// The process environment's answer. The ONE call site outside tests is
+    /// [`AegixContext::new`].
+    pub(crate) fn from_env() -> Self {
+        Self {
+            permitted: Self::permitted_under(
+                aegix_deploy_posture::security_profile::profile(),
+                aegix_deploy_posture::bool_env_or_default(ENV_PROVIDER_KEYS_OPT_IN, false),
+            ),
+            read: process_env_var,
+        }
+    }
+
+    /// Test-only: a stated rule and a stated environment.
+    #[cfg(test)]
+    pub(crate) fn stated(permitted: bool, read: fn(&str) -> Option<String>) -> Self {
+        Self { permitted, read }
+    }
+
+    /// The env fallback for `env_name`, or `None` when refused or unset. A
+    /// refusal of a key that IS set is logged once per process, so the
+    /// operator learns why a module reports the provider as not configured.
+    pub(crate) fn lookup(&self, env_name: &str) -> Option<String> {
+        let value = (self.read)(env_name).filter(|v| !v.is_empty());
+        if !self.permitted {
+            if value.is_some() {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        env_name,
+                        opt_in = ENV_PROVIDER_KEYS_OPT_IN,
+                        "an LLM provider key is set in the worker environment but production \
+                         refuses the env fallback — store it in the vault (delivered per job), \
+                         or set the opt-in to accept the worker holding it"
+                    );
+                }
+            }
+            return None;
+        }
+        value
+    }
+}
+
+impl std::fmt::Debug for EnvProviderKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvProviderKeys")
+            .field("permitted", &self.permitted)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The two egress clients one execution owns: the hardened reqwest client and
+/// the `wasi:http` send hooks that share it. Built here for
+/// [`AegixContext::new`] and for the test-only
+/// [`AegixContext::with_dev_egress`], so a test that states its opt-ins runs
+/// the same construction a job does.
+fn build_egress_clients(
+    allowed_hosts: &[String],
+    local_egress_only: bool,
+    dev_egress: DevEgressOptIns,
+) -> (
+    reqwest::Client,
+    crate::host::wasi_http::HardenedWasiHttpHooks,
+) {
+    let http_client = build_per_execution_http_client(
+        allowed_hosts,
+        local_egress_only,
+        dev_egress.private_host_targets,
+    );
+    // The `wasi:http` send path shares THIS client, so a raw `wasi:http`
+    // request is filtered at connect exactly like `aegix:core/http`.
+    let wasi_http_hooks = crate::host::wasi_http::HardenedWasiHttpHooks::new(http_client.clone());
+    (http_client, wasi_http_hooks)
+}
+
+/// Per-execution hardened reqwest client.
+///
+/// Pulled into a free helper (rather than left inline in
+/// `AegixContext::new`) so the `SsrfFilteringResolver` can borrow
+/// `allowed_hosts` before the latter is moved into the struct, and so
+/// the security-critical client posture (no redirects, 5s handshake
+/// budget, SSRF-aware DNS) is grep-able in one place.
+///
+/// Security posture summary:
+///   * No automatic redirect-following — a 30x to a private IP would
+///     bypass the per-call DNS validation that operates on the
+///     original URL only.
+///   * 5s connect timeout — bounds TLS-handshake stalls so a SSRF
+///     target hardened against TLS probes can't consume the full
+///     per-call timeout on the handshake alone (MCP-1058).
+///   * Per-host idle-pool cap (10) — limits resource churn while
+///     keeping a useful connection-reuse path open.
+///   * SSRF-aware DNS resolver scoped to this execution's allowed
+///     hosts — every address the OS resolver returns is re-classified
+///     via `classify_private_ip` BEFORE reqwest connects, closing the
+///     TOCTOU window between the per-call check and the connect step.
+///   * Tier-1 (`local_egress_only`) INVERTS the resolver's default
+///     public-allow posture: any resolved address that is NOT
+///     loopback/private/link-local is denied, enforcing the documented
+///     "data must NOT leave host" contract at the connect point (S3,
+///     2026-06-23). This defeats the DNS hole the name-based
+///     `tier1_egress_deny_reason` gate cannot close.
+fn build_per_execution_http_client(
+    allowed_hosts: &[String],
+    local_egress_only: bool,
+    private_host_targets: bool,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("Aegix-Worker/1.0")
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        // No system-proxy detection. reqwest honours `HTTP(S)_PROXY` /
+        // `ALL_PROXY` by default, and a proxied request is connected BY THE
+        // PROXY — the `SsrfFilteringResolver` below never sees the target's
+        // address, so with a proxy env var set on the worker every SSRF /
+        // local-egress decision was bypassed. Explicit, so a future env
+        // change on the pod cannot switch the resolver off.
+        .no_proxy()
+        .pool_max_idle_per_host(10)
+        .dns_resolver(std::sync::Arc::new(
+            crate::ssrf_resolver::SsrfFilteringResolver::for_allowed_hosts(
+                allowed_hosts,
+                local_egress_only,
+                private_host_targets,
+            ),
+        ))
+        .build()
+        .expect("worker: failed to build hardened reqwest client with no-redirect policy")
+}
+
+/// Filesystem-preopen policy for a capability world.
+///
+/// Returns `true` ONLY for the two worlds that get a full read/write WASI
+/// preopen AND the policy-enforcing `aegix:core/files` host interface
+/// (Filesystem, Trusted). Every other world — including Database and Agent —
+/// gets NO WASI preopen, so a guest's only filesystem surface is a raw WASI
+/// syscall that errors at the capability boundary.
+///
+/// Exhaustive match on purpose: a NEW `CapabilityWorld` variant is a compile
+/// error here, forcing an explicit fs-preopen decision rather than silently
+/// inheriting a (potentially wrong) default. See the call site in
+/// `AegixContext::new` for why Database/Agent are no-preopen (the read-only
+/// preopen they used to get was an empty, unpopulated dir whose only guard was
+/// WASI `FilePerms` — the surface RUSTSEC-2026-0149 bypassed).
+/// Whether the per-actor write ceiling is ENFORCED at the worker host-fn
+/// boundary. Default **off**: the signed `JobRequest.max_write_ceiling`
+/// field travels on every job (PR-A plumbing) but changes no runtime
+/// behavior until an operator sets `AEGIX_WRITE_CEILING_ENFORCED=1`,
+/// mirroring the staged rollout of `AEGIX_ENVELOPE_SEALING`. Since 2026-10-29
+/// the unset default is the security profile's (`AEGIX_SECURITY_PROFILE`):
+/// on under `hardened`, off under `transitional` and `development`, and an
+/// explicit `false` under `hardened` refuses the worker's boot. Read once and
+/// cached — [`AegixContext::write_ceiling_refuses`] sits on every mutating
+/// host call, so this must not re-parse the env per invocation.
+pub(crate) fn write_ceiling_enforced() -> bool {
+    static ENFORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENFORCED.get_or_init(|| {
+        aegix_deploy_posture::bool_env_or_default(
+            "AEGIX_WRITE_CEILING_ENFORCED",
+            aegix_deploy_posture::security_profile::profile().default_on(),
+        )
+    })
+}
+
+// Pure write-ceiling decision, split from the env read + audit side effects in
+// `AegixContext::write_ceiling_refuses` so the gate logic is unit-tested
+// without a live context or process env. Returns `true` when a data-mutating
+// host op MUST be refused: enforcement is on AND the ceiling forbids writes.
+//
+// (#750) The BODY lives in `aegix_dispatch_types::write_ceiling_denies`,
+// not here — the worker held the rule while the controller's
+// `__memory_write__` envelope path had no gate at all, so a `readonly` actor
+// was refused at `agent_memory::set` and permitted at `__memory_write__` on the
+// same job. A shared type with a per-process copy of the PREDICATE is how two
+// paths disagree about one control.
+//
+// (2026-09-24) Production code here no longer calls the ONE-AXIS form: every
+// gate goes through `write_ceiling_denies_axis` so the axis is an explicit
+// argument the compiler demands (see `write_ceiling_refuses`). The decision
+// tests below still drive the one-axis form directly, because the two must
+// agree whenever the override is absent — that agreement is what makes this
+// axis inert by default.
+
+/// Whether read-side STRICT EGRESS is enforced for read-only actors.
+/// Default **off**, and only meaningful when `AEGIX_WRITE_CEILING_ENFORCED`
+/// is also on. Background: the write ceiling gates MUTATING host ops, but a
+/// GET URL (path + query string) is guest-influenceable outbound DATA — an
+/// exfiltration channel the mutation gate cannot close. Perfectly closing it
+/// is impossible while allowing any egress at all (query strings reach the
+/// server logs of every reachable host); what CAN be bounded is *where* that
+/// data may land. With this flag on, a read-only actor's non-mutating HTTP
+/// (fetch / fetch-all / SSE connect) is admitted only to hosts an operator
+/// NAMED in the module's `allowed_hosts` (exact or `.suffix` entries) —
+/// wildcard (`"*"`) admissions are refused. Same staged-rollout shape as the
+/// parent flag.
+pub(crate) fn write_ceiling_strict_egress() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| {
+        aegix_deploy_posture::bool_env_or_default("AEGIX_WRITE_CEILING_STRICT_EGRESS", false)
+    })
+}
+
+/// Pure strict-egress decision (see [`write_ceiling_strict_egress`]).
+/// Refuse when: ceiling enforcement is on, strict egress is on, the actor
+/// is read-only, AND the host was admitted only via the `"*"` wildcard.
+/// Named admissions (exact / suffix) always pass — the operator made a
+/// deliberate per-host egress decision there.
+pub(crate) fn strict_egress_denies(
+    enforced: bool,
+    strict: bool,
+    ceiling: aegix_workflow_job_protocol::WriteCeiling,
+    matched: crate::host::HostMatchKind,
+) -> bool {
+    enforced && strict && !ceiling.allows_write() && matched == crate::host::HostMatchKind::Wildcard
+}
+
+/// What THIS worker process will actually do with the signed
+/// `JobRequest.max_write_ceiling` it receives — the *enforcement posture*, as
+/// opposed to the per-actor ceiling itself.
+///
+/// Reported to the controller at boot self-registration so operator surfaces
+/// can stop describing the ceiling in the abstract. Both fields are read from
+/// the SAME [`write_ceiling_enforced`] / [`write_ceiling_strict_egress`]
+/// `OnceLock`s the host-fn gates read, deliberately: a second env read here
+/// would be a copy of the rule that could drift from the rule, and a report
+/// that disagrees with the gate it describes is worse than no report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteCeilingEnforcement {
+    /// `AEGIX_WRITE_CEILING_ENFORCED` — whether a `readonly` actor's mutating
+    /// host ops are actually refused here.
+    pub enforced: bool,
+    /// `AEGIX_WRITE_CEILING_STRICT_EGRESS` — the subordinate read-side control.
+    /// Inert while `enforced` is false (see [`strict_egress_denies`]), so any
+    /// consumer counting "effective strict egress" must require BOTH.
+    pub strict_egress: bool,
+}
+
+/// This process's live write-ceiling enforcement posture. See
+/// [`WriteCeilingEnforcement`]. Cheap (two `OnceLock` reads).
+#[must_use]
+pub fn write_ceiling_enforcement() -> WriteCeilingEnforcement {
+    WriteCeilingEnforcement {
+        enforced: write_ceiling_enforced(),
+        strict_egress: write_ceiling_strict_egress(),
+    }
+}
+
+#[cfg(test)]
+mod write_ceiling_decision_tests {
+    use aegix_workflow_job_protocol::write_ceiling_denies;
+    use aegix_workflow_job_protocol::WriteCeiling;
+
+    /// The reported posture must come from the SAME readers the gates use.
+    ///
+    /// STATED LIMIT, because overstating a guard is the defect one level up:
+    /// both flags are `OnceLock`s over process env, so in a test process where
+    /// they hold the SAME value (the default — both unset, both false) this
+    /// cannot distinguish a swapped field assignment. The swap IS covered, on
+    /// the path where it would matter: `worker::self_register`'s
+    /// `write_ceiling_flags_travel_unswapped_and_unsigned` builds a body with
+    /// the two bits DIFFERENT and the controller-side round trip
+    /// (`worker_write_ceiling_reporting_tests`) reads them back apart.
+    #[test]
+    fn reported_posture_agrees_with_the_gate_readers() {
+        let posture = super::write_ceiling_enforcement();
+        assert_eq!(posture.enforced, super::write_ceiling_enforced());
+        assert_eq!(posture.strict_egress, super::write_ceiling_strict_egress());
+        // And the reported bit is the one the mutation gate consumes.
+        assert_eq!(
+            write_ceiling_denies(posture.enforced, WriteCeiling::ReadOnly),
+            posture.enforced
+        );
+    }
+
+    #[test]
+    fn disabled_never_refuses() {
+        // Flag off (the default): the signed ceiling is inert regardless.
+        assert!(!write_ceiling_denies(false, WriteCeiling::ReadOnly));
+        assert!(!write_ceiling_denies(false, WriteCeiling::Write));
+    }
+
+    #[test]
+    fn enforced_refuses_only_read_only() {
+        assert!(write_ceiling_denies(true, WriteCeiling::ReadOnly));
+        assert!(!write_ceiling_denies(true, WriteCeiling::Write));
+    }
+
+    #[test]
+    fn strict_egress_refuses_only_wildcard_reads_for_readonly() {
+        use super::strict_egress_denies;
+        use crate::host::HostMatchKind::{Exact, Suffix, Wildcard};
+        // Both flags on + readonly + wildcard admission → refused.
+        assert!(strict_egress_denies(
+            true,
+            true,
+            WriteCeiling::ReadOnly,
+            Wildcard
+        ));
+        // Named admissions always pass — deliberate operator egress intent.
+        assert!(!strict_egress_denies(
+            true,
+            true,
+            WriteCeiling::ReadOnly,
+            Exact
+        ));
+        assert!(!strict_egress_denies(
+            true,
+            true,
+            WriteCeiling::ReadOnly,
+            Suffix
+        ));
+        // Write-ceiling actors are unaffected.
+        assert!(!strict_egress_denies(
+            true,
+            true,
+            WriteCeiling::Write,
+            Wildcard
+        ));
+        // Either flag off → inert.
+        assert!(!strict_egress_denies(
+            false,
+            true,
+            WriteCeiling::ReadOnly,
+            Wildcard
+        ));
+        assert!(!strict_egress_denies(
+            true,
+            false,
+            WriteCeiling::ReadOnly,
+            Wildcard
+        ));
+    }
+}
+
+impl AegixContext {
+    /// The execution's sandbox directory — the WASI preopen of a filesystem
+    /// world and where `aegix:core/files` writes. Read by the epoch callback's
+    /// size check (E2-2).
+    pub(crate) fn sandbox_dir(&self) -> &std::path::Path {
+        self._ephemeral_dir.path()
+    }
+}
+
+pub(crate) fn capability_world_has_fs_preopen(
+    world: &crate::wit_inspector::CapabilityWorld,
+) -> bool {
+    use crate::wit_inspector::CapabilityWorld;
+    match world {
+        CapabilityWorld::Filesystem | CapabilityWorld::Trusted => true,
+        CapabilityWorld::Database
+        | CapabilityWorld::Agent
+        | CapabilityWorld::Minimal
+        | CapabilityWorld::Http
+        | CapabilityWorld::Network
+        | CapabilityWorld::Secrets
+        | CapabilityWorld::Messaging
+        | CapabilityWorld::Cache
+        | CapabilityWorld::Governance
+        | CapabilityWorld::Unknown => false,
+    }
+}
+
+/// Which host path a credential leaves through — the `surface` of a
+/// `wasi:secret_use` audit event. A closed set so the ledger's vocabulary is
+/// fixed at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretUseSurface {
+    HttpHeader,
+    /// A `vault://` reference resolved into a JSON REQUEST BODY field. Kept
+    /// distinct from `HttpHeader` so the WORM ledger records WHERE a
+    /// credential was placed, not merely that it was used — the two
+    /// placements have different review properties and an auditor must be
+    /// able to tell them apart.
+    HttpJsonBody,
+    GraphqlHeader,
+    /// A `vault://` reference resolved into a GraphQL request BODY — the
+    /// host-composed `{query, variables}` envelope. Distinct from
+    /// `GraphqlHeader` for the reason `HttpJsonBody` is distinct from
+    /// `HttpHeader`: the ledger records WHERE the credential was placed.
+    GraphqlJsonBody,
+    HttpStreamHeader,
+    WebhookHeader,
+    /// A `vault://` reference resolved into a webhook request BODY. `send`
+    /// sets no content type of its own, so the JSON declaration that admits
+    /// substitution comes from the guest's own headers.
+    WebhookJsonBody,
+    MessagingHeader,
+    LlmProviderKey,
+    EmailApiKey,
+}
+
+impl SecretUseSurface {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpHeader => "http-header",
+            Self::HttpJsonBody => "http-json-body",
+            Self::GraphqlHeader => "graphql-header",
+            Self::GraphqlJsonBody => "graphql-json-body",
+            Self::HttpStreamHeader => "http-stream-header",
+            Self::WebhookHeader => "webhook-header",
+            Self::WebhookJsonBody => "webhook-json-body",
+            Self::MessagingHeader => "messaging-header",
+            Self::LlmProviderKey => "llm-provider-key",
+            Self::EmailApiKey => "email-api-key",
+        }
+    }
+}
+
+/// Where a credential's plaintext came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretSource {
+    /// The job's secret provider (a vault path).
+    Vault,
+    /// A worker environment variable fallback (the key is the variable NAME).
+    Env,
+}
+
+impl SecretSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vault => "vault",
+            Self::Env => "env",
+        }
+    }
+}
+
+/// What [`AegixContext::record_secret_use`] does with one credential use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretUseAdmission {
+    /// A new `(surface, key, destination)`: write `wasi:secret_use`.
+    Record,
+    /// Already written this execution: nothing.
+    AlreadyRecorded,
+    /// The first new use past the cap: write ONE `wasi:secret_use_suppressed`.
+    RecordSuppression,
+    /// A new use after the suppression marker: nothing.
+    Suppressed,
+}
+
+/// Dedupe-and-cap decision over the set of uses already recorded. The set
+/// holds at most `cap` real entries plus one suppression sentinel, so its size
+/// is bounded whatever a module does.
+pub(crate) fn secret_use_admission(
+    seen: &mut std::collections::HashSet<String>,
+    key: String,
+    cap: usize,
+) -> SecretUseAdmission {
+    const SUPPRESSED: &str = "\u{0}suppressed";
+    if seen.contains(&key) {
+        return SecretUseAdmission::AlreadyRecorded;
+    }
+    let recorded = seen.len() - usize::from(seen.contains(SUPPRESSED));
+    if recorded < cap {
+        seen.insert(key);
+        SecretUseAdmission::Record
+    } else if seen.insert(SUPPRESSED.to_string()) {
+        SecretUseAdmission::RecordSuppression
+    } else {
+        SecretUseAdmission::Suppressed
+    }
+}
+
+impl AegixContext {
+    /// Create a new execution context with an ephemeral file-system sandbox.
+    ///
+    /// A fresh temporary directory is created for each call and mounted at `/`
+    /// in the WASI preopened-dirs table.  The directory is removed from disk
+    /// when the returned `AegixContext` is dropped.
+    ///
+    /// * `allowed_hosts` – hostname allowlist for outbound HTTP (empty = deny all; use `["*"]` to allow any host).
+    /// * `allowed_methods` – HTTP method allowlist (empty = DENY every verb; `["GET"]` = read-only).
+    /// * `max_memory_mb` – memory cap in megabytes.
+    /// * `secrets` – pre-fetched, decrypted secret values consumed by the `AegixVaultProvider`.
+    ///   After construction the map is owned by the provider; no plaintext copy remains in the context.
+    /// * `redis_client` – optional Redis connection.
+    /// * `nats_client` – optional NATS connection.
+    /// * `allow_wasi_network` – if `true`, grant `wasi:sockets` access so the
+    ///   component can use `std::net::TcpStream` (WASIP2).
+    ///   Only set this for `network-node` or `automation-node`
+    ///   components; `minimal-node` components never need it.
+    /// * `max_llm_tier` – the actor's data-egress ceiling. `Tier1`
+    ///   (local-Ollama-only) wires the per-execution SSRF resolver into
+    ///   `local_egress_only` mode, denying any resolved address that is
+    ///   not loopback/private/link-local (S3, 2026-06-23). The field is
+    ///   also stored on the context so the host-fn tier gates read it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        capability_world: crate::wit_inspector::CapabilityWorld,
+        allowed_hosts: Vec<String>,
+        allowed_methods: Vec<String>,
+        max_memory_mb: usize,
+        secrets: aegix_workflow_job_protocol::SecretMap,
+        redis_client: Option<Arc<redis::Client>>,
+        nats_client: Option<Arc<async_nats::Client>>,
+        allow_wasi_network: bool,
+        token_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+        global_expose_fallback: Arc<crate::expose_fallback::ExposeFallback>,
+        max_llm_tier: aegix_workflow_job_protocol::LlmTier,
+        egress_scope: Option<aegix_workflow_job_protocol::EgressScope>,
+    ) -> anyhow::Result<Self> {
+        // ── Ephemeral sandbox ────────────────────────────────────────────────
+        // Create the per-execution temporary directory.  It is automatically
+        // removed from disk (including all contents) when `_ephemeral_dir` is
+        // dropped — which happens as soon as the Store is deallocated after
+        // execution, timeout, or panic.
+        let ephemeral_dir = tempfile::tempdir()?;
+
+        // Open a cap_std::fs::Dir handle for the `aegix:core/files` host functions.
+        // These host functions enforce additional path sanitisation on top of
+        // the capability-based boundary already provided by cap-std.
+        let fs_dir =
+            cap_std::fs::Dir::open_ambient_dir(ephemeral_dir.path(), cap_std::ambient_authority())?;
+
+        // ── WASI context ─────────────────────────────────────────────────────
+        // Mount the sandbox at `/` using its host path.  WasiCtxBuilder opens
+        // the directory internally and registers it as a WASI preopened dir so
+        // that WASM nodes can use standard Rust file I/O (std::fs, std::io)
+        // transparently.  The DirPerms / FilePerms restrict what the WASM guest
+        // can do within the sandbox.
+        // Ensure a sensible memory limit is supplied (must be > 0).
+        if max_memory_mb == 0 {
+            anyhow::bail!("max_memory_mb must be > 0");
+        }
+        let mut builder = WasiCtxBuilder::new();
+
+        if let Some(tx) = token_sender {
+            builder.stdout(ChannelStdout { sender: tx });
+        } else {
+            // L-5: discard guest stdout when no capture channel is
+            // wired. Inheriting the worker process's stdout would
+            // commingle untrusted guest output with operator logs and
+            // let a chatty module bloat log volumes — even though each
+            // Store is dropped per-job so confidentiality across jobs
+            // is bounded.
+            builder.stdout(NullStdout);
+        }
+
+        // Capture WASI stderr into an in-process buffer instead of inheriting the
+        // worker's process stderr.  Panic messages (written to WASI stderr by the
+        // wasm32-wasip2 runtime) are preserved here and surfaced in trap errors.
+        let stderr_capture = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        builder.stderr(BufferCapture {
+            buffer: stderr_capture.clone(),
+        });
+
+        // L1 (2026-05-22): gate the filesystem preopen by capability world.
+        //
+        // Pre-fix: every WASM execution got a preopened `/` with
+        // DirPerms::all() + FilePerms::all(), regardless of whether the
+        // module's declared capability world actually included
+        // filesystem access. The blast radius was bounded to the
+        // ephemeral per-instance tempdir, but defense-in-depth says
+        // worlds without filesystem capability should not have ANY
+        // file handle available — the WASI preopen surface is itself
+        // attack surface (path-resolution bugs, symlink-following
+        // tricks against cap-std, etc.).
+        //
+        // TWO tiers of preopen:
+        //   * Filesystem / Trusted (Automation) — full read/write. These
+        //     worlds also have the `aegix:core/files` host interface linked
+        //     (build_filesystem_linker / build_trusted_linker), so the WASI
+        //     preopen and the policy-enforcing custom interface back the same
+        //     per-execution dir; a module legitimately needs scratch I/O.
+        //   * EVERYTHING ELSE — NO preopen. Guest `std::fs::*` fails at the
+        //     capability boundary ("Capability denied").
+        //
+        // 2026-06-02 architectural change: Database / Agent previously got a
+        // READ-ONLY preopen (DirPerms::READ / FilePerms::READ), justified as
+        // "read operator-mounted lookup tables." That mount was never wired —
+        // the dir is a FRESH EMPTY `tempfile::tempdir()` (line above), the
+        // `execution_fs_dir` staging param is unused, and the `files`
+        // interface (the only thing that writes the dir) is NOT linked for
+        // these worlds. So the read-only preopen was an EMPTY, unpopulated,
+        // functionally-inert dir — pure attack surface with no benefit.
+        //
+        // Worse, its read-only enforcement rode entirely on WASI `FilePerms`,
+        // which is exactly what RUSTSEC-2026-0149 (wasmtime-wasi
+        // `path_open(TRUNCATE)`) bypassed. Patched in wasmtime 44 (PR #121),
+        // but the architectural lesson stands: a world WITHOUT the custom
+        // `files` interface should not have a raw WASI preopen whose only
+        // guard is the host's permission model. Collapsing Database / Agent
+        // into the no-preopen tier removes the surface entirely and makes the
+        // FilePerms-bypass class structurally unreachable for them. If these
+        // worlds ever genuinely need to read staged files, route it through a
+        // READ-ONLY `files` host interface (policy-enforcing), not a preopen.
+        //
+        // Defense-in-depth fact-check: the `files` host functions
+        // (read/write/delete/list_dir) are linked ONLY in the Filesystem and
+        // Trusted tiers, so a non-fs world that somehow imports
+        // `aegix:core/files` already fails to link. This closes the lower
+        // raw-WASI-syscall surface to match.
+        // Single, named, exhaustive policy (see `capability_world_has_fs_preopen`).
+        if capability_world_has_fs_preopen(&capability_world) {
+            // Wasmtime 48 folded `DirPerms::all()` + `FilePerms::all()` into
+            // `FsPerms::ReadWrite` — the same grant.
+            builder.preopened_dir(ephemeral_dir.path(), "/", FsPerms::ReadWrite)?;
+        }
+
+        // Network access for wasi:sockets (WASIP2) — only granted when the
+        // component's capability world includes outbound network I/O.
+        // `inherit_network()` lets the guest use std::net::TcpStream et al.
+        // The Aegix `allowed_hosts` list still governs the HTTP host function;
+        // raw TCP is gated here at the WasiCtx level.
+        // Computed HERE (before the socket check closure) and reused for the
+        // reqwest resolver below, so the two egress surfaces are built from
+        // ONE answer and cannot disagree about the actor's posture.
+        let local_egress_only = resolve_local_egress_only(egress_scope, max_llm_tier);
+        if allow_wasi_network {
+            builder.inherit_network();
+            // Guest DNS stays on for a granted store. Since E-2 (2026-10-14)
+            // the grant reaches only a Tier-2, public-egress `network` /
+            // `trusted` module that declares `"*"` — one that already reaches
+            // any public host over `aegix:core/http`, so a lookup is no
+            // channel it did not have. Every other store has no network at
+            // all, lookup included.
+            //
+            // Note, measured 2026-10-14: TCP itself is NOT enabled here. Since
+            // wasmtime 48 `WasiCtxBuilder` defaults TCP to off and nothing
+            // calls `allow_tcp(true)`, so no store can create a TCP socket
+            // (`runtime::socket_grant_tests::tcp_is_off_even_for_a_granted_store`).
+            builder.allow_ip_name_lookup(true);
+
+            // SECURITY: Disable raw UDP sockets.  Aegix HTTP is TCP-only;
+            // UDP would allow DNS exfiltration and QUIC bypass of HTTP controls.
+            builder.allow_udp(false);
+
+            // SECURITY: Prevent Server-Side Request Forgery (SSRF)
+            // Even though `aegix:core/http::fetch` respects the `allowed_hosts` list,
+            // raw WASI sockets bypass it entirely because they resolve directly to IPs.
+            // To ensure the WASM sandbox cannot be used to scan internal network infrastructure,
+            // we actively block connections to private, loopback, and link-local IP addresses.
+            builder.socket_addr_check(move |addr, _use| {
+                Box::pin(async move {
+                    // Route raw WASI sockets through the SAME shared SSRF
+                    // classifier the WIT-http literal-IP gate and the controller
+                    // pre-validation use (`aegix_ssrf_classify::classify_private_ip`),
+                    // so all three egress surfaces agree BY CONSTRUCTION. This
+                    // replaces ~90 lines of hand-maintained range checks that the
+                    // MCP-1067..1070 comments had to keep "byte-for-byte" in sync
+                    // — exactly the drift hazard the literal-IP chokepoint (PR #116)
+                    // removed on the http side.
+                    //
+                    // Two behaviour deltas vs. the old inline copy, both correct:
+                    //   * It now blocks EVERY IPv4-in-IPv6 transition form
+                    //     (IPv4-mapped AND IPv4-compat / NAT64 / 6to4) — the old
+                    //     copy canonicalized only IPv4-mapped, so `::169.254.169.254`
+                    //     (compat), 6to4, and NAT64 spellings of an internal target
+                    //     were a latent socket-SSRF bypass. Now closed.
+                    //   * It no longer special-cases RFC-5737 documentation ranges
+                    //     (192.0.2/24, …). Those are reserved-unassigned, not
+                    //     internal, and the other two surfaces already treat them
+                    //     as public (see aegix_http_utils::ssrf). Aligning removes
+                    //     the lone divergence.
+                    let ip = addr.ip();
+                    match socket_addr_permitted(ip, local_egress_only) {
+                        SocketAddrVerdict::Permit => true,
+                        SocketAddrVerdict::DenyPrivate(policy) => {
+                            tracing::warn!(
+                                %ip,
+                                policy,
+                                "SECURITY: blocked WASI socket connection to a non-public IP"
+                            );
+                            false
+                        }
+                        SocketAddrVerdict::DenyPublicLocalEgressOnly => {
+                            tracing::warn!(
+                                %ip,
+                                "SECURITY: blocked WASI socket connection to a PUBLIC IP — \
+                                 this actor is local-egress-only (egress_scope=local / tier-1)"
+                            );
+                            false
+                        }
+                    }
+                })
+            });
+        }
+
+        let wasi = builder.build();
+
+        let table = ResourceTable::new();
+        let max_memory_bytes = max_memory_mb * 1024 * 1024;
+        let http_ctx = wasmtime_wasi_http::WasiHttpCtx::new();
+
+        // Consume the pre-fetched secrets map into the SecretProvider.
+        // No plaintext copy of the map is retained in AegixContext — all secret
+        // access goes through the provider, which adds slot-based tracking and
+        // audit logging via AuditingProvider.
+        let provider: std::sync::Arc<dyn aegix_secrets::SecretProvider> = {
+            let p = aegix_secrets::config::build_provider(
+                &aegix_secrets::config::ProviderConfig::TalosVault,
+                secrets, // consumed — no clone
+                true,    // enable AuditingProvider wrapper
+            );
+            std::sync::Arc::from(p)
+        };
+
+        // Build the per-execution reqwest client BEFORE moving
+        // `allowed_hosts` into the struct so the SSRF resolver can be
+        // scoped to this execution's explicit hostnames. See the
+        // resolver doc-comment for the per-host bypass rationale.
+        //
+        // S3 (2026-06-23): the blanket "no public egress, data must NOT leave
+        // host" SSRF gate — the resolver denies every public (globally-routable)
+        // resolved address regardless of hostname, closing the DNS hole the
+        // name-based `tier1_egress_deny_reason` fast-fail gate cannot.
+        //
+        // 2026-07-23: this gate is now driven by the `egress_scope` OVERRIDE
+        // (independent of `max_llm_tier`), falling back to the tier-derived
+        // default when unset. This decouples "no external LLM" (still keyed to
+        // `max_llm_tier` via `tier1_egress_deny_reason`) from "no public egress
+        // at all". So an actor can be `Tier1` (LLM hard-gated local) yet
+        // `egress_scope = Public` — reaching declared `allowed_hosts` like
+        // Gmail while its LLM stays on-host. Fail-closed: an unset scope on a
+        // Tier1 actor stays air-gapped exactly as before (byte-identical).
+        //
+        // The dev-only opt-ins are read from the environment HERE, once, and
+        // the same value goes to the resolver and onto the context.
+        let dev_egress = DevEgressOptIns::from_env();
+        let (http_client, wasi_http_hooks) =
+            build_egress_clients(&allowed_hosts, local_egress_only, dev_egress);
+
+        Ok(Self {
+            wasi,
+            table,
+            http_ctx,
+            wasi_http_hooks,
+            allowed_hosts,
+            allowed_methods,
+            allowed_sql_operations: vec![],
+            allowed_secrets: vec![],
+            env_vars: HashMap::new(),
+            capability_world,
+            // Populated downstream from the JobRequest; construct-time
+            // default is None so non-integration modules fall through to
+            // the `unauthorized` path in integration_state host fns.
+            integration_name: None,
+            // Populated downstream from the JobRequest (via SecurityPolicy) —
+            // None at construct time so non-declaring nodes add no header.
+            idempotency_key: None,
+            http_replay: None,
+            http_capture: None,
+            memory_rehearsal: None,
+            host_call_label: crate::fuel_profile::UNNAMED,
+            provider,
+            expose_call_count: std::sync::atomic::AtomicU64::new(0),
+            secret_tier2_exposed: std::sync::atomic::AtomicBool::new(false),
+            allow_tier2_exposure: false,
+            global_expose_fallback,
+            workflow_id: None,
+            execution_id: None,
+            module_id: None,
+            user_id: None,
+            state_store: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            redis_client,
+            redis_conn_mgr: Arc::new(tokio::sync::OnceCell::new()),
+            nats_client,
+            audit_ledger: None,
+            last_db_error: String::new(),
+            oom_error_message: None,
+            fs_dir,
+            _ephemeral_dir: ephemeral_dir,
+            max_memory_bytes,
+            committed_memory_bytes: 0,
+            crypto_budget_us: AtomicU64::new(5_000_000), // 5 seconds default
+            request_id: None,
+            cancellation_token: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            quota_usage: std::sync::Mutex::new(HashMap::new()),
+            http_call_count: AtomicU64::new(0),
+            http_calls_per_host: dashmap::DashMap::new(),
+            db_query_count: AtomicU64::new(0),
+            messaging_publish_count: AtomicU64::new(0),
+            cache_call_count: AtomicU64::new(0),
+            cache_write_bytes: AtomicU64::new(0),
+            model_predict_input_count: AtomicU64::new(0),
+            model_fewshot_call_count: AtomicU64::new(0),
+            email_send_count: AtomicU64::new(0),
+            webhook_send_count: AtomicU64::new(0),
+            graphql_query_count: AtomicU64::new(0),
+            secret_access_count: AtomicU64::new(0),
+            fs_bytes_written: AtomicU64::new(0),
+            log_message_count: AtomicU64::new(0),
+            log_bytes: AtomicU64::new(0),
+            host_diag_count: AtomicU64::new(0),
+            denial_ledger_count: AtomicU64::new(0),
+            secret_use_recorded: std::collections::HashSet::new(),
+            last_network_reason: Arc::new(std::sync::Mutex::new(None)),
+            acted_since_network_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            event_emit_count: AtomicU64::new(0),
+            streams: StreamRegistry::new(),
+            sse_connects_per_host: dashmap::DashMap::new(),
+            // MCP-471: tighten the SSRF-redirect fallback. The
+            // `redirect(Policy::none())` above closes the redirect-
+            // pivot bypass for the worker's outbound HTTP / webhook /
+            // GraphQL / http-stream surfaces. The previous fallback
+            // `Client::new()` (no `.redirect()`) would silently
+            // re-enable the default `Policy::limited(10)` redirect
+            // following — exactly the gap we're trying to prevent.
+            // `.build()` rarely fails (TLS init only); `Client::new()`
+            // would panic on the same condition anyway, so the
+            // fallback was effectively dead AND would have reopened
+            // the SSRF gap if reached. `.expect()` surfaces a
+            // deployment failure loudly at worker context creation
+            // instead of silently degrading security posture.
+            // MCP-1058 (2026-05-15): defense-in-depth `.connect_timeout()`
+            // on the WIT host HTTP client. Per-call `wit_http::fetch` /
+            // `wit_http::fetch_all` / `wit_webhook::send` set the
+            // request-level `.timeout()` per invocation, but no
+            // client-level cap on TCP+TLS handshake. A WASM module
+            // calling out to a remote that accepts TCP but stalls TLS
+            // (e.g. SSRF target hardened against TLS probes, or a
+            // black-holed host) would otherwise consume the full
+            // per-call timeout on the handshake alone. 5s matches the
+            // workspace-canonical handshake budget.
+            http_client,
+            // MCP-937 (2026-05-15): filter empty-string env values so a
+            // Helm-placeholder `S3_ENDPOINT=""` (or any of the three S3
+            // creds) doesn't propagate `Some("")` into the
+            // wit_object_storage host functions. Downstream consumers
+            // use `.as_ref().ok_or(NotConfigured)` which succeeds on
+            // `Some(&"")`, then `format!("{}/{}/{}", "", bucket, key)`
+            // produces a relative URL → parse fails → operator sees a
+            // confusing "Invalid S3 URL" log instead of the clean
+            // "NotConfigured" surface the absent-config case was
+            // designed to produce.
+            //
+            // s3_region also needs the filter — its `.or_else(|| Some(
+            // "us-east-1"))` fallback was shadowed by `Some("")` (the
+            // same chain class as MCP-934). With the filter, empty
+            // S3_REGION falls through to the us-east-1 default.
+            //
+            // Same empty-env-var-bypass class as MCP-590..631 /
+            // MCP-934 / MCP-935 / MCP-936.
+            s3_endpoint: std::env::var("S3_ENDPOINT").ok().filter(|v| !v.is_empty()),
+            s3_access_key: std::env::var("S3_ACCESS_KEY_ID")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            s3_secret_key: std::env::var("S3_SECRET_ACCESS_KEY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            s3_region: std::env::var("S3_REGION")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or_else(|| Some("us-east-1".to_string())),
+            metrics: None,
+            stderr_capture,
+            // Fresh per-context accumulator; dispatch paths that need to
+            // read usage after execution overwrite this with their own Arc.
+            llm_usage: LlmUsageAcc::default(),
+            // Off unless a caller explicitly asks to collect diagnostics
+            // in-process (`run_sandbox` / `test_module`). Every NATS-backed
+            // dispatch path leaves this None and is unchanged.
+            host_diag_sink: None,
+            inference_wait: None,
+            dry_run: false,
+            read_only_posts: Arc::new(Vec::new()),
+            dry_run_ledger: crate::dry_run::DryRunLedger::default(),
+            actor_id: None,
+            // Stamped from the constructor arg so the SSRF resolver's
+            // `local_egress_only` decision (built above) and the host-fn
+            // tier gates agree on the same value from construction. Live
+            // execution paths still re-assign `context.max_llm_tier` after
+            // `new()` (a no-op since they pass the same value); legacy /
+            // test paths that pass `LlmTier::default()` keep Tier-2.
+            max_llm_tier,
+            // Stamped from the SAME expression that built `http_client`'s
+            // resolver a few lines above, so the egress-attribution branch in
+            // `wit_http::fetch` can never disagree with the resolver that
+            // actually dropped the address. Live paths re-assign
+            // `max_llm_tier` after `new()` with the identical value, so this
+            // stays in agreement.
+            local_egress_only,
+            // The value the resolver above was built with.
+            dev_egress,
+            env_provider_keys: EnvProviderKeys::from_env(),
+            // Default `Write` (permissive) at construction; live dispatch
+            // paths re-stamp this from the signed `JobRequest.max_write_ceiling`
+            // right after `new()`, mirroring `max_llm_tier`. Tests / legacy
+            // paths keep the permissive default.
+            max_write_ceiling: aegix_workflow_job_protocol::WriteCeiling::default(),
+            // `None` = inherit the ceiling above; see the field's docs.
+            http_verb_ceiling: None,
+        })
+    }
+
+    /// The dev-only egress opt-ins this execution was built with.
+    pub fn dev_egress(&self) -> DevEgressOptIns {
+        self.dev_egress
+    }
+
+    /// Test-only: run this context under STATED dev-only opt-ins instead of
+    /// the process environment's, rebuilding the two egress clients through
+    /// the function [`Self::new`] uses. A test that needs a loopback target
+    /// opts in here; a test whose verdict is a refusal can pin both off. No
+    /// test in this binary sets either environment variable — the one test
+    /// that does (`tests/dev_egress_env.rs`) is a process of its own.
+    #[cfg(test)]
+    pub(crate) fn with_dev_egress(mut self, dev_egress: DevEgressOptIns) -> Self {
+        let (http_client, wasi_http_hooks) =
+            build_egress_clients(&self.allowed_hosts, self.local_egress_only, dev_egress);
+        self.http_client = http_client;
+        self.wasi_http_hooks = wasi_http_hooks;
+        self.dev_egress = dev_egress;
+        self
+    }
+
+    /// Test-only: run this context under a STATED env-provider-key rule and
+    /// environment instead of the process's. See [`EnvProviderKeys`].
+    #[cfg(test)]
+    pub(crate) fn with_env_provider_keys(mut self, keys: EnvProviderKeys) -> Self {
+        self.env_provider_keys = keys;
+        self
+    }
+
+    /// Read the bytes written to WASI stderr during this execution.
+    /// Returns an empty string if nothing was captured (normal case).
+    /// Non-UTF8 bytes are replaced with the Unicode replacement character.
+    pub fn take_stderr_output(&self) -> String {
+        let guard = self
+            .stderr_capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&guard).into_owned()
+    }
+
+    /// Set workflow context metadata for tracing and automatic logging.
+    pub fn set_workflow_context(
+        &mut self,
+        workflow_id: String,
+        execution_id: String,
+        module_id: String,
+    ) {
+        self.workflow_id = Some(workflow_id);
+        self.execution_id = Some(execution_id);
+        self.module_id = Some(module_id);
+    }
+
+    /// The dispatch this execution's data-plane RPCs are made for
+    /// (2026-10-29): the job's run (`workflow_id`, which carries the job's
+    /// `workflow_execution_id`) and its own `module_executions` row
+    /// (`execution_id`). `None` for a rehearsal, which has no execution
+    /// context; the controller admits its own runtime's unbound calls on its
+    /// signing identity and refuses a worker's.
+    pub fn dispatch_binding(
+        &self,
+    ) -> Option<aegix_rpc_protocol::dispatch_binding::DispatchBinding> {
+        aegix_rpc_protocol::dispatch_binding::DispatchBinding::from_context(
+            self.workflow_id.as_deref(),
+            self.execution_id.as_deref(),
+        )
+    }
+
+    /// Set an optional request identifier for end‑to‑end correlation.
+    pub fn set_request_id(&mut self, request_id: String) {
+        self.request_id = Some(request_id);
+    }
+
+    /// Set the user ID for global rate limiting and audit logging.
+    pub fn set_user_id(&mut self, user_id: uuid::Uuid) {
+        self.user_id = Some(user_id);
+    }
+
+    /// Override environment variables (from workflow / module configuration).
+    pub fn set_env_vars(&mut self, vars: HashMap<String, String>) {
+        self.env_vars = vars;
+    }
+
+    /// Build the module-scoped prefix for agent memory keys.
+    /// Format: `mem:{module_id}:` — distinct from state keys (`{module_id}:`).
+    pub fn memory_key_prefix(&self) -> String {
+        match &self.module_id {
+            Some(mid) => format!("mem:{}:", mid),
+            None => "mem:_:".to_string(),
+        }
+    }
+
+    /// Build a module-scoped agent memory key.
+    pub fn scoped_memory_key(&self, key: &str) -> String {
+        format!("{}{}", self.memory_key_prefix(), key)
+    }
+
+    /// Set per-module secret allowlist.  When non-empty, only secrets whose
+    /// key matches an entry (or `"*"`) are served by `secrets::get-secret`.
+    pub fn set_allowed_secrets(&mut self, allowed: Vec<String>) {
+        self.allowed_secrets = allowed;
+    }
+
+    /// Allow or deny Tier-2 secret exposure for this module.
+    pub fn set_allow_tier2_exposure(&mut self, allow: bool) {
+        self.allow_tier2_exposure = allow;
+    }
+
+    /// Set per-module SQL operation allowlist.
+    pub fn set_allowed_sql_operations(&mut self, allowed: Vec<String>) {
+        self.allowed_sql_operations = allowed;
+    }
+
+    /// Enable dry-run mode: non-GET HTTP requests, webhook sends, and messaging
+    /// publishes are mocked. GET requests still execute normally for data fetching.
+    pub fn set_dry_run(&mut self, dry_run: bool) {
+        self.dry_run = dry_run;
+    }
+
+    /// Attach OpenTelemetry runtime metrics so host functions can record
+    /// rate-limit, approval, LLM, cancellation, and quota events.
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::RuntimeMetrics>) {
+        self.metrics = Some(metrics);
+    }
+}
+
+// ============================================================================
+// SAFETY NOTE
+// ============================================================================
+// `WasiCtx` and `ResourceTable` contain interior-mutability structures that
+// are not `Sync`.  Aegix guarantees each `AegixContext` is only ever accessed
+// from a single thread at any point in time (one store per job execution).
+// This impl must be revisited if concurrent access is ever introduced.
+// unsafe impl Sync for AegixContext {}
+
+// ============================================================================
+// Resource limiter – enforced by Wasmtime to prevent exhaustion attacks
+// ============================================================================
+impl ResourceLimiter for AegixContext {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> std::result::Result<bool, wasmtime::Error> {
+        tracing::debug!(
+            current_kb = current / 1024,
+            desired_kb = desired / 1024,
+            limit_mb = self.max_memory_bytes / 1024 / 1024,
+            "WASM memory growth requested"
+        );
+        // The pooling allocator admits up to `max_memories_per_component`
+        // memories per component; a per-memory comparison let a store hold
+        // that many times the limit. Charge every growth against ONE total.
+        let Some(committed) = memory_growth_admitted(
+            self.committed_memory_bytes,
+            current,
+            desired,
+            self.max_memory_bytes,
+        ) else {
+            tracing::warn!(
+                current_mb = current / 1024 / 1024,
+                desired_mb = desired / 1024 / 1024,
+                committed_mb = self.committed_memory_bytes / 1024 / 1024,
+                limit_mb = self.max_memory_bytes / 1024 / 1024,
+                "WASM memory limit exceeded — denying allocation"
+            );
+            self.oom_error_message = Some(format!(
+                "WASM module exceeded its {}MB memory limit (tried to allocate {}MB). Reduce result size or use pagination.",
+                self.max_memory_bytes / 1024 / 1024,
+                desired / 1024 / 1024
+            ));
+            return Ok(false);
+        };
+        self.committed_memory_bytes = committed;
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> std::result::Result<bool, wasmtime::Error> {
+        const MAX_TABLE_SIZE: usize = 10_000;
+        if desired > MAX_TABLE_SIZE {
+            tracing::warn!(
+                current,
+                desired,
+                MAX_TABLE_SIZE,
+                "WASM table limit exceeded — denying allocation"
+            );
+            // Reuse the `oom_error_message` path so the trap-handling site in
+            // `runtime.rs` surfaces an operator-actionable message instead of
+            // a generic trap. Without this the guest aborts with no signal
+            // about which resource limit was hit.
+            self.oom_error_message = Some(format!(
+                "WASM module exceeded its table-entry limit of {} (tried to grow to {}). \
+                 This typically indicates an unbounded indirect-call or function-pointer \
+                 table; refactor to reduce dispatch fan-out.",
+                MAX_TABLE_SIZE, desired
+            ));
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+/// Store-wide linear-memory accounting: a growth from `current` to `desired`
+/// bytes adds `desired - current` to the store's committed total. Returns the
+/// new total, or `None` when it would exceed `max`. Committed bytes never
+/// shrink (wasm memories cannot), so an over-count is the fail-safe direction.
+pub(crate) fn memory_growth_admitted(
+    committed: usize,
+    current: usize,
+    desired: usize,
+    max: usize,
+) -> Option<usize> {
+    let next = committed.checked_add(desired.saturating_sub(current))?;
+    (next <= max).then_some(next)
+}
+
+#[cfg(test)]
+mod memory_growth_tests {
+    use super::memory_growth_admitted;
+
+    #[test]
+    fn many_memories_share_one_limit() {
+        let max = 128 << 20;
+        // Twenty memories each growing to 100 MiB: the per-memory check
+        // admitted all twenty (2 GB); the store total admits exactly one.
+        let mut committed = 0;
+        let mut admitted = 0;
+        for _ in 0..20 {
+            if let Some(next) = memory_growth_admitted(committed, 0, 100 << 20, max) {
+                committed = next;
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 1);
+        assert_eq!(committed, 100 << 20);
+    }
+
+    #[test]
+    fn growth_charges_only_the_delta() {
+        let max = 10;
+        assert_eq!(memory_growth_admitted(4, 4, 8, max), Some(8));
+        assert_eq!(memory_growth_admitted(8, 8, 10, max), Some(10));
+        assert_eq!(memory_growth_admitted(10, 10, 11, max), None);
+        assert_eq!(memory_growth_admitted(usize::MAX, 0, 1, usize::MAX), None);
+    }
+}
+
+// Allow the context to be used as wasmtime component store data.
+impl wasmtime::component::HasData for AegixContext {
+    type Data<'a> = AegixContext;
+}
+
+impl wasmtime_wasi_http::WasiHttpView for AegixContext {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.table,
+            // SECURITY: never `default_hooks()`. Upstream's default
+            // `send_request` connects with raw hyper/tokio on a name it
+            // resolves itself — no SSRF filter on the resolved address, no
+            // local-only egress. Until 2026-09-25 that was exactly what the
+            // trusted/automation world got, behind an UNGATED outgoing-handler.
+            // Now the handler is `host::wasi_http::GatedOutgoing` (the
+            // `aegix:core/http` gate set, applied before this is reached) and
+            // the send is the execution's hardened client. Every other world
+            // links `wasi:http/types` only, so this send path is unreachable
+            // there (a component importing the handler fails to link).
+            hooks: &mut self.wasi_http_hooks,
+        }
+    }
+}
+
+impl AegixContext {
+    pub fn set_audit_ledger(
+        &mut self,
+        ledger: std::sync::Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>,
+    ) {
+        self.audit_ledger = Some(ledger);
+    }
+
+    /// Records a capability denial to the cryptographic audit ledger and
+    /// publishes it to the WORM stream (`talos.audit.ledger`).
+    ///
+    /// Cap on host-diagnostic entries per execution. Diagnostics are
+    /// host-triggered but guest-influenced (each denied call can emit
+    /// one), so the cap bounds log-store growth for a module hammering
+    /// a denied host in a loop. 100 is far above any legitimate run's
+    /// denial count while keeping worst-case volume trivial.
+    pub(crate) const HOST_DIAG_CAP: u64 = 100;
+
+    /// Cap on policy-denial AUDIT events per execution. Each denial appends a
+    /// hash-chained ledger row and spawns a NATS publish; the guest-visible
+    /// diagnostic was capped at [`Self::HOST_DIAG_CAP`] but the ledger/publish
+    /// beneath it was NOT — a module looping a denied call was bounded only by
+    /// its own fuel, minting one spawned task and one WORM row per iteration.
+    /// At the cap ONE more event (`wasi:capability_denied_suppressed`) is
+    /// appended saying so, and every later denial in this execution is
+    /// refused-but-unrecorded. 200 is twice the diagnostic cap: far above any
+    /// legitimate run's denial count, and a bounded worst case for the ledger.
+    pub(crate) const DENIAL_LEDGER_CAP: u64 = 200;
+
+    /// Cap on DISTINCT credential-use audit events per execution (package BL).
+    /// Measured on the reference fleet 2026-09-15: 27 host-side resolutions
+    /// across 7 executions, all one Gmail token to one host, so ONE distinct
+    /// use per execution is the steady state. 64 is the per-request outbound
+    /// header cap: a single request cannot carry more distinct `vault://`
+    /// references than that. At the cap one `wasi:secret_use_suppressed` is
+    /// appended and later new uses are resolved but not recorded.
+    pub(crate) const SECRET_USE_LEDGER_CAP: usize = 64;
+
+    /// Name the host call now running, for the fuel profile. Every host
+    /// function calls this first; one that does not ends no stretch and is
+    /// only counted (`fuel_profile::UNNAMED`).
+    #[inline]
+    pub(crate) fn host_call(&mut self, label: &'static str) {
+        self.host_call_label = label;
+        if !Self::is_passive_host_call(label) {
+            self.acted_since_network_failure
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A host call that reaches nothing outside the worker and decides
+    /// nothing: logging, and the pure JSON / template / date helpers. Making
+    /// one after a failed HTTP call does not make that failure any less the
+    /// last thing the module did.
+    pub(crate) fn is_passive_host_call(label: &str) -> bool {
+        ["logging::", "json::", "templates::", "datetime::"]
+            .iter()
+            .any(|prefix| label.starts_with(prefix))
+    }
+
+    /// In a rehearsal (`http_replay` set) only `http::fetch` / `fetch_all` are
+    /// answered from recordings. Every other HTTP surface calls this first and
+    /// refuses when it returns true, so "a rehearsal sends nothing" holds for
+    /// all of them rather than for the two that are replayed.
+    pub(crate) async fn rehearsal_refuses(&mut self, surface: &'static str) -> bool {
+        if self.http_replay.is_none() {
+            return false;
+        }
+        self.record_network_outcome(None);
+        self.emit_host_diagnostic(
+            "http-replay",
+            &format!(
+                "{surface} is not replayed: this run is a rehearsal (http_fixtures), \
+                 so the call was refused and nothing was sent"
+            ),
+        )
+        .await;
+        true
+    }
+
+    /// Publish a sanitized host-side diagnostic into the per-execution
+    /// log stream — the same `wasm.log.{execution_id}` channel guest
+    /// `logging::log` uses, marked `source: "host"` — so it lands in
+    /// `workflow_execution_logs` and is visible via `get_execution_logs`
+    /// / `tail_worker_logs` / the editor trace.
+    ///
+    /// WHY (DX pain point 22, 3rd occurrence 2026-07-14): the WIT error
+    /// enums carry no message (and changing them breaks every compiled
+    /// module), so a denied or failed host call surfaced to the module
+    /// author as a bare `networkerror` — indistinguishable across DNS
+    /// outage, host-allowlist deny, method deny, tier-1 egress deny, and
+    /// connection failure. The true reason logged only to worker stderr,
+    /// which the debugging surfaces can't see. Every deny/failure path
+    /// now pairs its opaque enum return with one of these entries.
+    ///
+    /// SANITIZATION CONTRACT: `reason` is a fixed kebab-case token from
+    /// the emitting site; `message` must be built from values the module
+    /// author already controls (their host, method, key path) plus fixed
+    /// policy names — NEVER raw resolver/reqwest error strings (which can
+    /// embed proxy or internal-infra detail) and NEVER secret-derived
+    /// values (same rule as `record_capability_denied`'s `target`).
+    ///
+    /// Best-effort and fire-and-forget: no NATS / no execution_id → nothing
+    /// is published; a publish failure never changes the call's outcome.
+    ///
+    /// When a [`HostDiagSink`] is attached, the SAME formatted line is also
+    /// appended in-process BEFORE those two early-returns — that is the whole
+    /// point of the sink, since `run_sandbox` / `test_module` have no
+    /// execution id and would otherwise emit nothing anywhere. Both routes
+    /// spend the one shared `HOST_DIAG_CAP` budget, so attaching a sink
+    /// cannot increase how much a module can emit.
+    // `&mut self` (not `&self`): AegixContext is Send but not Sync (the
+    // WASI stdio streams), so async methods must hold an exclusive ref
+    // to keep their futures Send — same reason record_capability_denied
+    // and every other async host method take `&mut self`.
+    pub async fn emit_host_diagnostic(&mut self, reason: &str, message: &str) {
+        let count = self
+            .host_diag_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= Self::HOST_DIAG_CAP {
+            if count == Self::HOST_DIAG_CAP {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    "host-diagnostic quota exceeded, dropping further entries"
+                );
+            }
+            return;
+        }
+        // In-process mirror first: it is the ONLY route for a caller with no
+        // execution id, so it must not sit behind the NATS/id guards below.
+        // Same text as the published entry (`build_host_diagnostic_entry`'s
+        // `message` field) so the two surfaces can't describe the same event
+        // differently.
+        if let Some(ref sink) = self.host_diag_sink {
+            if let Ok(mut lines) = sink.lock() {
+                // Bound independently of the per-context counter: a retrying
+                // execution builds a fresh AegixContext (and a fresh counter)
+                // per attempt while the caller's sink is shared across all of
+                // them, so the counter alone would not cap the Vec.
+                if (lines.len() as u64) < Self::HOST_DIAG_CAP {
+                    lines.push(format_host_diagnostic_line(reason, message));
+                }
+            }
+        }
+        let Some(nats) = &self.nats_client else {
+            return;
+        };
+        let Some(execution_id) = self.execution_id.as_deref().filter(|e| !e.is_empty()) else {
+            return;
+        };
+        let log_entry = build_host_diagnostic_entry(
+            execution_id,
+            self.request_id.as_deref().unwrap_or_default(),
+            reason,
+            message,
+        );
+        if let Ok(payload) = serde_json::to_vec(&log_entry) {
+            let topic = format!("wasm.log.{execution_id}");
+            let _ = nats.publish(topic, payload.into()).await;
+        }
+    }
+
+    /// Record a host-side HTTP FAILURE and publish its diagnostic in one step.
+    ///
+    /// The single chokepoint for [`crate::reason_class`] tokens: the same
+    /// `class` becomes BOTH the `[host:<reason>]` diagnostic tag AND the
+    /// `[reason_class=…]` marker the retry gates read, so the two can never
+    /// drift into disagreeing about why a call failed.
+    ///
+    /// `class` must be one of the `reason_class` consts — never a
+    /// request-derived string. `message` is bound by the same sanitization
+    /// contract as [`Self::emit_host_diagnostic`].
+    /// `wit` is the discriminant name the caller is about to return to the
+    /// guest — one of the `reason_class::WIT_*` consts. It is a PARAMETER and
+    /// not a constant because the pairing is what licenses the marker: a class
+    /// raised at a `Timeout` site must never be stamped onto a `networkerror`
+    /// message, and vice versa. Passing it at the call site keeps the two
+    /// visibly together where a reviewer reads the `return Err(...)`.
+    pub(crate) async fn emit_network_failure(
+        &mut self,
+        class: &'static str,
+        wit: &'static str,
+        message: &str,
+    ) {
+        self.record_network_outcome(Some(crate::reason_class::Reason { class, wit }));
+        self.emit_host_diagnostic(class, message).await;
+    }
+
+    /// Latch a host-side denial WITHOUT publishing a diagnostic.
+    ///
+    /// The HTTP policy-denial sites already publish their `[host:<policy>]`
+    /// diagnostic through `record_capability_denied` (and the pure-cap sites
+    /// deliberately publish none at all), so this is the latch half on its
+    /// own. Adding a second diagnostic at those ~34 sites would duplicate the
+    /// audit-backed one and double-spend `HOST_DIAG_CAP`.
+    ///
+    /// `&self` for the same reason as [`Self::record_network_outcome`]: the
+    /// `fetch_all` validation loop holds an immutable borrow of the request
+    /// vector while it runs.
+    pub(crate) fn record_http_denial(&self, class: &'static str, wit: &'static str) {
+        self.record_network_outcome(Some(crate::reason_class::Reason { class, wit }));
+    }
+
+    /// RFC 0014 P4a: latch which progress deadline cut a LOCAL LLM exchange,
+    /// so a node that fails on it carries `[reason_class=inference-*-timeout]`
+    /// and the retry decision can tell first-byte, idle and ceiling apart.
+    ///
+    /// Shares the egress latch deliberately. Every failing return on the four
+    /// HTTP surfaces latches or clears it (the totality rule), so a later HTTP
+    /// failure overwrites this class and it can never ride one. Only a TIMEOUT
+    /// latches here: the other local-exchange failures surface as
+    /// `api-error(…)`, which no class explains, and clearing on them could
+    /// remove an earlier NON-transient HTTP marker — the forbidden direction.
+    pub(crate) fn record_inference_timeout(&self, kind: aegix_local_inference::stream::StallKind) {
+        self.record_network_outcome(Some(crate::reason_class::Reason {
+            class: crate::reason_class::inference_timeout_class(kind),
+            wit: crate::reason_class::WIT_LLM_TIMEOUT,
+        }));
+    }
+
+    /// Record the class of the latest host-side HTTP outcome — `Some(class)`
+    /// for a failure, `None` to CLEAR after a success. See
+    /// [`Self::last_network_reason`] for why success must clear.
+    ///
+    /// Takes `&self` (not `&mut`) so the success path can call it without
+    /// disturbing borrow shapes in the middle of a request pipeline. A
+    /// poisoned mutex is recovered rather than propagated: losing a
+    /// diagnostic breadcrumb must never change a call's outcome.
+    pub(crate) fn record_network_outcome(&self, class: Option<crate::reason_class::Reason>) {
+        let mut guard = self
+            .last_network_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A failure starts the watch on what the module does next. The host
+        // call that failed has already set the flag in `host_call`, so it is
+        // cleared here, AFTER it.
+        if class.is_some() {
+            self.acted_since_network_failure
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        *guard = class;
+    }
+
+    /// Is there host-diagnostic budget left this execution?
+    ///
+    /// Read-only peek at the same counter [`Self::emit_host_diagnostic`]
+    /// spends, so the WORKER-LOG line carrying the sanitized transport detail
+    /// shares the diagnostic channel's `HOST_DIAG_CAP` bound instead of being
+    /// a second, uncapped stream. Without it the per-execution ceiling on that
+    /// line is `MAX_HTTP_CALLS_PER_EXECUTION` (1000) × the sanitizer's 2000-char
+    /// truncation — megabytes from one runaway module. Failures are rare and
+    /// the first 100 carry all the diagnostic value.
+    pub(crate) fn host_diag_budget_remaining(&self) -> bool {
+        self.host_diag_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < Self::HOST_DIAG_CAP
+    }
+
+    /// Handle onto [`Self::last_network_reason`] for the runtime to keep after
+    /// this context is moved into the wasmtime `Store`.
+    pub(crate) fn network_reason_handle(
+        &self,
+    ) -> Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>> {
+        self.last_network_reason.clone()
+    }
+
+    /// Handle onto [`Self::acted_since_network_failure`], kept by the runtime
+    /// for the same reason.
+    pub(crate) fn acted_since_network_failure_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.acted_since_network_failure.clone()
+    }
+
+    /// Every policy-driven refusal in the worker — HTTP host allowlist,
+    /// HTTP method allowlist, Tier-1 LLM egress, secret allowlist,
+    /// private-IP SSRF guard — calls this BEFORE returning the deny error
+    /// to the guest. The append is hash-chained (SHA-256 over the previous
+    /// row's hash plus length-prefixed fields) and HMAC-signed if
+    /// `AEGIX_AUDIT_SIGNING_KEY` is configured. The downstream subscriber
+    /// in the controller persists the row to Postgres (append-only via
+    /// `prevent_audit_modification` trigger) and to S3 / MinIO (optionally
+    /// Object-Lock-Compliance gated by `AEGIX_AUDIT_S3_OBJECT_LOCK`).
+    ///
+    /// Best-effort: a NATS publish failure does NOT change the deny
+    /// outcome and the security event remains visible via tracing and the
+    /// in-memory ledger row. The deny path itself is unconditional.
+    ///
+    /// SECURITY: never pass plaintext secret values, full vault paths, or
+    /// URLs containing tokens through `target`. Hash secret-derived values
+    /// first and pass only the host / path / hash.
+    ///
+    /// * `capability` — kebab-case kind: `http-fetch`, `http-method`,
+    ///   `tier1-llm-egress`, `secret-access`, `vault-header`, `graphql`,
+    ///   `webhook`, etc. Stable across releases — operator dashboards key
+    ///   on this.
+    /// * `policy` — which named policy fired: `allowed-hosts`,
+    ///   `external-llm-hosts`, `private-ip`, `method-allowlist`,
+    ///   `secret-allowlist`, etc. Pairs with `capability` to make the
+    ///   reason machine-grep'able.
+    /// * `target` — the attempted target as a non-secret string (host,
+    ///   key-path SHA-256, sanitized URL).
+    ///
+    /// Takes `&mut self` (not `&self`) so the future is `Send` without
+    /// requiring `AegixContext: Sync` — `WasiCtx` contains
+    /// `dyn RngCore + Send` which is not `Sync`. Matches the existing
+    /// inline-audit pattern at `host_impl.rs::secrets::get_secret`.
+    pub async fn record_capability_denied(&mut self, capability: &str, policy: &str, target: &str) {
+        self.record_capability_denied_detailed(capability, policy, target, None)
+            .await;
+    }
+
+    /// As [`Self::record_capability_denied`], plus one sentence of operator
+    /// DETAIL appended to the guest-visible diagnostic.
+    ///
+    /// Added 2026-09-23 for the write-ceiling HTTP refusal, where the generic
+    /// line — `http-fetch denied by policy 'write-ceiling' (target: <host>)` —
+    /// is true and unactionable: it does not say that the ceiling classifies by
+    /// HTTP VERB, so an operator whose API answers reads over POST reads it as
+    /// "this host is blocked" and goes looking at `allowed_hosts`. Measured
+    /// cost of that omission: one wrong diagnosis, by the author of the gate.
+    ///
+    /// `detail` is a FIXED string chosen at the call site, never caller data —
+    /// same no-secrets contract as `capability` and `policy`. The ledger
+    /// payload is deliberately UNCHANGED: `capability`/`policy`/`target` are
+    /// the queryable fields and a free-text sentence is not one.
+    pub async fn record_capability_denied_detailed(
+        &mut self,
+        capability: &str,
+        policy: &str,
+        target: &str,
+        detail: Option<&'static str>,
+    ) {
+        // Guest-visible diagnostic FIRST (and unconditionally — the audit
+        // ledger below is optional wiring, the module author's debugging
+        // signal is not). `capability`/`policy` are fixed tokens and
+        // `target` already obeys this fn's no-secrets contract, so the
+        // pair is safe to surface in the execution log.
+        let base = format!("{capability} denied by policy '{policy}' (target: {target})");
+        let line = match detail {
+            Some(d) => format!("{base} — {d}"),
+            None => base,
+        };
+        self.emit_host_diagnostic(policy, &line).await;
+        if self.audit_ledger.is_none() {
+            return;
+        }
+
+        // Bound the ledger + publish fan-out (see `DENIAL_LEDGER_CAP`). The
+        // DENY itself is unconditional and already happened at the call site;
+        // only the RECORDING is capped. At exactly the cap one suppression
+        // event is appended so the ledger says "more happened than is here"
+        // rather than ending at a round number.
+        let n = self
+            .denial_ledger_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (action, payload) = if n < Self::DENIAL_LEDGER_CAP {
+            (
+                "wasi:capability_denied",
+                serde_json::json!({
+                    "capability": capability,
+                    "policy": policy,
+                    "target": target,
+                    "actor_id": self.actor_id.map(|u| u.to_string()),
+                    "module_id": self.module_id.as_deref(),
+                })
+                .to_string(),
+            )
+        } else if n == Self::DENIAL_LEDGER_CAP {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                cap = Self::DENIAL_LEDGER_CAP,
+                capability,
+                policy,
+                "policy-denial audit cap reached — further denials in this execution are \
+                 refused but not individually recorded"
+            );
+            (
+                "wasi:capability_denied_suppressed",
+                serde_json::json!({
+                    "suppressed_after": Self::DENIAL_LEDGER_CAP,
+                    "last_capability": capability,
+                    "last_policy": policy,
+                    "actor_id": self.actor_id.map(|u| u.to_string()),
+                    "module_id": self.module_id.as_deref(),
+                })
+                .to_string(),
+            )
+        } else {
+            return;
+        };
+
+        self.append_and_replicate(action, &payload, capability)
+            .await;
+    }
+
+    /// Append one `worker` event to this execution's audit ledger and
+    /// replicate it to the WORM stream (`talos.audit.ledger`). Returns the
+    /// appended event, or `None` when no ledger is wired. `label` names the
+    /// event in the replication-failure WARN. One home for both recorders
+    /// (`record_capability_denied`, `record_secret_use`).
+    async fn append_and_replicate(
+        &mut self,
+        action: &str,
+        payload: &str,
+        label: &str,
+    ) -> Option<crate::audit::AuditEvent> {
+        let ledger_mutex = self.audit_ledger.as_ref()?;
+        let event = {
+            let mut ledger = ledger_mutex.lock().await;
+            ledger.append("worker", action, payload)
+        };
+
+        replicate_audit_event(self.nats_client.clone(), event.clone(), label.to_string());
+        Some(event)
+    }
+
+    /// [`Self::record_capability_denied_detailed`] for a SYNCHRONOUS host
+    /// function — the gated `wasi:http` handler (`host::wasi_http`), whose
+    /// upstream trait is sync.
+    ///
+    /// Same guest diagnostic, same ledger payload, same cap. The ledger is a
+    /// `tokio::sync::Mutex`; it is taken with `try_lock`, which succeeds unless
+    /// another task holds it at this instant — and during a guest's own host
+    /// call nothing else does (appends hold it only for the synchronous
+    /// `append`). Appending HERE, inside the host call, is what keeps the
+    /// event ahead of the execution's terminal anchor; a spawned append could
+    /// land after it and read as tampering. If the lock IS contended the
+    /// append is spawned instead and a WARN says ordering is not guaranteed
+    /// for that event.
+    pub(crate) fn record_capability_denied_now(
+        &mut self,
+        capability: &str,
+        policy: &str,
+        target: &str,
+        detail: Option<&'static str>,
+    ) {
+        let base = format!("{capability} denied by policy '{policy}' (target: {target})");
+        let line = match detail {
+            Some(d) => format!("{base} — {d}"),
+            None => base,
+        };
+        self.emit_host_diagnostic_now(policy, &line);
+        if self.audit_ledger.is_none() {
+            return;
+        }
+        let n = self
+            .denial_ledger_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (action, payload) = if n < Self::DENIAL_LEDGER_CAP {
+            (
+                "wasi:capability_denied",
+                serde_json::json!({
+                    "capability": capability,
+                    "policy": policy,
+                    "target": target,
+                    "actor_id": self.actor_id.map(|u| u.to_string()),
+                    "module_id": self.module_id.as_deref(),
+                })
+                .to_string(),
+            )
+        } else if n == Self::DENIAL_LEDGER_CAP {
+            (
+                "wasi:capability_denied_suppressed",
+                serde_json::json!({
+                    "suppressed_after": Self::DENIAL_LEDGER_CAP,
+                    "last_capability": capability,
+                    "last_policy": policy,
+                    "actor_id": self.actor_id.map(|u| u.to_string()),
+                    "module_id": self.module_id.as_deref(),
+                })
+                .to_string(),
+            )
+        } else {
+            return;
+        };
+        let Some(ledger_mutex) = self.audit_ledger.clone() else {
+            return;
+        };
+        let appended = ledger_mutex
+            .try_lock()
+            .map(|mut ledger| ledger.append("worker", action, &payload));
+        let event = match appended {
+            Ok(event) => event,
+            Err(_) => {
+                tracing::warn!(
+                    capability,
+                    policy,
+                    "audit ledger contended during a synchronous denial — appending from a \
+                     spawned task; this event's order relative to the terminal anchor is \
+                     not guaranteed"
+                );
+                let action = action.to_string();
+                let nats = self.nats_client.clone();
+                let label = capability.to_string();
+                tokio::spawn(async move {
+                    let event = ledger_mutex
+                        .lock()
+                        .await
+                        .append("worker", &action, &payload);
+                    replicate_audit_event(nats, event, label);
+                });
+                return;
+            }
+        };
+        replicate_audit_event(self.nats_client.clone(), event, capability.to_string());
+    }
+
+    /// [`Self::emit_host_diagnostic`] for a synchronous host function: the
+    /// in-process sink is written in place, the NATS publish is spawned
+    /// (it was fire-and-forget already). Shares `HOST_DIAG_CAP`.
+    pub(crate) fn emit_host_diagnostic_now(&mut self, reason: &str, message: &str) {
+        let count = self
+            .host_diag_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= Self::HOST_DIAG_CAP {
+            return;
+        }
+        if let Some(ref sink) = self.host_diag_sink {
+            if let Ok(mut lines) = sink.lock() {
+                if (lines.len() as u64) < Self::HOST_DIAG_CAP {
+                    lines.push(format_host_diagnostic_line(reason, message));
+                }
+            }
+        }
+        let Some(nats) = self.nats_client.clone() else {
+            return;
+        };
+        let Some(execution_id) = self.execution_id.as_deref().filter(|e| !e.is_empty()) else {
+            return;
+        };
+        let log_entry = build_host_diagnostic_entry(
+            execution_id,
+            self.request_id.as_deref().unwrap_or_default(),
+            reason,
+            message,
+        );
+        if let Ok(payload) = serde_json::to_vec(&log_entry) {
+            let topic = format!("wasm.log.{execution_id}");
+            tokio::spawn(async move {
+                if let Err(e) = nats.publish(topic, payload.into()).await {
+                    tracing::debug!(error = %e, "host diagnostic publish failed");
+                }
+            });
+        }
+    }
+
+    /// Record that a resolved CREDENTIAL is about to leave the host (package
+    /// BL, 2026-09-15).
+    ///
+    /// Before this, the WORM ledger recorded guest `get_secret` calls and every
+    /// DENIED resolution, but not one host-initiated credential USE: a
+    /// `vault://` token spliced into an outbound header, an LLM provider key,
+    /// the email API key. Measured over the whole reference audit bucket
+    /// (60 618 execution prefixes): 61 111 `execution_complete`, 6
+    /// `capability_denied`, 1 approval request — and zero events saying a
+    /// credential went anywhere, while the worker resolved a Gmail token into
+    /// an `Authorization` header roughly 1 300 times a day. The ledger could say
+    /// what a module was refused and never what it was given.
+    ///
+    /// ONE event per distinct `(surface, key hash, destination)` per execution
+    /// (a loop sending one token to one host records once — the per-request
+    /// cost stays a set lookup), up to [`Self::SECRET_USE_LEDGER_CAP`], then a
+    /// single `wasi:secret_use_suppressed`. The payload carries the key-path
+    /// SHA-256 (never the path: operators reading the ledger must not learn
+    /// vault layout) and the destination HOST (never the URL, whose query
+    /// string can carry data). Call only AFTER the plaintext is in hand — a
+    /// failed or denied resolution is not a use.
+    pub(crate) async fn record_secret_use(
+        &mut self,
+        surface: SecretUseSurface,
+        destination: &str,
+        key_name: &str,
+        source: SecretSource,
+        header_name: Option<&str>,
+    ) -> Option<crate::audit::AuditEvent> {
+        self.audit_ledger.as_ref()?;
+        let key_hash =
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(key_name.as_bytes())).to_string();
+        let dedupe = format!("{}|{}|{}", surface.as_str(), key_hash, destination);
+        let action = match secret_use_admission(
+            &mut self.secret_use_recorded,
+            dedupe,
+            Self::SECRET_USE_LEDGER_CAP,
+        ) {
+            SecretUseAdmission::AlreadyRecorded | SecretUseAdmission::Suppressed => return None,
+            SecretUseAdmission::Record => "wasi:secret_use",
+            SecretUseAdmission::RecordSuppression => {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    cap = Self::SECRET_USE_LEDGER_CAP,
+                    "credential-use audit cap reached — further distinct credential uses in \
+                     this execution are allowed but not individually recorded"
+                );
+                "wasi:secret_use_suppressed"
+            }
+        };
+        let payload = if action == "wasi:secret_use" {
+            serde_json::json!({
+                "surface": surface.as_str(),
+                "key_hash": key_hash,
+                "destination": destination,
+                "source": source.as_str(),
+                "header": header_name,
+                "actor_id": self.actor_id.map(|u| u.to_string()),
+                "module_id": self.module_id.as_deref(),
+            })
+        } else {
+            serde_json::json!({
+                "suppressed_after": Self::SECRET_USE_LEDGER_CAP,
+                "last_surface": surface.as_str(),
+                "actor_id": self.actor_id.map(|u| u.to_string()),
+                "module_id": self.module_id.as_deref(),
+            })
+        }
+        .to_string();
+        self.append_and_replicate(action, &payload, action).await
+    }
+
+    /// Write-ceiling gate for data-mutating host ops.
+    ///
+    /// Returns `true` when the op MUST be refused: enforcement is on
+    /// (`AEGIX_WRITE_CEILING_ENFORCED=1`) AND this job's actor is
+    /// `ReadOnly`. On refusal it records a `wasi:capability_denied` audit
+    /// event (`policy = "write-ceiling"`) and emits a WARN, mirroring the
+    /// tier-1 egress gate. When enforcement is off — the default — it
+    /// short-circuits to `false` before any allocation, so the signed
+    /// `max_write_ceiling` field stays inert on the hot path until an
+    /// operator opts in.
+    ///
+    /// `op` is a stable, non-secret label (e.g. `"agent-memory-set"`);
+    /// `target` is a non-secret detail (key, sanitized URL, table) for the
+    /// audit trail — never a secret value.
+    ///
+    /// `axis` is REQUIRED rather than defaulted, and that is the point: a new
+    /// gate site cannot inherit the wrong half of the ceiling by saying
+    /// nothing. [`CeilingAxis::VerbInferred`] belongs to the three sites that
+    /// guess "is this a mutation?" from the HTTP verb; everything else is
+    /// [`CeilingAxis::Categorical`]. Making it a parameter is a stronger
+    /// guard than a source pin — the compiler enforces it.
+    pub async fn write_ceiling_refuses(
+        &mut self,
+        axis: aegix_workflow_job_protocol::CeilingAxis,
+        op: &str,
+        target: &str,
+    ) -> bool {
+        self.write_ceiling_refuses_detailed(axis, op, target, None)
+            .await
+    }
+
+    /// The write-ceiling refusal, with one sentence of operator detail.
+    ///
+    /// The HTTP call sites pass [`WRITE_CEILING_VERB_DETAIL`] because their
+    /// classification is by VERB and nothing said so — see that constant.
+    pub async fn write_ceiling_refuses_detailed(
+        &mut self,
+        axis: aegix_workflow_job_protocol::CeilingAxis,
+        op: &str,
+        target: &str,
+        detail: Option<&'static str>,
+    ) -> bool {
+        // Pure decision (flag + ceiling) split out for unit testing; the
+        // audit + warn side effects stay here. Short-circuits before any
+        // allocation on the default (disabled) path.
+        if !aegix_workflow_job_protocol::write_ceiling_denies_axis(
+            write_ceiling_enforced(),
+            axis,
+            self.max_write_ceiling,
+            self.http_verb_ceiling,
+        ) {
+            return false;
+        }
+        self.record_capability_denied_detailed(op, "write-ceiling", target, detail)
+            .await;
+        tracing::warn!(
+            op,
+            actor_id = ?self.actor_id,
+            module_id = self.module_id.as_deref(),
+            "write-ceiling: refused data-mutating host op for a read-only actor"
+        );
+        true
+    }
+
+    /// Strict-egress gate for NON-mutating outbound requests from
+    /// read-only actors (see [`write_ceiling_strict_egress`]). Returns
+    /// `true` when the read MUST be refused: both flags on, actor is
+    /// read-only, and the host was admitted only via the `"*"` wildcard.
+    /// Audit policy is `"write-ceiling-strict-egress"` so operators can
+    /// distinguish read-egress refusals from mutation refusals.
+    pub(crate) async fn read_egress_refuses(
+        &mut self,
+        op: &str,
+        host: &str,
+        matched: crate::host::HostMatchKind,
+    ) -> bool {
+        if !strict_egress_denies(
+            write_ceiling_enforced(),
+            write_ceiling_strict_egress(),
+            self.max_write_ceiling,
+            matched,
+        ) {
+            return false;
+        }
+        self.record_capability_denied(op, "write-ceiling-strict-egress", host)
+            .await;
+        tracing::warn!(
+            op,
+            host,
+            actor_id = ?self.actor_id,
+            module_id = self.module_id.as_deref(),
+            "strict-egress: refused wildcard-admitted read for a read-only actor \
+             (name the host in allowed_hosts to permit it)"
+        );
+        true
+    }
+
+    /// Build a module-scoped state key to isolate per-module state within a
+    /// shared execution.  Format: `{module_id}:{key}`.
+    pub fn scoped_state_key(&self, key: &str) -> String {
+        match &self.module_id {
+            Some(mid) => format!("{}:{}", mid, key),
+            None => key.to_string(), // fallback for tests/unknown
+        }
+    }
+
+    /// Check if this execution has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // ========================================================================
+    // UNIFIED RESOURCE VALIDATION HELPERS
+    // ========================================================================
+
+    /// Validates that a JSON payload does not exceed the configured size limit.
+    ///
+    /// This is a unified helper used by all JSON-handling host functions to ensure
+    /// consistent enforcement of payload size limits and prevent OOM attacks.
+    ///
+    /// # Arguments
+    /// * `payload` - The JSON string to validate
+    /// * `operation` - Name of the operation for logging (e.g., "json::parse")
+    ///
+    /// # Returns
+    /// * `Ok(())` if the payload is within limits
+    /// * `Err(limit)` where limit is the max size if exceeded
+    pub fn validate_json_size(&self, payload: &str, operation: &str) -> Result<(), usize> {
+        const DEFAULT_MAX_JSON: usize = 1024 * 1024; // 1 MiB default
+                                                     // MCP-495: cache the env-driven cap on first use. Every JSON
+                                                     // parse/serialize ran `std::env::var("WASM_MAX_JSON_SIZE")` —
+                                                     // a Mutex<HashMap> lookup inside libstd — and re-parsed the
+                                                     // string on every call. WASM_MAX_JSON_SIZE is set at process
+                                                     // start and doesn't change at runtime; OnceLock locks it in.
+                                                     //
+                                                     // MCP-772 (2026-05-13): route through `nonzero_env_or_default`
+                                                     // (sibling to MCP-639 which fixed the WASM_MAX_OUTPUT_BYTES /
+                                                     // WASM_MAX_INPUT_BYTES variants). `WASM_MAX_JSON_SIZE=0`
+                                                     // previously parsed as a valid value and produced
+                                                     // `payload.len() > 0 → true` for any non-empty JSON, rejecting
+                                                     // every parse/serialize at the boundary. Helper substitutes
+                                                     // the default + emits a structured WARN at first use.
+        use std::sync::OnceLock;
+        static MAX_JSON: OnceLock<usize> = OnceLock::new();
+        let max_json = *MAX_JSON.get_or_init(|| {
+            crate::runtime::nonzero_env_or_default("WASM_MAX_JSON_SIZE", DEFAULT_MAX_JSON)
+        });
+
+        if payload.len() > max_json {
+            tracing::warn!(
+                operation = operation,
+                size = payload.len(),
+                limit = max_json,
+                "JSON payload exceeds size limit"
+            );
+            return Err(max_json);
+        }
+        Ok(())
+    }
+
+    /// Consumes fuel to account for async host function execution time.
+    ///
+    /// This provides "async-aware" fuel consumption. While WASM fuel counts
+    /// instructions executed inside the guest, async host functions (like HTTP
+    /// requests) can run for a long time without executing guest instructions.
+    ///
+    /// This method converts elapsed wall time into an approximate fuel cost
+    /// based on the assumption that ~1ms of wall time ≈ 10,000 instructions
+    /// on a typical host. This prevents modules from making indefinite async
+    /// calls to bypass fuel limits.
+    ///
+    /// # Arguments
+    /// * `elapsed` - The elapsed wall time
+    /// * `operation` - Name of the operation for logging
+    ///
+    /// # Returns
+    /// The fuel cost computed from `elapsed`. Currently always succeeds —
+    /// fuel-budget enforcement happens in the per-host-fn caller, this
+    /// helper just standardizes the wall-time → fuel conversion.
+    pub fn consume_async_fuel(&mut self, elapsed: std::time::Duration, operation: &str) -> u64 {
+        // Approximate conversion: 1ms wall time ≈ 10,000 WASM instructions
+        // This is a conservative estimate that prevents abuse while allowing
+        // legitimate async operations.
+        const FUEL_PER_MS: u64 = 10_000;
+        let fuel_cost = (elapsed.as_millis() as u64).saturating_mul(FUEL_PER_MS);
+
+        // Return the cost so the caller can account for it
+        tracing::debug!(
+            operation = operation,
+            elapsed_ms = elapsed.as_millis(),
+            fuel_cost = fuel_cost,
+            "Consumed async fuel"
+        );
+
+        fuel_cost
+    }
+
+    /// Atomically check and consume crypto budget.
+    ///
+    /// This is an optimized variant of `deduct_crypto_budget` that checks if
+    /// sufficient budget exists before deducting, preventing overdraft.
+    ///
+    /// # Arguments
+    /// * `microseconds` - The amount of budget to consume
+    ///
+    /// # Returns
+    /// * `true` if the budget was successfully deducted
+    /// * `false` if insufficient budget exists
+    pub fn try_deduct_crypto_budget(&self, microseconds: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = self.crypto_budget_us.load(Ordering::Relaxed);
+            if current < microseconds {
+                return false;
+            }
+            let new_val = current - microseconds;
+            match self.crypto_budget_us.compare_exchange(
+                current,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue, // CAS failed, retry
+            }
+        }
+    }
+
+    /// Mark this execution as cancelled.
+    ///
+    /// **This method still has no production caller, and that is not the same
+    /// thing as the mechanism being inert.** Operator-initiated cancellation
+    /// stores into the SAME `Arc<AtomicBool>` from outside the context —
+    /// `AegixRuntime::cancel_execution` reaches it through
+    /// [`crate::cancel_registry`], which holds the Arc rather than the
+    /// context, because the context is owned by the wasmtime `Store` for the
+    /// duration of the call. So the flag IS set in production; it is set by a
+    /// different writer.
+    ///
+    /// Kept because it is the natural in-context spelling and is what
+    /// `worker/tests/kill_switch_tests.rs` drives. If you are auditing whether
+    /// cancellation has a producer, grep for writers of the FLAG
+    /// (`cancelled.store(`), not callers of this method — an inventory pinned
+    /// to this one spelling reported a clean "no producer" about a live
+    /// mechanism.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check if a rate limit has been exceeded. Returns true if OK, false if exceeded.
+    /// `limit` of 0 means unlimited.
+    ///
+    /// MCP-495: previously `fetch_add(1)` unconditionally — even when
+    /// the call was already over-budget. A module hammering an
+    /// exhausted limit pushed the counter arbitrarily high; consumers
+    /// reading the counter for metrics / reporting saw inflated
+    /// "attempts" instead of the actual call count. The CAS pattern
+    /// here matches `try_deduct_crypto_budget` / `deduct_crypto_budget`
+    /// in this same file: load → check → CAS-increment, retry on
+    /// contention. The counter only advances when the call IS
+    /// admitted, so its value is a faithful "calls allowed" tally.
+    /// The batch-HTTP path at `host_impl.rs::fetch_all` had to roll
+    /// back manually for the same reason — this helper now does
+    /// the right thing inline.
+    pub fn check_rate_limit(&self, counter: &AtomicU64, limit: u64) -> bool {
+        if limit == 0 {
+            return true;
+        }
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = counter.load(Ordering::Relaxed);
+            if current >= limit {
+                return false;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// M-6: atomic check-and-bump of the per-host HTTP counter.
+    /// Returns `true` if the per-host budget for `host` still has
+    /// headroom and the counter was incremented; `false` if the host
+    /// is at `limit`.
+    ///
+    /// Hosts are lowercased at entry so `Example.com` and
+    /// `example.com` share a slot. The `DashMap` entry API is
+    /// linearizable per-key, so concurrent admissions from the same
+    /// execution serialize correctly without an outer lock.
+    pub fn check_per_host_rate_limit(&self, host: &str, limit: u64) -> bool {
+        per_host_check_and_bump(&self.http_calls_per_host, host, limit)
+    }
+
+    /// L-finding-7: per-host CUMULATIVE SSE-connect check. Sibling to
+    /// `check_per_host_rate_limit` but routes through the separate
+    /// `sse_connects_per_host` map so the HTTP and SSE budgets do not
+    /// share a counter (a chatty webhook poller shouldn't drain the
+    /// SSE budget and vice versa). Same lower-cased `host:port` key
+    /// normalisation, same lock-free DashMap update pattern.
+    pub fn check_sse_per_host_rate_limit(&self, host: &str, limit: u64) -> bool {
+        per_host_check_and_bump(&self.sse_connects_per_host, host, limit)
+    }
+
+    /// Atomically deduct `microseconds` from the crypto time budget.
+    /// Returns `true` if budget remains, `false` if exhausted.
+    pub fn deduct_crypto_budget(&self, microseconds: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = self.crypto_budget_us.load(Ordering::Relaxed);
+            if current == 0 {
+                return false;
+            }
+            let new_val = current.saturating_sub(microseconds);
+            match self.crypto_budget_us.compare_exchange(
+                current,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return new_val > 0,
+                Err(_) => continue, // CAS failed, retry
+            }
+        }
+    }
+
+    // Bulk state flush / load were part of the pre-Phase-2.3 durable-
+    // state design (used `state_db_pool` directly from the worker).
+    // With state writes now brokered through NATS via
+    // `spawn_state_write_through`, there is no in-process DB pool on
+    // the worker to flush to. Removed 2026-04-14.
+}
+
+// `flush_state_impl` and `load_state_impl` lived here pre-Phase-2.3
+// to push state into `execution_state` from the worker directly.
+// That path no longer exists — writes go through NATS-RPC
+// (`spawn_state_write_through`) and reads are in-memory only during
+// an execution. Deleted 2026-04-14.
+
+/// Pure-function core of `AegixContext::check_per_host_rate_limit`,
+/// extracted so the per-host rate-limit algorithm is unit-testable
+/// without constructing a full AegixContext. Lowercases the host
+/// (so case variants share a slot), short-circuits when limit == 0,
+/// and uses the DashMap entry API for linearizable per-key updates.
+pub(crate) fn per_host_check_and_bump(
+    counts: &dashmap::DashMap<String, u64>,
+    host: &str,
+    limit: u64,
+) -> bool {
+    if limit == 0 {
+        return true;
+    }
+    let key = host.to_ascii_lowercase();
+    let mut entry = counts.entry(key).or_insert(0);
+    if *entry >= limit {
+        return false;
+    }
+    *entry += 1;
+    true
+}
+
+#[cfg(test)]
+mod fs_preopen_policy_tests {
+    use super::capability_world_has_fs_preopen;
+    use crate::wit_inspector::CapabilityWorld;
+
+    #[test]
+    fn only_filesystem_and_trusted_get_a_preopen() {
+        assert!(capability_world_has_fs_preopen(
+            &CapabilityWorld::Filesystem
+        ));
+        assert!(capability_world_has_fs_preopen(&CapabilityWorld::Trusted));
+    }
+
+    #[test]
+    fn database_and_agent_get_no_preopen() {
+        // The architectural change: Database/Agent no longer get a raw WASI
+        // preopen (the read-only one was empty/unpopulated and its only guard
+        // was bypassable WASI FilePerms — RUSTSEC-2026-0149). A regression
+        // re-granting them a preopen must fail here.
+        assert!(!capability_world_has_fs_preopen(&CapabilityWorld::Database));
+        assert!(!capability_world_has_fs_preopen(&CapabilityWorld::Agent));
+    }
+
+    #[test]
+    fn non_filesystem_worlds_get_no_preopen() {
+        for w in [
+            CapabilityWorld::Minimal,
+            CapabilityWorld::Http,
+            CapabilityWorld::Network,
+            CapabilityWorld::Secrets,
+            CapabilityWorld::Messaging,
+            CapabilityWorld::Cache,
+            CapabilityWorld::Governance,
+            CapabilityWorld::Unknown,
+        ] {
+            assert!(
+                !capability_world_has_fs_preopen(&w),
+                "{w:?} must not get a filesystem preopen"
+            );
+        }
+    }
+}
+
+/// Resolve the worker's blanket public-egress SSRF gate (`local_egress_only`)
+/// from the per-actor `egress_scope` OVERRIDE, falling back to the tier-derived
+/// default when the override is unset. This is the sole decoupling point of the
+/// LLM-tier / network-egress split — extracted pure so the full matrix is
+/// unit-testable without building a `AegixContext`.
+///
+/// SECURITY: an explicit `Public` is the ONLY value that permits public egress;
+/// `Local`, any future (non_exhaustive) `EgressScope` variant, and (via the
+/// `None` fallback) a `Tier1` actor without an override all deny it. The
+/// LLM-provider deny is NOT decided here — it stays keyed to `max_llm_tier` in
+/// `tier1_egress_deny_reason`, so a `Tier1 + Public` actor reaches public hosts
+/// like Gmail but STILL cannot reach an external LLM provider.
+/// The raw `wasi:sockets` destination verdict — the socket-path twin of the
+/// `SsrfFilteringResolver`'s address filter, so both egress surfaces answer
+/// from one rule: a PRIVATE address is always denied (SSRF), and under
+/// `local_egress_only` a PUBLIC address is denied too. Net effect for a
+/// local-egress-only actor: raw sockets reach nothing — which is also what
+/// `runtime::socket_grant` now decides one layer up; this is the belt to that
+/// suspender for any store that reaches the check with the grant on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketAddrVerdict {
+    Permit,
+    /// Private / loopback / link-local / CGNAT / transition-form — the policy
+    /// token names which range (`aegix_ssrf_classify::classify_private_ip`).
+    DenyPrivate(&'static str),
+    /// Globally-routable, but the actor is local-egress-only.
+    DenyPublicLocalEgressOnly,
+}
+
+pub(crate) fn socket_addr_permitted(
+    ip: std::net::IpAddr,
+    local_egress_only: bool,
+) -> SocketAddrVerdict {
+    if let Some(policy) = aegix_ssrf_classify::classify_private_ip(ip) {
+        return SocketAddrVerdict::DenyPrivate(policy);
+    }
+    if local_egress_only {
+        return SocketAddrVerdict::DenyPublicLocalEgressOnly;
+    }
+    SocketAddrVerdict::Permit
+}
+
+#[cfg(test)]
+mod socket_addr_verdict_tests {
+    use super::{socket_addr_permitted, SocketAddrVerdict};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn public_address_is_denied_only_under_local_egress_only() {
+        let public = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(
+            socket_addr_permitted(public, false),
+            SocketAddrVerdict::Permit,
+            "control: a public IP is reachable for a public-egress actor"
+        );
+        assert_eq!(
+            socket_addr_permitted(public, true),
+            SocketAddrVerdict::DenyPublicLocalEgressOnly,
+            "the defect: a local-egress-only actor could open raw TCP to a public IP"
+        );
+        let public6 = IpAddr::V6(
+            "2606:2800:220:1:248:1893:25c8:1946"
+                .parse::<Ipv6Addr>()
+                .unwrap(),
+        );
+        assert_eq!(
+            socket_addr_permitted(public6, true),
+            SocketAddrVerdict::DenyPublicLocalEgressOnly
+        );
+    }
+
+    #[test]
+    fn private_address_is_denied_under_both_postures() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+        ] {
+            assert!(
+                matches!(
+                    socket_addr_permitted(ip, false),
+                    SocketAddrVerdict::DenyPrivate(_)
+                ),
+                "{ip} must be SSRF-denied for a public-egress actor"
+            );
+            assert!(
+                matches!(
+                    socket_addr_permitted(ip, true),
+                    SocketAddrVerdict::DenyPrivate(_)
+                ),
+                "{ip} must be SSRF-denied for a local-egress-only actor too"
+            );
+        }
+    }
+}
+
+pub(crate) fn resolve_local_egress_only(
+    egress_scope: Option<aegix_workflow_job_protocol::EgressScope>,
+    max_llm_tier: aegix_workflow_job_protocol::LlmTier,
+) -> bool {
+    resolve_local_egress_only_impl(egress_scope, max_llm_tier)
+}
+
+fn resolve_local_egress_only_impl(
+    egress_scope: Option<aegix_workflow_job_protocol::EgressScope>,
+    max_llm_tier: aegix_workflow_job_protocol::LlmTier,
+) -> bool {
+    match egress_scope {
+        Some(aegix_workflow_job_protocol::EgressScope::Public) => false,
+        Some(_) => true, // Local + any future variant → fail closed (no egress)
+        None => matches!(max_llm_tier, aegix_workflow_job_protocol::LlmTier::Tier1),
+    }
+}
+
+#[cfg(test)]
+mod egress_scope_gate_tests {
+    use super::resolve_local_egress_only;
+    use aegix_workflow_job_protocol::{EgressScope, LlmTier};
+
+    #[test]
+    fn none_override_falls_back_to_tier_default() {
+        // The backward-compatible path: every existing actor (egress_scope
+        // NULL → None) keeps the exact pre-split behavior.
+        assert!(
+            resolve_local_egress_only(None, LlmTier::Tier1),
+            "Tier1 + no override stays air-gapped (byte-identical to pre-split)"
+        );
+        assert!(
+            !resolve_local_egress_only(None, LlmTier::Tier2),
+            "Tier2 + no override permits public egress (unchanged)"
+        );
+    }
+
+    #[test]
+    fn explicit_public_permits_egress_even_on_tier1() {
+        // THE new capability: a Tier1 actor (LLM hard-gated local) can reach
+        // public hosts like Gmail when egress_scope=Public. The LLM-provider
+        // deny is enforced elsewhere (keyed to the tier), not here.
+        assert!(
+            !resolve_local_egress_only(Some(EgressScope::Public), LlmTier::Tier1),
+            "Tier1 + egress=public → public egress ALLOWED (Gmail reachable)"
+        );
+        assert!(!resolve_local_egress_only(
+            Some(EgressScope::Public),
+            LlmTier::Tier2
+        ));
+    }
+
+    #[test]
+    fn explicit_local_denies_egress_even_on_tier2() {
+        // The override tightens too: a Tier2 actor can be pinned air-gapped.
+        assert!(
+            resolve_local_egress_only(Some(EgressScope::Local), LlmTier::Tier2),
+            "Tier2 + egress=local → public egress DENIED"
+        );
+        assert!(resolve_local_egress_only(
+            Some(EgressScope::Local),
+            LlmTier::Tier1
+        ));
+    }
+
+    /// The tie-in that the failure-attribution branch in `wit_http::fetch`
+    /// depends on: it MUST key on the resolver's posture, never on
+    /// `max_llm_tier == Tier1`. Keying on the tier is wrong in BOTH
+    /// directions, and since a connect failure's class now drives retry
+    /// classification, each mistake is a correctness bug:
+    ///
+    /// * `Tier1 + Public` — the house pattern for a Gmail-reading privacy
+    ///   actor — permits public egress. Calling its connect failures
+    ///   `tier1-egress` makes them `capability_denied` (non-transient) and
+    ///   vetoes exactly the retries this change restores.
+    /// * `Tier2 + Local` denies public egress. NOT calling its connect
+    ///   failures `tier1-egress` leaves them `connect-failed` (transient), so
+    ///   a deny that cannot change between attempts burns the retry budget.
+    #[test]
+    fn egress_attribution_follows_the_resolver_not_the_llm_tier() {
+        use crate::reason_class::{is_local_egress_attributable, CONNECT_FAILED};
+        let attributable = |scope, tier| {
+            is_local_egress_attributable(CONNECT_FAILED, resolve_local_egress_only(scope, tier))
+        };
+        assert!(
+            !attributable(Some(EgressScope::Public), LlmTier::Tier1),
+            "Tier1+Public connect failures are ordinary transport failures — must stay retryable"
+        );
+        assert!(
+            attributable(Some(EgressScope::Local), LlmTier::Tier2),
+            "Tier2+Local connect failures ARE the egress gate — must not be retried"
+        );
+        // The two unchanged, pre-split defaults still behave as before.
+        assert!(attributable(None, LlmTier::Tier1));
+        assert!(!attributable(None, LlmTier::Tier2));
+    }
+}
+
+#[cfg(test)]
+mod per_host_rate_limit_tests {
+    use super::per_host_check_and_bump;
+
+    #[test]
+    fn limit_zero_is_unlimited() {
+        // limit == 0 means "no per-host cap" — match the global
+        // check_rate_limit convention so 0-via-env or unset behaves
+        // identically. The counter is NOT incremented in this path.
+        let counts = dashmap::DashMap::new();
+        for _ in 0..10_000 {
+            assert!(per_host_check_and_bump(&counts, "example.com:443", 0));
+        }
+        assert!(
+            counts.is_empty(),
+            "counter must not be touched when limit=0"
+        );
+    }
+
+    #[test]
+    fn admits_up_to_limit_then_rejects() {
+        let counts = dashmap::DashMap::new();
+        for _ in 0..5 {
+            assert!(per_host_check_and_bump(&counts, "a.example.com:443", 5));
+        }
+        // The 6th call must be rejected.
+        assert!(!per_host_check_and_bump(&counts, "a.example.com:443", 5));
+        // Counter does NOT advance past the limit.
+        assert_eq!(*counts.get("a.example.com:443").unwrap(), 5);
+    }
+
+    #[test]
+    fn different_hosts_have_independent_budgets() {
+        let counts = dashmap::DashMap::new();
+        for _ in 0..3 {
+            assert!(per_host_check_and_bump(&counts, "a.com:443", 3));
+        }
+        // a.com is full but b.com still has its full budget.
+        assert!(!per_host_check_and_bump(&counts, "a.com:443", 3));
+        for _ in 0..3 {
+            assert!(per_host_check_and_bump(&counts, "b.com:443", 3));
+        }
+        assert!(!per_host_check_and_bump(&counts, "b.com:443", 3));
+    }
+
+    #[test]
+    fn case_insensitive_host_collision() {
+        // Example.com and example.com share a budget — otherwise an
+        // attacker could double their effective per-host budget by
+        // alternating case.
+        let counts = dashmap::DashMap::new();
+        for _ in 0..2 {
+            assert!(per_host_check_and_bump(&counts, "Example.com:443", 2));
+        }
+        // Third request — different case, same logical host.
+        assert!(!per_host_check_and_bump(&counts, "example.com:443", 2));
+        assert!(!per_host_check_and_bump(&counts, "EXAMPLE.COM:443", 2));
+    }
+
+    #[test]
+    fn rejected_attempts_do_not_advance_counter() {
+        // Once we're at the cap, subsequent rejected attempts must
+        // not silently push the counter higher (would matter if we
+        // ever exposed the counter for diagnostic purposes).
+        let counts = dashmap::DashMap::new();
+        for _ in 0..2 {
+            assert!(per_host_check_and_bump(&counts, "a:80", 2));
+        }
+        for _ in 0..5 {
+            assert!(!per_host_check_and_bump(&counts, "a:80", 2));
+        }
+        assert_eq!(*counts.get("a:80").unwrap(), 2);
+    }
+}
+
+/// Pure builder for the host-diagnostic log entry — the wire contract
+/// with the controller's `wasm.log.*` subscriber (which persists to
+/// `workflow_execution_logs` keyed on `execution_id`/`level`/`message`).
+/// Kept as a free function so the shape is unit-testable without
+/// constructing a `AegixContext` (no test constructor exists — the
+/// context owns WASI streams). `source: "host"` distinguishes these
+/// entries from guest `logging::log` output (`source: "wasm"`).
+/// The one place the `[host:<reason>] <message>` line is spelled.
+///
+/// Both delivery routes format through this — the NATS entry below and the
+/// in-process [`HostDiagSink`] — so an operator reading a persisted log line
+/// and a developer reading `run_sandbox` output see the same text for the
+/// same event.
+/// Replicate one appended audit event to the WORM stream
+/// (`talos.audit.ledger`). Fire-and-forget; one home for the async and the
+/// synchronous recorders.
+///
+/// MCP-735 (2026-05-13): NATS publish failures are LOGGED. The local
+/// `ledger.append` is the source of truth, so a failed publish loses nothing
+/// — but SIEM/dashboard consumers watching the stream would silently see zero
+/// capability-deny events during a NATS outage and conclude no probes are
+/// happening, so operators need WARN-level visibility on systemic failures.
+fn replicate_audit_event(
+    nats: Option<Arc<async_nats::Client>>,
+    event: crate::audit::AuditEvent,
+    label: String,
+) {
+    let Some(nats) = nats else {
+        return;
+    };
+    tokio::spawn(async move {
+        let hash = event.calculate_hash();
+        let msg = serde_json::json!({
+            "event": event,
+            "hash": hash,
+        });
+        match serde_json::to_vec(&msg) {
+            Ok(bytes) => {
+                if let Err(e) = nats
+                    .publish(
+                        aegix_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
+                        bytes.into(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_rpc",
+                        event = %label,
+                        error = %e,
+                        "audit-ledger NATS replication failed — local ledger unaffected, SIEM stream will miss this event"
+                    );
+                }
+            }
+            Err(e) => tracing::error!(
+                event = %label,
+                error = %e,
+                "Failed to serialize audit event"
+            ),
+        }
+    });
+}
+
+pub(crate) fn format_host_diagnostic_line(reason: &str, message: &str) -> String {
+    format!("[host:{reason}] {message}")
+}
+
+pub(crate) fn build_host_diagnostic_entry(
+    execution_id: &str,
+    request_id: &str,
+    reason: &str,
+    message: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "execution_id": execution_id,
+        "request_id": request_id,
+        "level": "WARN",
+        "message": format_host_diagnostic_line(reason, message),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "source": "host",
+        "trace_id": null,
+        "span_id": null,
+    })
+}
+
+#[cfg(test)]
+mod host_diagnostic_sink_tests {
+    //! The in-process `[host:*]` sink — the ONLY diagnostic route for a
+    //! caller with no execution row (`run_sandbox`, `test_module`).
+    //!
+    //! Regression cover for the surface #617 built diagnostics for but could
+    //! not reach: both handlers pass `execution_context: None`, so
+    //! `emit_host_diagnostic`'s `execution_id` guard short-circuited and a
+    //! developer probing a failing fetch got a bare `networkerror` and an
+    //! empty response. The ORDER of the guards is the whole fix, so these
+    //! tests pin it: the sink must be fed BEFORE the NATS/id early-returns.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use aegix_workflow_job_protocol::LlmTier;
+
+    use super::{build_host_diagnostic_entry, AegixContext, HostDiagSink};
+    use crate::wit_inspector::CapabilityWorld;
+
+    /// A context in exactly the `run_sandbox` shape: no NATS client, no
+    /// execution id.
+    fn sandbox_shaped_context() -> AegixContext {
+        AegixContext::new(
+            CapabilityWorld::Minimal,
+            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            128,
+            HashMap::new(),
+            None, // redis
+            None, // NATS — the published route is dead
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::default(),
+            None,
+        )
+        .expect("context builds")
+    }
+
+    fn sink() -> HostDiagSink {
+        Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    #[tokio::test]
+    async fn sink_collects_when_there_is_no_nats_and_no_execution_id() {
+        let mut ctx = sandbox_shaped_context();
+        assert!(ctx.execution_id.is_none() && ctx.nats_client.is_none());
+        let s = sink();
+        ctx.host_diag_sink = Some(s.clone());
+
+        ctx.emit_host_diagnostic(
+            "allowed-hosts",
+            "http-fetch denied by policy 'allowed-hosts'",
+        )
+        .await;
+
+        let lines = s.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec!["[host:allowed-hosts] http-fetch denied by policy 'allowed-hosts'".to_string()],
+            "with no execution id the sink is the only route — if it is fed AFTER the id guard, \
+             this is empty and the developer sees nothing at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_sink_nothing_is_collected_and_nothing_breaks() {
+        let mut ctx = sandbox_shaped_context();
+        assert!(ctx.host_diag_sink.is_none());
+        // The pre-existing behaviour for every NATS-backed dispatch path.
+        ctx.emit_host_diagnostic("dns-resolution-failed", "hostname resolution failed")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sink_line_is_textually_identical_to_the_published_entry() {
+        let mut ctx = sandbox_shaped_context();
+        let s = sink();
+        ctx.host_diag_sink = Some(s.clone());
+        ctx.emit_host_diagnostic(
+            "tls-handshake-failed",
+            "TLS handshake failed for 'api.x.test'",
+        )
+        .await;
+
+        let published = build_host_diagnostic_entry(
+            "exec-1",
+            "req-1",
+            "tls-handshake-failed",
+            "TLS handshake failed for 'api.x.test'",
+        );
+        assert_eq!(
+            s.lock().unwrap()[0],
+            published["message"].as_str().unwrap(),
+            "the two surfaces must never describe the same event differently"
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_is_bounded_by_the_diagnostic_cap() {
+        let mut ctx = sandbox_shaped_context();
+        let s = sink();
+        ctx.host_diag_sink = Some(s.clone());
+        for i in 0..(AegixContext::HOST_DIAG_CAP + 50) {
+            ctx.emit_host_diagnostic("allowed-hosts", &format!("denial {i}"))
+                .await;
+        }
+        assert_eq!(
+            s.lock().unwrap().len() as u64,
+            AegixContext::HOST_DIAG_CAP,
+            "a module hammering a denied host must not grow the sink without bound"
+        );
+    }
+
+    /// The sink is shared across retry attempts (each attempt builds a fresh
+    /// context with a fresh counter), so the Vec's own length check — not the
+    /// per-context counter — is what actually bounds it.
+    #[tokio::test]
+    async fn shared_sink_stays_bounded_across_multiple_contexts() {
+        let s = sink();
+        for _ in 0..3 {
+            let mut ctx = sandbox_shaped_context();
+            ctx.host_diag_sink = Some(s.clone());
+            for i in 0..AegixContext::HOST_DIAG_CAP {
+                ctx.emit_host_diagnostic("allowed-hosts", &format!("denial {i}"))
+                    .await;
+            }
+        }
+        assert_eq!(s.lock().unwrap().len() as u64, AegixContext::HOST_DIAG_CAP);
+    }
+}
+
+#[cfg(test)]
+mod host_diagnostic_tests {
+    use super::build_host_diagnostic_entry;
+
+    /// The controller's log subscriber persists entries by this shape —
+    /// pin every field the consumer reads so a rename here can't
+    /// silently stop diagnostics from being stored (the exact
+    /// alerts-go-quiet class this feature exists to fix).
+    #[test]
+    fn entry_matches_the_log_subscriber_contract() {
+        let e = build_host_diagnostic_entry(
+            "exec-1",
+            "req-1",
+            "dns-resolution-failed",
+            "hostname resolution failed for 'api.example.com'",
+        );
+        assert_eq!(e["execution_id"], "exec-1");
+        assert_eq!(e["request_id"], "req-1");
+        assert_eq!(e["level"], "WARN");
+        assert_eq!(e["source"], "host");
+        assert_eq!(
+            e["message"],
+            "[host:dns-resolution-failed] hostname resolution failed for 'api.example.com'"
+        );
+        assert!(e["timestamp"].is_string());
+        // Present-but-null keeps the entry shape identical to guest
+        // entries for consumers that read these keys unconditionally.
+        assert!(e.get("trace_id").is_some());
+        assert!(e.get("span_id").is_some());
+    }
+
+    /// The `[host:reason]` prefix is what operators grep for — pin that
+    /// reasons flow through verbatim (kebab-case tokens, no spaces).
+    #[test]
+    fn reason_token_prefixes_the_message() {
+        for reason in [
+            "dns-resolution-failed",
+            "circuit-breaker-open",
+            "request-timeout",
+            "connection-failed",
+            "tier1-egress-blocked",
+            "batch-request-failed",
+            "method-allowlist",
+        ] {
+            let e = build_host_diagnostic_entry("x", "", reason, "m");
+            let msg = e["message"].as_str().unwrap();
+            assert!(msg.starts_with(&format!("[host:{reason}] ")), "{msg}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod llm_usage_acc_tests {
+    use super::*;
+
+    fn acc() -> LlmUsageAcc {
+        LlmUsageAcc::default()
+    }
+
+    fn call(model: &str, completion: Option<u64>, stop: Option<&str>) -> LlmCallRecord {
+        LlmCallRecord {
+            provider: "ollama".into(),
+            model: model.into(),
+            prompt_tokens: completion.map(|_| 30),
+            completion_tokens: completion,
+            stop_reason: stop.map(str::to_string),
+            duration_ms: Some(12),
+        }
+    }
+
+    /// The observed run made two calls and showed one total. The second had
+    /// spent its whole budget reasoning and was cut off; nothing said so.
+    #[test]
+    fn each_call_is_kept_in_order_with_why_it_stopped_beside_the_totals() {
+        let a = acc();
+        record_llm_call(&a, call("m", Some(66), Some("stop")));
+        record_llm_call(&a, call("m", Some(1500), Some("length")));
+        let usage = a.lock().unwrap();
+        assert_eq!(
+            usage.totals()[&("ollama".to_string(), "m".to_string())],
+            (60, 1566, 2)
+        );
+        let stops: Vec<_> = usage
+            .calls()
+            .iter()
+            .map(|c| c.stop_reason.as_deref())
+            .collect();
+        assert_eq!(stops, [Some("stop"), Some("length")]);
+        assert_eq!(usage.calls()[1].completion_tokens, Some(1500));
+        assert_eq!(usage.calls_not_listed(), 0);
+    }
+
+    #[test]
+    fn the_call_list_is_bounded_and_the_rest_are_counted() {
+        let a = acc();
+        for _ in 0..MAX_LLM_CALL_RECORDS + 7 {
+            record_llm_call(&a, call("m", Some(1), Some("stop")));
+        }
+        let usage = a.lock().unwrap();
+        assert_eq!(usage.calls().len(), MAX_LLM_CALL_RECORDS);
+        assert_eq!(usage.calls_not_listed(), 7);
+        // The totals still count every call.
+        assert_eq!(
+            usage.totals()[&("ollama".to_string(), "m".to_string())].2 as usize,
+            MAX_LLM_CALL_RECORDS + 7
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_usage_is_listed_and_a_providers_stop_text_is_bounded() {
+        let a = acc();
+        let hostile = format!("len\u{7}gth{}", "x".repeat(200));
+        record_llm_call(&a, call("m", None, Some(&hostile)));
+        let usage = a.lock().unwrap();
+        // No usage: nothing in the totals (the ledger's rule), still a call.
+        assert!(usage.totals().is_empty());
+        let reason = usage.calls()[0].stop_reason.clone().unwrap();
+        assert_eq!(reason.chars().count(), 40);
+        assert!(reason.starts_with("length") && !reason.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn fold_merges_per_provider_model_and_counts_calls() {
+        let a = acc();
+        fold_llm_usage(&a, "anthropic", "m1", 100, 20);
+        fold_llm_usage(&a, "anthropic", "m1", 50, 10);
+        fold_llm_usage(&a, "ollama", "m2", 7, 3);
+        // Zero-usage observations are dropped (a provider that sent no
+        // counts must not inflate `calls`).
+        fold_llm_usage(&a, "ollama", "m2", 0, 0);
+
+        let entries = drain_llm_usage_entries(&a);
+        assert_eq!(entries.len(), 2);
+        // Sorted by (provider, model): anthropic before ollama.
+        assert_eq!(entries[0].provider, "anthropic");
+        assert_eq!(entries[0].model, "m1");
+        assert_eq!(
+            (
+                entries[0].prompt_tokens,
+                entries[0].completion_tokens,
+                entries[0].calls
+            ),
+            (150, 30, 2)
+        );
+        assert_eq!(entries[1].provider, "ollama");
+        assert_eq!(
+            (
+                entries[1].prompt_tokens,
+                entries[1].completion_tokens,
+                entries[1].calls
+            ),
+            (7, 3, 1)
+        );
+    }
+
+    #[test]
+    fn drain_empties_the_accumulator() {
+        let a = acc();
+        fold_llm_usage(&a, "p", "m", 1, 1);
+        assert_eq!(drain_llm_usage_entries(&a).len(), 1);
+        assert!(drain_llm_usage_entries(&a).is_empty());
+    }
+
+    #[test]
+    fn drain_saturates_u64_counts_to_u32_wire_type() {
+        let a = acc();
+        fold_llm_usage(&a, "p", "m", u64::from(u32::MAX) + 5, 1);
+        let entries = drain_llm_usage_entries(&a);
+        assert_eq!(entries[0].prompt_tokens, u32::MAX);
+        assert_eq!(entries[0].completion_tokens, 1);
+    }
+
+    #[test]
+    fn fold_saturates_accumulation() {
+        let a = acc();
+        fold_llm_usage(&a, "p", "m", u64::MAX - 1, 0);
+        fold_llm_usage(&a, "p", "m", 100, 0);
+        let entries = drain_llm_usage_entries(&a);
+        // u64 accumulation saturated, then saturated again to u32.
+        assert_eq!(entries[0].prompt_tokens, u32::MAX);
+        assert_eq!(entries[0].calls, 2);
+    }
+
+    #[test]
+    fn drain_truncates_to_protocol_cap() {
+        let a = acc();
+        for i in 0..(aegix_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES + 8) {
+            fold_llm_usage(&a, "p", &format!("model-{i:03}"), 1, 1);
+        }
+        assert_eq!(
+            drain_llm_usage_entries(&a).len(),
+            aegix_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES
+        );
+    }
+}
+
+#[cfg(test)]
+mod denial_ledger_cap_tests {
+    //! E4 (2026-09): every policy denial appended a hash-chained ledger row and
+    //! spawned a NATS publish with no bound — the guest-visible diagnostic was
+    //! capped at `HOST_DIAG_CAP`, the recording beneath it was not.
+    use super::*;
+    use crate::wit_inspector::CapabilityWorld;
+    use aegix_workflow_job_protocol::LlmTier;
+
+    fn ctx() -> AegixContext {
+        AegixContext::new(
+            CapabilityWorld::Http,
+            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds")
+    }
+
+    #[tokio::test]
+    async fn denials_past_the_cap_collapse_into_one_suppression_event() {
+        let mut c = ctx();
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        c.set_audit_ledger(ledger.clone());
+        let n = AegixContext::DENIAL_LEDGER_CAP + 50;
+        for i in 0..n {
+            c.record_capability_denied("http-fetch", "allowed-hosts", &format!("h{i}"))
+                .await;
+        }
+        // CAP individual rows + exactly ONE `wasi:capability_denied_suppressed`.
+        assert_eq!(
+            ledger.lock().await.current_sequence,
+            AegixContext::DENIAL_LEDGER_CAP + 1,
+            "the ledger must hold the cap plus one suppression marker, no more"
+        );
+        assert_eq!(
+            c.denial_ledger_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            n
+        );
+    }
+
+    #[tokio::test]
+    async fn under_the_cap_every_denial_is_recorded() {
+        let mut c = ctx();
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        c.set_audit_ledger(ledger.clone());
+        for _ in 0..10 {
+            c.record_capability_denied("webhook", "allowed-hosts", "h")
+                .await;
+        }
+        assert_eq!(ledger.lock().await.current_sequence, 10);
+    }
+}
+
+#[cfg(test)]
+mod stream_registry_abort_tests {
+    //! E5 (2026-09): the SSE reader's `JoinHandle` was discarded, so a reader
+    //! blocked on a quiet upstream outlived its execution. The registry now
+    //! owns the handles and aborts them on `close` and on drop.
+    use super::StreamRegistry;
+    use std::time::Duration;
+
+    /// Fires its oneshot when dropped — i.e. when the task is aborted.
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn forever_task() -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Built OUTSIDE the async block and moved in, so the signal fires when
+        // the FUTURE is dropped — including an abort that lands before the
+        // task was ever polled (a first draft built it inside, and an abort
+        // that early dropped the captured `tx` unsent: `RecvError`, i.e. the
+        // abort working and the test misreading it).
+        let guard = DropSignal(Some(tx));
+        let h = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        (h, rx)
+    }
+
+    #[tokio::test]
+    async fn dropping_the_registry_aborts_every_reader() {
+        let reg = StreamRegistry::new();
+        let (h1, rx1) = forever_task();
+        let (h2, rx2) = forever_task();
+        reg.register_sse_task("s1", h1);
+        reg.register_sse_task("s2", h2);
+        assert_eq!(reg.sse_task_count(), 2);
+        drop(reg);
+        for (name, rx) in [("s1", rx1), ("s2", rx2)] {
+            tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .unwrap_or_else(|_| panic!("{name}: reader still running 2 s after registry drop"))
+                .expect("guard dropped");
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_sse_task_stops_one_reader_and_leaves_the_rest() {
+        let reg = StreamRegistry::new();
+        let (h1, rx1) = forever_task();
+        let (h2, mut rx2) = forever_task();
+        reg.register_sse_task("s1", h1);
+        reg.register_sse_task("s2", h2);
+        reg.abort_sse_task("s1");
+        tokio::time::timeout(Duration::from_secs(2), rx1)
+            .await
+            .expect("s1 aborted")
+            .expect("guard dropped");
+        tokio::task::yield_now().await;
+        assert!(rx2.try_recv().is_err(), "s2 must still be running");
+        assert_eq!(reg.sse_task_count(), 1);
+        // Aborting an unknown id is a no-op.
+        reg.abort_sse_task("nope");
+        drop(reg);
+        tokio::time::timeout(Duration::from_secs(2), rx2)
+            .await
+            .expect("s2 aborted on drop")
+            .expect("guard dropped");
+    }
+}
+
+impl AegixContext {
+    /// The runtime's shared Redis connection, built on first use and reused
+    /// by every subsequent guest call on every job (2026-09-10).
+    ///
+    /// `get_or_try_init` does NOT cache a failed init, so a Redis outage at
+    /// first use leaves the cell empty and the next call retries; once built,
+    /// `ConnectionManager` reconnects on its own. Cloning a manager is a
+    /// handle clone, not a connection. `Err` when no Redis client is
+    /// configured — the same `Connectionfailed` the host functions already
+    /// return for that case.
+    ///
+    /// Returns an OWNED `'static + Send` future rather than borrowing `self`
+    /// across the await: `AegixContext` is not `Sync` (it holds a
+    /// `Box<dyn Any + Send>`), so a `&self` held across an `.await` would make
+    /// every bindgen host method that calls this non-`Send`. The two `Arc`s
+    /// are cloned up front and the borrow ends before anything is awaited.
+    pub(crate) fn redis_conn(
+        &self,
+    ) -> impl std::future::Future<Output = Result<redis::aio::ConnectionManager, redis::RedisError>>
+           + Send
+           + 'static {
+        let client = self.redis_client.clone();
+        let cell = self.redis_conn_mgr.clone();
+        async move {
+            let client = client.ok_or_else(|| {
+                redis::RedisError::from((redis::ErrorKind::Io, "Redis not configured"))
+            })?;
+            let mgr = cell
+                .get_or_try_init(|| async { aegix_redis::manager((*client).clone()).await })
+                .await?;
+            Ok(mgr.clone())
+        }
+    }
+}
+
+/// Package BL: a credential the host resolves and sends out is recorded in the
+/// WORM ledger — once per (surface, key, destination) per execution, capped —
+/// and a denied or failed resolution is not.
+#[cfg(test)]
+mod secret_use_ledger_tests {
+    use super::*;
+    use crate::wit_inspector::CapabilityWorld;
+    use aegix_workflow_job_protocol::LlmTier;
+    use std::collections::HashSet;
+
+    const PATH: &str = "oauth/gmail/00000000-0000-0000-0000-000000000000/acct/access_token";
+
+    fn ctx_with_secret() -> (
+        AegixContext,
+        Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>,
+    ) {
+        let mut secrets = HashMap::new();
+        secrets.insert(
+            PATH.to_string(),
+            zeroize::Zeroizing::new("tok-plaintext".to_string()),
+        );
+        let mut c = AegixContext::new(
+            CapabilityWorld::Http,
+            // Every destination these tests resolve for is NAMED: since E-3
+            // (2026-10-14) a credential is substituted only for a named host.
+            ["gmail.googleapis.com", "other.example.com", "h"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            128,
+            secrets,
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds");
+        c.set_allowed_secrets(vec!["oauth/gmail".to_string()]);
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        c.set_audit_ledger(ledger.clone());
+        (c, ledger)
+    }
+
+    async fn seq(l: &Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>) -> u64 {
+        l.lock().await.current_sequence
+    }
+
+    #[test]
+    fn admission_dedupes_caps_and_suppresses_once() {
+        let mut seen = HashSet::new();
+        assert_eq!(
+            secret_use_admission(&mut seen, "a".into(), 2),
+            SecretUseAdmission::Record
+        );
+        assert_eq!(
+            secret_use_admission(&mut seen, "a".into(), 2),
+            SecretUseAdmission::AlreadyRecorded
+        );
+        assert_eq!(
+            secret_use_admission(&mut seen, "b".into(), 2),
+            SecretUseAdmission::Record
+        );
+        assert_eq!(
+            secret_use_admission(&mut seen, "c".into(), 2),
+            SecretUseAdmission::RecordSuppression
+        );
+        for k in ["d", "e", "f"] {
+            assert_eq!(
+                secret_use_admission(&mut seen, k.into(), 2),
+                SecretUseAdmission::Suppressed
+            );
+        }
+        // An already-recorded use stays silent past the cap too.
+        assert_eq!(
+            secret_use_admission(&mut seen, "a".into(), 2),
+            SecretUseAdmission::AlreadyRecorded
+        );
+        assert_eq!(
+            seen.len(),
+            3,
+            "cap entries plus one sentinel, whatever a module does"
+        );
+    }
+
+    /// The live shape: a Gmail token spliced into an Authorization header.
+    #[tokio::test]
+    async fn a_resolved_header_credential_is_ledgered_once_per_destination() {
+        let (mut c, ledger) = ctx_with_secret();
+        let header = format!("Bearer vault://{PATH}");
+
+        let out = c
+            .resolve_vault_header(
+                SecretUseSurface::HttpHeader,
+                "gmail.googleapis.com",
+                "Authorization",
+                &header,
+            )
+            .await
+            .expect("resolves");
+        assert_eq!(out, "Bearer tok-plaintext");
+        assert_eq!(seq(&ledger).await, 1, "the use is recorded");
+
+        // Same credential, same host, again: the loop case — no new row.
+        for _ in 0..5 {
+            c.resolve_vault_header(
+                SecretUseSurface::HttpHeader,
+                "gmail.googleapis.com",
+                "Authorization",
+                &header,
+            )
+            .await
+            .expect("resolves");
+        }
+        assert_eq!(seq(&ledger).await, 1);
+
+        // A different destination and a different surface are distinct uses.
+        c.resolve_vault_header(
+            SecretUseSurface::HttpHeader,
+            "other.example.com",
+            "Authorization",
+            &header,
+        )
+        .await
+        .expect("resolves");
+        c.resolve_vault_header(
+            SecretUseSurface::WebhookHeader,
+            "gmail.googleapis.com",
+            "Authorization",
+            &header,
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(seq(&ledger).await, 3);
+    }
+
+    /// CONTROLS: a header with no reference, a denied path and a path the
+    /// provider cannot resolve are not uses.
+    #[tokio::test]
+    async fn denied_failed_and_plain_headers_record_no_use() {
+        let (mut c, ledger) = ctx_with_secret();
+        c.resolve_vault_header(
+            SecretUseSurface::HttpHeader,
+            "h",
+            "Accept",
+            "application/json",
+        )
+        .await
+        .expect("plain header passes through");
+        assert_eq!(seq(&ledger).await, 0);
+
+        // Not in allowed_secrets: a DENIAL row, not a use.
+        let denied = c
+            .resolve_vault_header(
+                SecretUseSurface::HttpHeader,
+                "h",
+                "Authorization",
+                "Bearer vault://stripe/api_key",
+            )
+            .await;
+        assert!(denied.is_err());
+        assert_eq!(
+            c.denial_ledger_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(c.secret_use_recorded.is_empty(), "a denial is not a use");
+
+        // Allowed prefix, but nothing to resolve.
+        let before = seq(&ledger).await;
+        let missing = c
+            .resolve_vault_header(
+                SecretUseSurface::HttpHeader,
+                "h",
+                "Authorization",
+                "Bearer vault://oauth/gmail/nobody/access_token",
+            )
+            .await;
+        assert!(missing.is_err());
+        assert_eq!(
+            seq(&ledger).await,
+            before,
+            "a failed resolution is not a use"
+        );
+        assert!(c.secret_use_recorded.is_empty());
+    }
+
+    /// The payload names the key by hash and the destination by host, never
+    /// the vault path or the plaintext.
+    #[tokio::test]
+    async fn the_event_carries_a_key_hash_and_never_the_path_or_value() {
+        let (mut c, _ledger) = ctx_with_secret();
+        let event = c
+            .record_secret_use(
+                SecretUseSurface::HttpHeader,
+                "gmail.googleapis.com",
+                PATH,
+                SecretSource::Vault,
+                Some("Authorization"),
+            )
+            .await
+            .expect("recorded");
+        assert_eq!(event.action, "wasi:secret_use");
+        assert_eq!(event.actor, "worker");
+        let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        let expected_hash =
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(PATH.as_bytes())).to_string();
+        assert_eq!(p["key_hash"], expected_hash);
+        assert_eq!(p["surface"], "http-header");
+        assert_eq!(p["destination"], "gmail.googleapis.com");
+        assert_eq!(p["source"], "vault");
+        assert_eq!(p["header"], "Authorization");
+        assert!(!event.payload.contains("oauth/gmail"), "{}", event.payload);
+        assert!(
+            !event.payload.contains("tok-plaintext"),
+            "{}",
+            event.payload
+        );
+    }
+
+    /// Past the cap: exactly one suppression row, then silence.
+    #[tokio::test]
+    async fn distinct_uses_past_the_cap_collapse_into_one_suppression_event() {
+        let (mut c, ledger) = ctx_with_secret();
+        let n = AegixContext::SECRET_USE_LEDGER_CAP + 10;
+        let mut last = None;
+        for i in 0..n {
+            if let Some(e) = c
+                .record_secret_use(
+                    SecretUseSurface::HttpHeader,
+                    &format!("h{i}"),
+                    PATH,
+                    SecretSource::Vault,
+                    None,
+                )
+                .await
+            {
+                last = Some(e);
+            }
+        }
+        assert_eq!(
+            seq(&ledger).await,
+            AegixContext::SECRET_USE_LEDGER_CAP as u64 + 1
+        );
+        assert_eq!(last.expect("events").action, "wasi:secret_use_suppressed");
+    }
+
+    /// An external LLM provider key resolved from the job's secrets is a use;
+    /// the tier-1 refusal of the same provider is not.
+    #[tokio::test]
+    async fn an_llm_provider_key_is_ledgered_and_a_tier1_refusal_is_not() {
+        let mut secrets = HashMap::new();
+        secrets.insert(
+            "anthropic/api_key".to_string(),
+            zeroize::Zeroizing::new("sk-ant-test".to_string()),
+        );
+        let mk = |tier| {
+            AegixContext::new(
+                CapabilityWorld::Agent,
+                vec![],
+                ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                128,
+                secrets.clone(),
+                None,
+                None,
+                false,
+                None,
+                Arc::new(crate::expose_fallback::ExposeFallback::new()),
+                tier,
+                None,
+            )
+            .expect("context builds")
+        };
+        let mut c = mk(LlmTier::Tier2);
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        c.set_audit_ledger(ledger.clone());
+        assert_eq!(
+            c.get_llm_api_key_by_name("Anthropic").await.as_deref(),
+            Some("sk-ant-test")
+        );
+        assert_eq!(seq(&ledger).await, 1);
+        assert!(c
+            .secret_use_recorded
+            .iter()
+            .any(|k| k.starts_with("llm-provider-key|") && k.ends_with("|anthropic")));
+        // The enum-keyed variant, on its own context, records independently.
+        let mut e = mk(LlmTier::Tier2);
+        let le = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        e.set_audit_ledger(le.clone());
+        e.get_llm_api_key(crate::host::wit_llm::Provider::Anthropic)
+            .await
+            .expect("resolves");
+        assert_eq!(seq(&le).await, 1, "get_llm_api_key records too");
+        // And a repeat on the first context adds nothing.
+        c.get_llm_api_key_by_name("anthropic")
+            .await
+            .expect("resolves");
+        assert_eq!(seq(&ledger).await, 1);
+
+        // CONTROL: the tier-1 ceiling refuses before any key is resolved.
+        let mut t1 = mk(LlmTier::Tier1);
+        let l1 = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        t1.set_audit_ledger(l1.clone());
+        assert!(t1.get_llm_api_key_by_name("anthropic").await.is_none());
+        assert!(t1.secret_use_recorded.is_empty(), "a refusal is not a use");
+    }
+
+    /// A stated worker environment holding one provider key.
+    fn provider_key_in_worker_env(name: &str) -> Option<String> {
+        (name == "ANTHROPIC_API_KEY").then(|| "sk-ant-from-worker-env".to_string())
+    }
+
+    /// E-5 (2026-10-14): with a provider key in the worker environment and
+    /// none in the job's vault map, a production worker resolves NOTHING; the
+    /// opt-in and a non-production worker keep the fallback.
+    #[tokio::test]
+    async fn production_refuses_an_llm_provider_key_from_the_worker_env() {
+        let mk = |production: bool, opted_in: bool| {
+            AegixContext::new(
+                CapabilityWorld::Agent,
+                vec![],
+                vec!["POST".to_string()],
+                128,
+                HashMap::new(), // the vault map has no provider key
+                None,
+                None,
+                false,
+                None,
+                Arc::new(crate::expose_fallback::ExposeFallback::new()),
+                LlmTier::Tier2,
+                None,
+            )
+            .expect("context builds")
+            .with_env_provider_keys(EnvProviderKeys::stated(
+                EnvProviderKeys::permitted(production, opted_in),
+                provider_key_in_worker_env,
+            ))
+        };
+
+        let mut prod = mk(true, false);
+        assert_eq!(
+            prod.get_llm_api_key(crate::host::wit_llm::Provider::Anthropic)
+                .await,
+            None
+        );
+        assert_eq!(prod.get_llm_api_key_by_name("anthropic").await, None);
+        assert!(prod.secret_use_recorded.is_empty(), "nothing was resolved");
+
+        // CONTROL: the operator's opt-in, and a non-production worker.
+        for (production, opted_in) in [(true, true), (false, false)] {
+            let mut c = mk(production, opted_in);
+            assert_eq!(
+                c.get_llm_api_key_by_name("anthropic").await.as_deref(),
+                Some("sk-ant-from-worker-env"),
+                "production={production} opted_in={opted_in}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_env_provider_key_rule() {
+        assert!(!EnvProviderKeys::permitted(true, false));
+        assert!(EnvProviderKeys::permitted(true, true));
+        assert!(EnvProviderKeys::permitted(false, false));
+        assert!(EnvProviderKeys::permitted(false, true));
+    }
+
+    /// 2026-10-29, mutation target: a rule that honoured the opt-in under
+    /// `hardened` (or forgot `transitional`) fails this.
+    #[test]
+    fn the_env_provider_key_rule_under_each_profile() {
+        use aegix_deploy_posture::security_profile::SecurityProfile::{
+            Development, Hardened, Transitional,
+        };
+        assert!(!EnvProviderKeys::permitted_under(Hardened, false));
+        assert!(!EnvProviderKeys::permitted_under(Hardened, true));
+        assert!(!EnvProviderKeys::permitted_under(Transitional, false));
+        assert!(EnvProviderKeys::permitted_under(Transitional, true));
+        assert!(EnvProviderKeys::permitted_under(Development, false));
+        assert!(EnvProviderKeys::permitted_under(Development, true));
+    }
+
+    /// TEXTUAL pin (stated): the two host-internal plaintext lookups have
+    /// exactly the call sites that record a use. A new caller of either must
+    /// record one — or change this count and say why.
+    #[test]
+    fn host_internal_secret_lookups_are_all_recorded() {
+        let vault = include_str!("host/vault.rs");
+        let email = include_str!("host/email.rs");
+        let raw_calls = vault.matches("self.resolve_raw_vault_secret(").count();
+        assert_eq!(raw_calls, 1, "resolve_raw_vault_secret callers in vault.rs");
+        assert!(vault.contains("async fn llm_key_with_use_recorded("));
+        let host_calls: usize = [
+            include_str!("host/email.rs"),
+            include_str!("host/llm.rs"),
+            include_str!("host/llm_tools.rs"),
+            include_str!("host/llm_streaming.rs"),
+            include_str!("host/http.rs"),
+            include_str!("host/webhook.rs"),
+            include_str!("host/graphql.rs"),
+            include_str!("host/messaging.rs"),
+        ]
+        .iter()
+        .map(|f| f.matches(".get_host_secret(").count())
+        .sum();
+        assert_eq!(
+            host_calls, 2,
+            "get_host_secret callers (EMAIL_API_URL, EMAIL_API_KEY)"
+        );
+        assert!(email.contains("SecretUseSurface::EmailApiKey"));
+    }
+
+    /// No ledger wired (a test or a stripped runtime): nothing recorded and no
+    /// dedupe state accumulates.
+    #[tokio::test]
+    async fn without_a_ledger_nothing_is_recorded() {
+        let mut c = AegixContext::new(
+            CapabilityWorld::Http,
+            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds");
+        assert!(c
+            .record_secret_use(
+                SecretUseSurface::HttpHeader,
+                "h",
+                PATH,
+                SecretSource::Vault,
+                None
+            )
+            .await
+            .is_none());
+        assert!(c.secret_use_recorded.is_empty());
+    }
+}
+
+/// The operator DETAIL on a capability denial (2026-09-23).
+///
+/// These drive the RECORDER, not the gate: `write_ceiling_enforced()` is a
+/// process-global `OnceLock` over the env, so a sibling test in this binary
+/// decides its value and the gate cannot be flipped per test. The gate's own
+/// contribution is the `Some(detail)` pass-through, which
+/// `host::http::write_ceiling_detail_tests::every_inferring_gate_passes_a_detail`
+/// pins at the call sites. Stated rather than implied.
+#[cfg(test)]
+mod capability_denial_detail_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use aegix_workflow_job_protocol::LlmTier;
+
+    use super::{AegixContext, HostDiagSink};
+    use crate::wit_inspector::CapabilityWorld;
+
+    fn ctx_with_sink() -> (AegixContext, HostDiagSink) {
+        let mut c = AegixContext::new(
+            CapabilityWorld::Minimal,
+            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::default(),
+            None,
+        )
+        .expect("context builds");
+        let s: HostDiagSink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        c.host_diag_sink = Some(s.clone());
+        (c, s)
+    }
+
+    /// The line a module author reads must say the ceiling classified by VERB.
+    /// Without this the diagnostic is `http-fetch denied by policy
+    /// 'write-ceiling' (target: sandbox.plaid.com)` — true, and it sends the
+    /// reader to `allowed_hosts`, which is not the control that refused.
+    #[tokio::test]
+    async fn the_verb_detail_reaches_the_guest_visible_diagnostic() {
+        let (mut c, s) = ctx_with_sink();
+        c.record_capability_denied_detailed(
+            "http-fetch",
+            "write-ceiling",
+            "sandbox.plaid.com",
+            Some(crate::host_impl::WRITE_CEILING_VERB_DETAIL),
+        )
+        .await;
+
+        let lines = s.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        // The base is preserved verbatim — the detail is an addition, not a
+        // replacement, so every existing reader of this line still works.
+        assert!(
+            line.contains(
+                "http-fetch denied by policy 'write-ceiling' (target: sandbox.plaid.com)"
+            ),
+            "{line}"
+        );
+        // And the addition is the sentence that redirects the diagnosis: the
+        // RULE that refused, and the NARROW tool that lifts it (#942 — the
+        // detail used to point at the whole ceiling, which since #941 grants
+        // fifteen ops where three would do).
+        assert!(line.contains("GET is the only read verb"), "{line}");
+        assert!(line.contains("set_actor_http_verb_ceiling"), "{line}");
+    }
+
+    /// The CONTROL, so the assertion above cannot pass because every denial
+    /// happens to carry the sentence: a categorically-mutating op passes
+    /// `None` and its line is the base alone.
+    #[tokio::test]
+    async fn a_denial_with_no_detail_is_the_bare_line() {
+        let (mut c, s) = ctx_with_sink();
+        c.record_capability_denied("agent-memory-set", "write-ceiling", "notes/1")
+            .await;
+
+        let lines = s.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.ends_with("agent-memory-set denied by policy 'write-ceiling' (target: notes/1)"),
+            "{line}"
+        );
+        assert!(!line.contains("GET is the only read verb"), "{line}");
+        assert!(
+            !line.contains(" — "),
+            "no detail was passed, so none is rendered: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fuel_acc_tests {
+    use super::{add_attempt_fuel, take_fuel, FuelAcc};
+    use aegix_workflow_job_protocol::FuelMeasure;
+
+    /// A job's attempts SUM: the budget is charged for every attempt the
+    /// worker ran, not only the last. `take` empties the accumulator, so a
+    /// result is never charged twice for the same spend.
+    #[test]
+    fn attempts_sum_and_take_empties() {
+        let acc: FuelAcc = std::sync::Arc::new(std::sync::Mutex::new(None));
+        assert_eq!(take_fuel(&acc), None, "nothing measured, nothing reported");
+        add_attempt_fuel(&acc, 700, 1_000);
+        add_attempt_fuel(&acc, 1_000, 1_000);
+        assert_eq!(
+            take_fuel(&acc),
+            Some(FuelMeasure {
+                consumed: 1_700,
+                limit: 1_000
+            })
+        );
+        assert_eq!(take_fuel(&acc), None);
+        add_attempt_fuel(&acc, u64::MAX, 1);
+        add_attempt_fuel(&acc, 5, 1);
+        assert_eq!(
+            take_fuel(&acc).map(|m| m.consumed),
+            Some(u64::MAX),
+            "saturates"
+        );
+    }
+}

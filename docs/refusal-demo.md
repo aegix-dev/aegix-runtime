@@ -51,10 +51,10 @@ Five **attempts**, which must be refused.
 
 | # | Attempt | Given | Decided in |
 |---|---|---|---|
-| 1 | read a secret that is stored but not in its grant | `Err(unauthorized)` | `aegix-worker-runtime/src/host/vault.rs`, `check_secret_allowlist` |
-| 2 | call a host that is not in `allowed_hosts` | `Err(forbiddenhost)` | `aegix-worker-runtime/src/host/egress_admission.rs`, `admit_parsed_url` |
-| 3 | call a model provider that is in `allowed_hosts`, as an actor held to local models | `Err(forbiddenhost)` | `aegix-worker-runtime/src/host/egress.rs`, `egress_posture_deny_reason` |
-| 4 | write to its actor's memory, as a read-only actor | `Err(not-available)` | `aegix-worker-runtime/src/context.rs`, `write_ceiling_refuses_detailed` |
+| 1 | read a secret that is stored but not in its grant | `Err(unauthorized)` | `aegix-wasm-host/src/host/vault.rs`, `check_secret_allowlist` |
+| 2 | call a host that is not in `allowed_hosts` | `Err(forbiddenhost)` | `aegix-wasm-host/src/host/egress_admission.rs`, `admit_parsed_url` |
+| 3 | call a model provider that is in `allowed_hosts`, as an actor held to local models | `Err(forbiddenhost)` | `aegix-wasm-host/src/host/egress.rs`, `egress_posture_deny_reason` |
+| 4 | write to its actor's memory, as a read-only actor | `Err(not-available)` | `aegix-wasm-host/src/context.rs`, `write_ceiling_refuses_detailed` |
 | 5 | ask the controller for the actor's data after the job has ended | `Unauthorized` | `aegix-rpc-gates/src/dispatch_binding.rs`, `gate` |
 
 Attempts 1 to 4 are made by the module. Attempt 5 is made from outside it, by
@@ -97,14 +97,14 @@ What it tried, and was refused
      asked      secrets::get-secret("demo/not-granted")
      given      Err(unauthorized)
      worker     [host:secret-allowlist] secret-access denied by policy 'secret-allowlist' (target: 9c91897a…)
-     decided in aegix-worker-runtime/src/host/vault.rs:703
+     decided in aegix-wasm-host/src/host/vault.rs:703
      ✓ refused
 
   3. reach an external model as a local-only actor
      asked      http::fetch(GET https://api.anthropic.com/v1/models)
      given      Err(forbiddenhost)
      worker     [host:tier1-llm-egress] http-fetch denied by policy 'tier1-llm-egress' (target: api.anthropic.com)
-     decided in aegix-worker-runtime/src/host/egress.rs:159
+     decided in aegix-wasm-host/src/host/egress.rs:159
      ✓ refused
 
   5. ask for its data after its job has ended

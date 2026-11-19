@@ -8,7 +8,7 @@ publish.workspace = true
 
 # Deliberately a LEAF: sqlparser and nothing else. This is the single source of
 # truth for "does this SQL statement mutate?", shared by the WASM-host worker
-# (aegix-worker-runtime) and the controller's signed-RPC handler
+# (aegix-wasm-host) and the controller's signed-RPC handler
 # (aegix-rpc-subscribers), so it must stay light enough to pull into the worker
 # without dragging in sqlx, tokio, or a web framework.
 [dependencies]

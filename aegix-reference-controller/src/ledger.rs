@@ -10,8 +10,8 @@
 //! up to [`MAX_ENDED_JOBS`]; one that has been dropped is a job the ledger
 //! does not know, which the dispatch-binding gate refuses.
 
+use aegix_dispatch_types::{EgressScope, LlmTier, WriteCeiling};
 use aegix_rpc_gates::{DispatchFacts, GateLedger};
-use aegix_workflow_engine_core::{EgressScope, LlmTier, WriteCeiling};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::Mutex;

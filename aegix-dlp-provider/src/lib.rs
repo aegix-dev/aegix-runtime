@@ -975,7 +975,7 @@ impl DlpService {
                 // Not fail-CLOSED because some operators have a custom DLP
                 // sidecar that intercepts traffic upstream of the
                 // controller and rightfully wants the in-process layer off.
-                let env_warn_emit = if aegix_config::is_production() {
+                let env_warn_emit = if aegix_deploy_posture::is_production() {
                     tracing::error!(
                         target: "aegix_dlp_provider",
                         event_kind = "dlp_disabled_in_production",
@@ -1001,7 +1001,10 @@ impl DlpService {
                          falling back to builtin"
                     );
                     Arc::new(BuiltinDlpProvider)
-                } else if !external_dlp_endpoint_permitted(&url, aegix_config::is_production()) {
+                } else if !external_dlp_endpoint_permitted(
+                    &url,
+                    aegix_deploy_posture::is_production(),
+                ) {
                     // tls-prod-gate-dlp
                     // The endpoint receives UNREDACTED data and the bearer
                     // token: refuse a plaintext URL in production. Fail

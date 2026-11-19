@@ -272,11 +272,11 @@ pub(crate) fn effective_key_entropy_bytes(raw: &str) -> usize {
 /// accepted; the accepted bytes are the raw UTF-8 string unchanged.
 pub fn audit_signing_key() -> &'static Option<Vec<u8>> {
     AUDIT_SIGNING_KEY.get_or_init(|| {
-        // MCP-671: route through `aegix_config::is_production()` so a
+        // MCP-671: route through `aegix_deploy_posture::is_production()` so a
         // helm-rendered `RUST_ENV=""` doesn't downgrade the production-only
         // audit-signing alerts to dev-level WARN/INFO. A SIEM pipeline keys
         // on the structured `event_kind = "audit_signing_disabled_in_production"`.
-        let is_production = aegix_config::is_production();
+        let is_production = aegix_deploy_posture::is_production();
         match std::env::var("AEGIX_AUDIT_SIGNING_KEY") {
             Ok(k) if !k.is_empty() => {
                 let entropy = effective_key_entropy_bytes(&k);
@@ -362,7 +362,7 @@ pub fn audit_verify_keys() -> Vec<Vec<u8>> {
             // for as long as it stays configured. Drop (and warn on) any
             // previous key below the floor instead of trusting it.
             if effective_key_entropy_bytes(trimmed) < MIN_KEY_ENTROPY_BYTES {
-                if aegix_config::is_production() {
+                if aegix_deploy_posture::is_production() {
                     tracing::error!(
                         target: "talos_security",
                         event_kind = "audit_previous_key_below_entropy_floor",
