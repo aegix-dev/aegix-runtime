@@ -46,7 +46,7 @@ members = [
 # (etc.) in their `[package]` table. Keeping these centralised means a
 # version bump or license-string fix touches one file, not eight.
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -133,9 +133,9 @@ uuid = { version = "1.20", features = ["v4", "serde"] }
 # of compiled modules, which Aegix never configures (the worker keeps its own
 # AOT cache), and it was the only path to zstd (RUSTSEC-2026-0391, -0395..0406,
 # -0410). A crate lists every other default itself.
-wasmtime = { version = "49.0.6", default-features = false }
-wasmtime-wasi = "49.0.6"
-wasmtime-wasi-http = "49.0.6"
+wasmtime = { version = "49.0.7", default-features = false }
+wasmtime-wasi = "49.0.7"
+wasmtime-wasi-http = "49.0.7"
 zeroize = "1.8"
 
 # Workspace-level clippy policy.

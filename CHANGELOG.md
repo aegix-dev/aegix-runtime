@@ -4,6 +4,16 @@ One section per release, the newest first. A release is the tag `v<version>`;
 `make release-check` holds the workspace version, `compose.yaml` and the first
 section here to one another.
 
+## 0.2.1
+
+A security patch release. No interface changed.
+
+- **Security: wasmtime 49.0.7**, for RUSTSEC-2026-0587: a WASI filesystem
+  sandbox escape on Windows through a drive-prefixed path component. It
+  reaches a worker that runs on a Windows host; the images this tree builds
+  are Linux and are not affected. Compiled modules the worker cached are
+  compiled again on first use.
+
 ## 0.2.0
 
 The tree carries less of the platform, and three checks refuse what they

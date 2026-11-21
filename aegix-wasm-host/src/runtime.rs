@@ -511,7 +511,14 @@ pub struct SecurityPolicy {
 ///             `threads` or `gc` feature). No engine config changed; the
 ///             fingerprint's wasmtime line did. V15 blobs are rejected by
 ///             header and recompile on next use.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV16";
+///   TALOSV17 — 2026-11-20: wasmtime 49.0.6→49.0.7 security patch
+///             (RUSTSEC-2026-0587: a WASI filesystem sandbox escape on
+///             Windows through a drive-prefixed path component). The fleet's
+///             hosts are Linux; the patch is on the line we run, so it is
+///             taken, not ignored. No engine config changed; the
+///             fingerprint's wasmtime line did. V16 blobs are rejected by
+///             header and recompile on next use.
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV17";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -609,7 +616,7 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 /// moment it mattered.
 macro_rules! wasmtime_version {
     () => {
-        "49.0.6"
+        "49.0.7"
     };
 }
 
@@ -1186,7 +1193,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
         // or the wasmtime= line). See test doc for the update procedure.
-        const EXPECTED: &str = "de3e624c281a2c3f690dddd68030ec938f6ad2bb7bf40b9d6b6ad51b5be616d4";
+        const EXPECTED: &str = "6bac78f1dd964728d7b55aaff29826b11f3a571a89c5e4d135dcfe07666ffda7";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,

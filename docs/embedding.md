@@ -10,7 +10,7 @@ the versions its tests ran on:
 
 ```toml
 [dependencies]
-aegix-runtime = { git = "https://github.com/aegix-dev/aegix-runtime", tag = "v0.2.0" }
+aegix-runtime = { git = "https://github.com/aegix-dev/aegix-runtime", tag = "v0.2.1" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
 ```

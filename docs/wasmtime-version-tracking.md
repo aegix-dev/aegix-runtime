@@ -10,9 +10,9 @@ why, and when the operator should bump.
 
 | Crate                | Version  | Pinned in                                  |
 |----------------------|----------|--------------------------------------------|
-| `wasmtime`           | 49.0.6   | `Cargo.toml`, `[workspace.dependencies]`   |
-| `wasmtime-wasi`      | 49.0.6   | `Cargo.toml`, `[workspace.dependencies]`   |
-| `wasmtime-wasi-http` | 49.0.6   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime`           | 49.0.7   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime-wasi`      | 49.0.7   | `Cargo.toml`, `[workspace.dependencies]`   |
+| `wasmtime-wasi-http` | 49.0.7   | `Cargo.toml`, `[workspace.dependencies]`   |
 
 Since 2026-10-06 the three versions are declared once, in the workspace
 manifest. `aegix-wasm-host` (which links all three) and `worker` (whose
@@ -47,6 +47,7 @@ column is the version bumped *to*.
 
 | Version  | Identifier             | Class                                    |
 |----------|------------------------|------------------------------------------|
+| 49.0.7   | RUSTSEC-2026-0587      | `wasmtime-wasi`: WASI filesystem sandbox escape on Windows through a drive-prefixed path component (the fleet is Linux) |
 | 49.0.6   | RUSTSEC-2026-0566      | `wasmtime-wasi`: unbounded host memory growth via empty writes to `AsyncWriteStream` |
 | 49.0.6   | RUSTSEC-2026-0567      | Abort in builds without the `threads` cargo feature |
 | 49.0.6   | RUSTSEC-2026-0568      | Stale GC heap base pointer in compiled code lets a guest abort the host process |
